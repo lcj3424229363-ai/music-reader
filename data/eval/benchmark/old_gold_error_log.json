@@ -1,0 +1,116 @@
+{
+  "log_version": "0.1.0",
+  "created": "2026-08-11",
+  "owner": "Mavis (P20.3.7 / P20.3.8)",
+  "policy": "所有发现的 gold JSON 错误只 LOG, 不修改原文件. 原始假设保留供训练/debug 对比. P20.3.8+ 的新 gold 用 correct_value.",
+  "entries": [
+    {
+      "error_id": "ERR-2026-08-11-001",
+      "case_id": "schubert_op90_no3",
+      "field": "analysis.key",
+      "old_value": "Eb major",
+      "correct_value": "Gb major",
+      "evidence": "Schubert Impromptu Op.90 No.3 = D.899 No.3 (4 Impromptus D.899, 整套). 第 3 首调性: G♭ major (降 G 大调), 不是 E♭ major (降 E 大调). 这两个调性差半音, 但降 G 大调有 6 个降号 (B♭, E♭, A♭, D♭, G♭, C♭), 降 E 大调只有 3 个降号 (B♭, E♭, A♭). 现有 gold 标的 'Eb major' 与作品不符.",
+      "source": "1. IMSLP work page: https://imslp.org/wiki/4_Impromptus,_D.899_(Schubert,_Franz)\n2. Schubert Werkverzeichnis (Deutsch catalogue): D 899/3, G♭ major\n3. Wikipedia: '4 Impromptus, D.899: No. 3 in G♭ major'",
+      "discovered_by": "Mavis (P20.3.7 Phase 1.5 schema 增强检查, 同时检查 Opus 编号 vs 调性)",
+      "discovered_date": "2026-08-11",
+      "action_taken": "LOGGED. 旧 gold JSON data/eval/gold/schubert_op90_no3.json 字段 analysis.key 保持 'Eb major' (P20.3.7 之前, 用户明确要求不修改). P20.3.8 起新生成 gold 用 'Gb major'.",
+      "status": "open",
+      "related_errors": []
+    },
+    {
+      "error_id": "ERR-2026-08-11-002",
+      "case_id": "haydn_hobxvi52_m1",
+      "field": "multiple",
+      "old_value": "完整 gold JSON 是手写猜测 (analysis.key, analysis.cadences, analysis.harmony, 等) 无 evidence chain",
+      "correct_value": "需谱面 + 人工标注才有 correct_value",
+      "evidence": "P20.3.7 调研发现: DCMLab 没有 haydn_piano_sonatas, craigsapp/haydn-piano-sonatas 不含 Hob.XVI:52, 没有公开 Roman numeral 标注.",
+      "source": "P20.3.7 Phase 1 调研 docs/gold_dataset_research.md",
+      "discovered_by": "Mavis (P20.3.7 调研)",
+      "discovered_date": "2026-08-11",
+      "action_taken": "LOGGED. 旧 gold JSON 不动. P20.3.8 标 'deferred' (无公开数据, 需未来 IMSLP + 人工标注).",
+      "status": "open",
+      "related_errors": []
+    },
+    {
+      "error_id": "ERR-2026-08-11-003",
+      "case_id": "chopin_op9_no2",
+      "field": "multiple",
+      "old_value": "完整 gold JSON 是手写猜测 无 evidence chain",
+      "correct_value": "需 Nocturne Op.9 No.2 谱面 + 人工标注",
+      "evidence": "P20.3.7 调研发现: DCMLab 只有 chopin_mazurkas (不是 nocturne), craigsapp/chopin-preludes 只有 Op.28, craigsapp/chopin-mazurkas 是 Op.6 mazurka. 没有公开 Op.9 No.2 Nocturne 标注.",
+      "source": "P20.3.7 Phase 1 调研 docs/gold_dataset_research.md",
+      "discovered_by": "Mavis (P20.3.7 调研)",
+      "discovered_date": "2026-08-11",
+      "action_taken": "LOGGED. 旧 gold JSON 不动. P20.3.8 标 'deferred' (无公开 Nocturne 标注, 教材/MuseScore 可能有但非机器可读).",
+      "status": "open",
+      "related_errors": []
+    },
+    {
+      "error_id": "ERR-2026-08-11-004",
+      "case_id": "ALL 8 V1 cases",
+      "field": "analysis_framework",
+      "old_value": "\"sposobin\"",
+      "correct_value": "\"functional\"",
+      "evidence": "P20.3 V1 规则 (P20.3.6 B.5 框架已确认): analysis_framework 必须是 'functional', 不是 'sposobin'. 因为 functional_analysis 字段用的是纯 T/S/D 标签, 不带 sposobin 特定的 'T-sub'/'D-sub' 等.",
+      "source": "P20.3.6 Gold Audit Table, 用户审批",
+      "discovered_by": "Mavis (P20.3.5 review, P20.3.6 审计确认)",
+      "discovered_date": "2026-08-08 (P20.3.6)",
+      "action_taken": "LOGGED. 旧 gold JSON 不动. P20.3.8 新生成 gold 用 'functional'.",
+      "status": "open",
+      "related_errors": []
+    },
+    {
+      "error_id": "ERR-2026-08-11-005",
+      "case_id": "beethoven_pathetique_m1",
+      "field": "excerpt + analysis.harmony",
+      "old_value": "excerpt: 'mm.1-10 (slow intro + Allegro opening)', harmonic 缺 slow intro",
+      "correct_value": "excerpt 至少 'mm.1-12' (因 PAC @ m.12), harmonic 应包含 m.1-4: vii°7 → V7 → i (slow intro)",
+      "evidence": "P20.3.5 review 指出: Allegro 主题 PAC @ m.12, 但 excerpt mm.1-10 不到 m.12, 范围冲突. 慢引子 (m.1-4) 是著名 vii°7 → V7 → i 进行, 但原 gold harmonic 漏标.",
+      "source": "P20.3.5 review (Mavis 写, 用户审计降级为'建议')",
+      "discovered_by": "Mavis (P20.3.5)",
+      "discovered_date": "2026-08-08 (P20.3.5)",
+      "action_taken": "LOGGED. 旧 gold JSON 不动. P20.3.8 用 DCMLab 数据 (310 measures 全乐章) 替换, 慢引子自动包含.",
+      "status": "open",
+      "related_errors": []
+    },
+    {
+      "error_id": "ERR-2026-08-11-006",
+      "case_id": "chopin_op9_no2",
+      "field": "analysis.harmony[VI]",
+      "old_value": "VI 标签自相矛盾 (一处归 T, 一处归 T-sub)",
+      "correct_value": "需谱面验证 (DCML/Craigsapp 都无 Op.9 No.2, 标 deferred)",
+      "evidence": "P20.3.5 review 指出 VI 字段在 functional_analysis 中两次不同标注. 但缺谱面无法验证, 用户审计降级.",
+      "source": "P20.3.5 review (Mavis 写, 用户审计降级)",
+      "discovered_by": "Mavis (P20.3.5)",
+      "discovered_date": "2026-08-08 (P20.3.5)",
+      "action_taken": "LOGGED. 旧 gold JSON 不动. 整个 case 标 deferred (无 Nocturne 标注).",
+      "status": "open",
+      "related_errors": []
+    },
+    {
+      "error_id": "ERR-2026-08-11-007",
+      "case_id": "schubert_op90_no3",
+      "field": "excerpt",
+      "old_value": "excerpt: 'mm.1-8 (A section opening)'",
+      "correct_value": "需确认是否引用 mm.9 (key change in A section)",
+      "evidence": "P20.3.5 review 指出 excerpt 范围冲突. 但缺谱面无法验证.",
+      "source": "P20.3.5 review (Mavis 写, 用户审计降级)",
+      "discovered_by": "Mavis (P20.3.5)",
+      "discovered_date": "2026-08-08 (P20.3.5)",
+      "action_taken": "LOGGED. 旧 gold JSON 不动. 整个 case 标 deferred.",
+      "status": "open",
+      "related_errors": []
+    }
+  ],
+  "summary": {
+    "total_entries": 7,
+    "by_severity": {
+      "FACT_ERROR": 1,
+      "FIELD_CONFLICT": 3,
+      "SCHEMA_VIOLATION": 1,
+      "MISSING_DATA": 2
+    },
+    "policy": "All entries are LOGGED. NO old gold JSON modified. Future P20.3.8+ gold uses correct_value. Original P20.3 phase JSON archived to data/eval/benchmark/_archive/P20.3/ after P20.3.8 approval."
+  }
+}

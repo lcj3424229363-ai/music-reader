@@ -1,0 +1,90 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+.pyre/
+
+# ===== Node =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
+
+# ===== Logs / dumps =====
+*.log
+*.out
+*.err
+
+# ===== Backups =====
+*.bak
+*~
+.DS_Store
+Thumbs.db
+*.bak.before-*
+*.bak.p*
+
+# ===== Editor / IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== OCR / processing outputs (large, regenerable) =====
+omr-runs/
+p2_1_results/
+*_results/
+__trash_
+__trash_/
+provenance_check_stdout.txt
+
+# ===== Working / debug scripts (root-level, ad-hoc) =====
+# 这些是临时 debug / audit / verify / phase / run / smoke / inspect / show / test
+# 不是真实源码, 不进 git
+_audit_*.py
+__audit_*.py
+_dbg_*.py
+__dbg_*.py
+_verify_*.py
+__verify_*.py
+_phase*.py
+__phase*.py
+_check_*.py
+_run_*.py
+_run_*.log
+_run_*.txt
+_smoke_*.py
+_inspect_*.py
+__inspect_*.py
+_show_*.py
+__show_*.py
+_debug_*.py
+__debug_*.py
+__test_*.py
+_p[0-9]_*.out
+_p8_*.py
+_test_*.out
+_verify_*.txt
+_pytest_*.txt
+_new_test_cases.json
+__trash_
+__trash_/
+
+# 根目录隐藏的 pytest 输出
+.pytest_err.txt
+.pytest_out.txt
+
+# 根目录 pytest dump 文件 (没下划线)
+pytest_*.txt
+
+# ===== Env / secrets =====
+.env
+.env.local
+*.pem
+*.key

@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "id": "so_what",
+    "composer": "Miles Davis (attributed to Bill Evans)",
+    "title": "So What",
+    "opus": "",
+    "period": "Modal Jazz (1959)",
+    "style_profile": "modal",
+    "analysis_framework": "modal",
+    "excerpt": "mm.1-32 (A section, 32 bars of 32-bar form)",
+    "difficulty": 3,
+    "source_url": "https://en.wikipedia.org/wiki/So_What_(Miles_Davis_song)"
+  },
+  "analysis": {
+    "key": "D dorian (A section) / Eb dorian (A' section repeat)",
+    "key_changes": [
+      {"measure": 17, "new_key": "Eb dorian", "notes": "up a half-step for A'"},
+      {"measure": 25, "new_key": "D dorian", "notes": "return for solo head out"}
+    ],
+    "phrase_structure": {
+      "type": "aaba' (32-bar form, but with 16+8+8 layout)",
+      "length": "16+8+8",
+      "antecedent": "mm.1-16 (D dorian, bass vamp on D-D-Eb-D)",
+      "consequent": "mm.17-32 (Eb dorian + return to D)"
+    },
+    "harmony": {
+      "roman_progression": ["Dm7", "Dm7", "Dm7", "Dm7", "Dm7", "Dm7", "Dm7", "Dm7", "Ebm7", "Ebm7", "Ebm7", "Ebm7", "Dm7", "Dm7", "Dm7", "Dm7"],
+      "functional_analysis": ["modal — D dorian", "modal — D dorian", "modal — Eb dorian", "modal — D dorian"]
+    },
+    "cadences": [
+      {"type": "no functional cadence", "measure": 0, "confidence": 1.0, "notes": "modal — no cadences"}
+    ],
+    "form_role": "Head A section (AABA' form)"
+  },
+  "errors_expected": [
+    "Agent may try to apply T/S/D (WRONG — modal, NO functional analysis)",
+    "Agent may miss Eb dorian shift at m.17"
+  ],
+  "teaching_points": [
+    "Modal jazz landmark: Dm7 and Ebm7 are the ONLY chords",
+    "Bass vamp: D-D-Eb-D repeats throughout A section",
+    "Use of dorian mode, not functional harmony"
+  ],
+  "alternative_analysis": [
+    {
+      "framework": "modal",
+      "interpretation": "Pure modal: D dorian (16 bars) → Eb dorian (8 bars) → D dorian (8 bars)",
+      "confidence": 0.95
+    },
+    {
+      "framework": "jazz_functional",
+      "interpretation": "Dm7 as ii of Eb, then back — but this is OVER-thinking",
+      "confidence": 0.2
+    }
+  ],
+  "needs_expert_review": false,
+  "review_notes": "Modal jazz classic, no functional analysis applies"
+}

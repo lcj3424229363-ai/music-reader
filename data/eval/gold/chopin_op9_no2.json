@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "id": "chopin_op9_no2",
+    "composer": "F. Chopin",
+    "title": "Nocturne Op.9 No.2",
+    "opus": "Op.9 No.2",
+    "period": "Romantic (1830)",
+    "style_profile": "sposobin",
+    "analysis_framework": "sposobin",
+    "excerpt": "mm.1-8 (A section opening)",
+    "difficulty": 2,
+    "source_url": "https://imslp.org/wiki/Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric)"
+  },
+  "analysis": {
+    "key": "Eb major",
+    "key_changes": [],
+    "phrase_structure": {
+      "type": "sentence-like (4+4)",
+      "length": "4+4",
+      "antecedent": "mm.1-4",
+      "consequent": "mm.5-8"
+    },
+    "harmony": {
+      "roman_progression": [
+        "I",
+        "V6",
+        "I",
+        "VI",
+        "ii6",
+        "V7",
+        "I"
+      ],
+      "functional_analysis": [
+        "T",
+        "D",
+        "T",
+        "T",
+        "S",
+        "D",
+        "T"
+      ]
+    },
+    "cadences": [
+      {
+        "type": "PAC",
+        "measure": 8,
+        "confidence": 0.95
+      }
+    ],
+    "form_role": "A section (ternary ABA)"
+  },
+  "errors_expected": [],
+  "teaching_points": [
+    "左手分解和弦伴奏 (夜曲典型织体)",
+    "VI 在 Sposobin 体系下归 T-sub (延展,非 S)",
+    "单一大乐句, PAC @ m.8"
+  ],
+  "expected_agent_behavior": "在 Sposobin 体系下: 识别 Eb major + 7 个罗马数字 (I-V6-I-VI-ii6-V7-I) + VI 标为 T-sub + 1 个 PAC @ m.8 + 不报错误",
+  "failure_modes": [
+    "把 VI 标为 S (Sposobin 体系下 VI 归 T, 非 S — 这是关键差异)",
+    "漏掉 V6 (当成 V)",
+    "把 m.8 标为 HC (实际是 PAC)"
+  ],
+  "_v1_note": "VI 归 T 组在 Sposobin 体系下成立 (上册); 部分教材归 S, 这是流派内部分歧",
+  "alternative_analysis": [
+    {
+      "framework": "sposobin-alternative",
+      "interpretation": "若按严格 Riemann 传统, VI 也可解释为 T-sub;此处与 Sposobin 一致",
+      "confidence": 0.85,
+      "notes": "Sposobin vs Riemann 对 VI 处理略有差异"
+    }
+  ],
+  "needs_expert_review": true,
+  "review_notes": "V1 标准 — 已从 functional_classical 改为 sposobin, 待 expert 校 VI 归类 (Sposobin 上册 VI 归 T, 下册可能归 S)",
+  "provenance": {
+    "source_score": "",
+    "source_url": "https://imslp.org/wiki/Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric)",
+    "source_format": "",
+    "measure_range": "mm.1-8",
+    "annotator": "",
+    "annotate_date": "",
+    "confidence": 0.0,
+    "evidence_chain": [],
+    "acquired_status": "needs_imslp",
+    "review_status": "raw",
+    "notes": "P20.3.7 — 当前无谱面, gold 是占位文本. 需获取 MusicXML + 人工标注后才能进入 benchmark."
+  }
+}

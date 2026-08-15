@@ -1,0 +1,935 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>乐谱分析工具</title>
+    <link rel="stylesheet" href="styles.css?v=19_0" />
+  </head>
+  <body>
+    <main class="app">
+      <nav class="sidebar" aria-label="主导航">
+        <div class="sidebar-brand">
+          <p>Music Analysis</p>
+          <h1>乐谱分析</h1>
+        </div>
+        <ul class="sidebar-menu">
+          <li><button type="button" class="sidebar-link active" data-view="upload"><span>1</span>上传乐谱</button></li>
+          <li><button type="button" class="sidebar-link" data-view="chords"><span>2</span>手动和弦</button></li>
+          <li><button type="button" class="sidebar-link" data-view="editor"><span>3</span>五线谱制谱</button></li>
+          <li><button type="button" class="sidebar-link" data-view="answer"><span>4</span>四部和声答案</button></li>
+          <li><button type="button" class="sidebar-link" data-view="analysis"><span>5</span>读谱分析</button></li>
+        </ul>
+        <div class="sidebar-foot">
+          <a href="/health" target="_blank" rel="noreferrer">健康检查</a>
+        </div>
+      </nav>
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p>Music Analysis Workspace</p>
+            <h1>乐谱分析工具</h1>
+          </div>
+          <span id="apiStatus" class="status">检查中</span>
+        </header>
+
+        <section class="upload-panel view-panel" data-view="upload" id="dropZone">
+          <input id="fileInput" type="file" accept=".musicxml,.xml,.mxl,.mid,.midi,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.pdf" />
+          <div class="upload-icon" aria-hidden="true">♩</div>
+          <h2>上传乐谱文件</h2>
+          <p>MusicXML、MIDI、印刷谱图片或 PDF</p>
+          <button id="pickButton" type="button">选择文件</button>
+        </section>
+
+        <section class="manual-panel view-panel" data-view="chords">
+          <header>
+            <div>
+              <p>OMR 失败后的输入通道</p>
+              <h2>手动输入小节和弦</h2>
+            </div>
+            <button id="manualButton" type="button">生成和声草稿</button>
+          </header>
+          <div class="manual-grid">
+            <label>
+              <span>调性</span>
+              <input id="manualKey" value="C major" placeholder="C major、A minor、Bb major" />
+            </label>
+            <label>
+              <span>拍号</span>
+              <input id="manualTime" value="4/4" placeholder="4/4" />
+            </label>
+          </div>
+          <label class="manual-progression">
+            <span>和弦进行</span>
+            <textarea id="manualProgression" placeholder="C | Am | Dm G7 | C"></textarea>
+          </label>
+        </section>
+
+        <section class="note-panel view-panel" data-view="editor" data-editor-tab="note">
+          <!-- ============ 顶部 header bar（深色） ============ -->
+          <header class="editor-header-bar">
+            <div class="editor-header-left">
+              <div class="editor-brand" aria-hidden="true">♩</div>
+              <div class="editor-title-block">
+                <p>五线谱编辑器</p>
+                <h2>规范五线谱输入</h2>
+              </div>
+            </div>
+            <div class="editor-header-center">
+              <div class="editor-score-settings">
+                <label class="editor-score-field" title="调号">
+                  <span>调</span>
+                  <select id="editorKey">
+                    <optgroup label="大调">
+                      <option value="C" selected>C</option>
+                      <option value="G">G</option>
+                      <option value="D">D</option>
+                      <option value="A">A</option>
+                      <option value="E">E</option>
+                      <option value="B">B</option>
+                      <option value="F#">F#</option>
+                      <option value="C#">C#</option>
+                      <option value="F">F</option>
+                      <option value="Bb">Bb</option>
+                      <option value="Eb">Eb</option>
+                      <option value="Ab">Ab</option>
+                      <option value="Db">Db</option>
+                      <option value="Gb">Gb</option>
+                      <option value="Cb">Cb</option>
+                    </optgroup>
+                    <optgroup label="小调">
+                      <option value="Am">Am</option>
+                      <option value="Em">Em</option>
+                      <option value="Bm">Bm</option>
+                      <option value="F#m">F#m</option>
+                      <option value="C#m">C#m</option>
+                      <option value="Dm">Dm</option>
+                      <option value="Gm">Gm</option>
+                      <option value="Cm">Cm</option>
+                      <option value="Fm">Fm</option>
+                      <option value="Bbm">Bbm</option>
+                    </optgroup>
+                  </select>
+                </label>
+                <label class="editor-score-field" title="拍号">
+                  <span>拍</span>
+                  <select id="editorTime">
+                    <option value="4/4">4/4</option>
+                    <option value="3/4">3/4</option>
+                    <option value="2/4">2/4</option>
+                    <option value="2/2">2/2</option>
+                    <option value="3/8">3/8</option>
+                    <option value="6/8">6/8</option>
+                    <option value="5/8">5/8</option>
+                    <option value="7/8">7/8</option>
+                    <option value="9/8">9/8</option>
+                    <option value="12/8">12/8</option>
+                    <option value="5/4">5/4</option>
+                    <option value="6/4">6/4</option>
+                    <option value="7/4">7/4</option>
+                  </select>
+                </label>
+                <label class="editor-score-field" title="速度 ♩=">
+                  <span>♩=</span>
+                  <input id="tempoInput" type="number" min="40" max="240" step="1" value="" placeholder="120" />
+                </label>
+                <label class="editor-score-field" title="谱表模式">
+                  <span>谱表</span>
+                  <select id="staffMode">
+                    <option value="single">单谱表</option>
+                    <option value="piano">钢琴双谱表</option>
+                  </select>
+                </label>
+                <label class="editor-score-field" title="当前输入谱表">
+                  <span>当前</span>
+                  <select id="noteClef">
+                    <option value="treble">高音</option>
+                    <option value="bass">低音</option>
+                  </select>
+                </label>
+                <label class="editor-score-field" title="当前声部">
+                  <span>声部</span>
+                  <select id="voiceSelect">
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="editor-header-right">
+              <button id="undoNotesButton" class="icon-button ghost" type="button" disabled title="撤销">↶</button>
+              <button id="clearNotesButton" class="icon-button ghost" type="button" disabled title="清空">🗑</button>
+              <span class="editor-divider" aria-hidden="true"></span>
+              <select id="examplePreset" class="editor-preset-select" title="课本例题">
+                <option value="">课本例题</option>
+                <optgroup label="0 升降">
+                  <option value="p0_cadence">P0 C 大调 I-IV-V-I</option>
+                  <option value="p5_a_minor">P5 a 小调终止</option>
+                </optgroup>
+                <optgroup label="1 升降">
+                  <option value="p1_5_f_major">P1.5 F 大调 (1♭) I-V7-I</option>
+                  <option value="p1_6_g_major">P1.6 G 大调 (1♯) I-V7-I</option>
+                  <option value="p5_3_d_minor">P5.3 d 小调 (1♯) 和声终止</option>
+                </optgroup>
+                <optgroup label="2 升降">
+                  <option value="p1_7_d_major">P1.7 D 大调 (2♯) I-V7-I</option>
+                  <option value="p3_6_bb_major">P3.6 Bb 大调 (2♭) I-IV-V-I</option>
+                  <option value="p5_4_g_minor">P5.4 g 小调 (2♭) 和声终止</option>
+                </optgroup>
+                <optgroup label="3 升降">
+                  <option value="p2_6_a_major">P2.6 A 大调 (3♯) V7/V 副属</option>
+                  <option value="p3_5_modal_mixture">P3.5 Eb 大调 (3♭) bVI 借用</option>
+                  <option value="p5_phrygian">P5.5 c 小调 (3♭) Phrygian 终止</option>
+                </optgroup>
+                <optgroup label="4 升降">
+                  <option value="p3_7_ab_major">P3.7 Ab 大调 (4♭) I-IV-V-I</option>
+                </optgroup>
+                <optgroup label="变和弦 + 转调">
+                  <option value="p1_v7_suspension">P1 V7 7-3 延留</option>
+                  <option value="p2_v7v">P2 V7/V 副属</option>
+                  <option value="p3_aug6_ger">P3 Ger+6 增六和弦</option>
+                  <option value="p7_5_c_to_g">P7.5 C → G 上五度转调</option>
+                  <option value="p7_5_c_to_a">P7.5 C → a 关系调转调</option>
+                </optgroup>
+              </select>
+              <span class="editor-divider" aria-hidden="true"></span>
+              <button id="validateScoreButton" class="icon-button" type="button" title="检查谱面">检查</button>
+              <button id="exportJsonButton" class="icon-button" type="button" title="生成结构数据">JSON</button>
+              <button id="exportMusicXmlButton" class="icon-button" type="button" title="生成 MusicXML">XML</button>
+              <button id="importMusicXmlButton" class="icon-button" type="button" title="导入 MusicXML">导入</button>
+              <input id="musicXmlFileInput" type="file" accept=".musicxml,.xml" class="hidden-input" />
+            </div>
+          </header>
+
+          <!-- ============ 二级 tab 栏 ============ -->
+          <nav class="editor-tab-bar" role="tablist" aria-label="编辑器工具分类">
+            <button type="button" class="editor-tab" data-tab-target="note" aria-selected="true">音符</button>
+            <button type="button" class="editor-tab" data-tab-target="articulation">演奏</button>
+            <button type="button" class="editor-tab" data-tab-target="ornament">装饰</button>
+            <button type="button" class="editor-tab" data-tab-target="dynamic">强弱</button>
+            <button type="button" class="editor-tab" data-tab-target="measure">小节</button>
+            <button type="button" class="editor-tab" data-tab-target="text">文本</button>
+            <button type="button" class="editor-tab" data-tab-target="alt">批量输入</button>
+          </nav>
+
+          <!-- ============ 主区域：左侧工具 ribbon + 中间画布 + 右侧 inspector ============ -->
+          <div class="editor-main">
+            <!-- 左侧：分类工具 ribbon -->
+            <aside class="editor-ribbon" aria-label="工具">
+              <!-- Note tab -->
+              <div class="ribbon-group" data-ribbon-tab="note">
+                <div class="ribbon-section">
+                  <h4>输入类型</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="inputKind" value="note" checked />
+                      <span>♩ 音符</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="inputKind" value="rest" />
+                      <span>𝄽 休止</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>写入方式</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="entryMode" value="new" checked />
+                      <span>新建</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="entryMode" value="chord" />
+                      <span>叠加</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>时值</h4>
+                  <div class="ribbon-row ribbon-duration-row">
+                    <label class="ribbon-radio" title="二全音符">
+                      <input type="radio" name="durationPick" data-bridge="noteDuration" value="0" />
+                      <span class="dur-glyph">𝅜</span>
+                    </label>
+                    <label class="ribbon-radio" title="全音符">
+                      <input type="radio" name="durationPick" data-bridge="noteDuration" value="1" />
+                      <span class="dur-glyph">𝅝</span>
+                    </label>
+                    <label class="ribbon-radio" title="二分音符">
+                      <input type="radio" name="durationPick" data-bridge="noteDuration" value="2" />
+                      <span class="dur-glyph">𝅗𝅥</span>
+                    </label>
+                    <label class="ribbon-radio" title="四分音符">
+                      <input type="radio" name="durationPick" data-bridge="noteDuration" value="4" checked />
+                      <span class="dur-glyph">♩</span>
+                    </label>
+                    <label class="ribbon-radio" title="八分音符">
+                      <input type="radio" name="durationPick" data-bridge="noteDuration" value="8" />
+                      <span class="dur-glyph">♪</span>
+                    </label>
+                    <label class="ribbon-radio" title="十六分音符">
+                      <input type="radio" name="durationPick" data-bridge="noteDuration" value="16" />
+                      <span class="dur-glyph">♬</span>
+                    </label>
+                  </div>
+                  <div class="ribbon-row">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="dottedPick" data-bridge="noteDotted" value="0" checked />
+                      <span>无附点</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="dottedPick" data-bridge="noteDotted" value="1" />
+                      <span>单附点</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="dottedPick" data-bridge="noteDotted" value="2" />
+                      <span>双附点</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>临时记号</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="accidentalPick" data-bridge="noteAccidental" value="" checked />
+                      <span>无</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="accidentalPick" data-bridge="noteAccidental" value="#" />
+                      <span>♯ 升</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="accidentalPick" data-bridge="noteAccidental" value="b" />
+                      <span>♭ 降</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="accidentalPick" data-bridge="noteAccidental" value="n" />
+                      <span>♮ 还</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>连音 / 特殊</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-radio" title="三连音">
+                      <input type="checkbox" data-bridge="toggleTripletButton" />
+                      <span>3 连音</span>
+                    </label>
+                    <label class="ribbon-radio" title="延音开始">
+                      <input type="checkbox" data-bridge="toggleTieStartButton" />
+                      <span>延音⌒</span>
+                    </label>
+                    <label class="ribbon-radio" title="延音结束">
+                      <input type="checkbox" data-bridge="toggleTieStopButton" />
+                      <span>延音止</span>
+                    </label>
+                    <label class="ribbon-radio" title="连线开始">
+                      <input type="checkbox" data-bridge="toggleSlurStartButton" />
+                      <span>连~</span>
+                    </label>
+                    <label class="ribbon-radio" title="连线结束">
+                      <input type="checkbox" data-bridge="toggleSlurStopButton" />
+                      <span>连止</span>
+                    </label>
+                  </div>
+                </div>
+                <!-- 兼容性隐藏 select，保留旧 id 以供 app.js 使用 -->
+                <div class="ribbon-hidden-fields" aria-hidden="true">
+                  <select data-bridge="noteDuration">
+                    <option value="0">二全音符</option>
+                    <option value="1">全音符</option>
+                    <option value="2">二分音符</option>
+                    <option value="4" selected>四分音符</option>
+                    <option value="8">八分音符</option>
+                    <option value="16">十六分音符</option>
+                    <option value="32">三十二分音符</option>
+                    <option value="64">六十四分音符</option>
+                  </select>
+                  <select data-bridge="noteAccidental">
+                    <option value="">无</option>
+                    <option value="#">升号 ♯</option>
+                    <option value="b">降号 ♭</option>
+                    <option value="n">还原号 ♮</option>
+                  </select>
+                  <select data-bridge="noteDotted">
+                    <option value="0" selected>无附点</option>
+                    <option value="1">单附点</option>
+                    <option value="2">双附点</option>
+                  </select>
+                  <select data-bridge="tupletTypeSelect">
+                    <option value="triplet">三连音</option>
+                    <option value="quintuplet">五连音</option>
+                    <option value="sextuplet">六连音</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Articulation tab -->
+              <div class="ribbon-group" data-ribbon-tab="articulation" hidden>
+                <div class="ribbon-section">
+                  <h4>演奏记号</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="articulationPick" value="" checked />
+                      <span>无</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="articulationPick" value="staccato" />
+                      <span>· 断奏</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="articulationPick" value="accent" />
+                      <span>&gt; 重音</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="articulationPick" value="tenuto" />
+                      <span>— 保持</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="articulationPick" value="marcato" />
+                      <span>^ 强音</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>踏板 / 呼吸</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="pedalPick" value="" checked />
+                      <span>无</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="pedalPick" value="start" />
+                      <span>Ped. 踩下</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="pedalPick" value="stop" />
+                      <span>✱ 抬起</span>
+                    </label>
+                    <label class="ribbon-radio ribbon-check">
+                      <input type="checkbox" data-bridge="breathCheck" />
+                      <span>∨ 呼吸</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>乐句 / 延留</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-radio ribbon-check">
+                      <input type="checkbox" data-bridge="togglePhraseStartButton" />
+                      <span>乐句起</span>
+                    </label>
+                    <label class="ribbon-radio ribbon-check">
+                      <input type="checkbox" data-bridge="togglePhraseStopButton" />
+                      <span>乐句止</span>
+                    </label>
+                    <label class="ribbon-radio ribbon-check">
+                      <input type="checkbox" data-bridge="toggleFermataButton" />
+                      <span>Fermata 𝄐</span>
+                    </label>
+                    <label class="ribbon-radio ribbon-check">
+                      <input type="checkbox" data-bridge="arpeggioCheck" />
+                      <span>琶音</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-hidden-fields" aria-hidden="true">
+                  <select data-bridge="articulationSelect">
+                    <option value="">无</option>
+                    <option value="staccato">断奏</option>
+                    <option value="accent">重音</option>
+                    <option value="tenuto">保持</option>
+                    <option value="marcato">强音</option>
+                  </select>
+                  <select data-bridge="pedalSelect">
+                    <option value="">无</option>
+                    <option value="start">踩下</option>
+                    <option value="stop">抬起</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Ornament tab -->
+              <div class="ribbon-group" data-ribbon-tab="ornament" hidden>
+                <div class="ribbon-section">
+                  <h4>装饰音</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="" checked />
+                      <span>无</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="trill" />
+                      <span>tr 颤音</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="mordent" />
+                      <span>∺ 上波</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="mordent-inverted" />
+                      <span>∻ 下波</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="turn" />
+                      <span>∽ 回音</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="turn-inverted" />
+                      <span>逆回</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="upprall" />
+                      <span>上行</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="downprall" />
+                      <span>下行</span>
+                    </label>
+                    <label class="ribbon-radio">
+                      <input type="radio" name="ornamentPick" value="lineprall" />
+                      <span>经过</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>倚音</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-field" title="倚音音高，例 C5">
+                      <span>音高</span>
+                      <input data-bridge="graceInput" type="text" placeholder="C5" />
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-hidden-fields" aria-hidden="true">
+                  <select data-bridge="ornamentSelect">
+                    <option value="">无</option>
+                    <option value="trill">颤音 tr</option>
+                    <option value="mordent">上波音</option>
+                    <option value="mordent-inverted">下波音</option>
+                    <option value="turn">回音</option>
+                    <option value="turn-inverted">逆回音</option>
+                    <option value="upprall">上行波音(巴洛克)</option>
+                    <option value="downprall">下行波音(巴洛克)</option>
+                    <option value="lineprall">经过波音</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Dynamic tab -->
+              <div class="ribbon-group" data-ribbon-tab="dynamic" hidden>
+                <div class="ribbon-section">
+                  <h4>强弱</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="" checked /><span>无</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="ppp" /><span>ppp</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="pp" /><span>pp</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="p" /><span>p</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="mp" /><span>mp</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="mf" /><span>mf</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="f" /><span>f</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="ff" /><span>ff</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="fff" /><span>fff</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="dynamicPick" value="sfz" /><span>sfz</span></label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>渐强渐弱</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-radio"><input type="radio" name="hairpinPick" value="" checked /><span>无</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="hairpinPick" value="cresc-start" /><span>&lt; 渐强</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="hairpinPick" value="decresc-start" /><span>&gt; 渐弱</span></label>
+                    <label class="ribbon-radio"><input type="radio" name="hairpinPick" value="stop" /><span>— 结束</span></label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>指法</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-field" title="1-5">
+                      <span>指</span>
+                      <input data-bridge="fingeringInput" type="text" placeholder="1-5" maxlength="1" />
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-hidden-fields" aria-hidden="true">
+                  <select data-bridge="dynamicSelect">
+                    <option value="">无</option>
+                    <option value="ppp">ppp</option>
+                    <option value="pp">pp</option>
+                    <option value="p">p</option>
+                    <option value="mp">mp</option>
+                    <option value="mf">mf</option>
+                    <option value="f">f</option>
+                    <option value="ff">ff</option>
+                    <option value="fff">fff</option>
+                    <option value="sfz">sfz</option>
+                  </select>
+                  <select data-bridge="hairpinSelect">
+                    <option value="">无</option>
+                    <option value="cresc-start">渐强开始</option>
+                    <option value="decresc-start">渐弱开始</option>
+                    <option value="stop">结束</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Measure tab -->
+              <div class="ribbon-group" data-ribbon-tab="measure" hidden>
+                <div class="ribbon-section">
+                  <h4>小节导航</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <button data-bridge="prevMeasureButton" class="icon-button" type="button">◀ 上一</button>
+                    <button data-bridge="nextMeasureButton" class="icon-button" type="button">下一 ▶</button>
+                    <button data-bridge="addMeasureButton" class="icon-button" type="button">＋ 新增</button>
+                    <button data-bridge="deleteMeasureButton" class="icon-button danger" type="button">－ 删除</button>
+                  </div>
+                  <div class="ribbon-row ribbon-row-justify">
+                    <label class="ribbon-field" title="小节号">
+                      <span>第</span>
+                      <input data-bridge="noteMeasure" type="number" min="1" value="1" />
+                      <span>小节</span>
+                    </label>
+                    <span data-bridge="measureNavStatus" class="ribbon-status">共 1 小节</span>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>小节线</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <label class="ribbon-field">
+                      <span>起始</span>
+                      <select data-bridge="beginBarlineSelect">
+                        <option value="single">单线</option>
+                        <option value="repeat-begin">开始反复</option>
+                      </select>
+                    </label>
+                    <label class="ribbon-field">
+                      <span>结束</span>
+                      <select data-bridge="endBarlineSelect">
+                        <option value="single">单线</option>
+                        <option value="double">双线</option>
+                        <option value="end">终止线</option>
+                        <option value="repeat-end">结束反复</option>
+                        <option value="repeat-both">双向反复</option>
+                      </select>
+                    </label>
+                    <label class="ribbon-radio ribbon-check">
+                      <input type="checkbox" data-bridge="anacrusisCheck" />
+                      <span>弱起小节</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Text tab -->
+              <div class="ribbon-group" data-ribbon-tab="text" hidden>
+                <div class="ribbon-section">
+                  <h4>标注</h4>
+                  <div class="ribbon-row">
+                    <label class="ribbon-field" title="和弦符号">
+                      <span>和弦</span>
+                      <input data-bridge="chordSymbolInput" type="text" placeholder="C、Am、G7" />
+                    </label>
+                  </div>
+                  <div class="ribbon-row">
+                    <label class="ribbon-field" title="文本标注">
+                      <span>文本</span>
+                      <input data-bridge="textMarkInput" type="text" placeholder="dolce、rit.、I" />
+                    </label>
+                  </div>
+                </div>
+                <div class="ribbon-section">
+                  <h4>操作</h4>
+                  <div class="ribbon-row ribbon-row-wrap">
+                    <button data-bridge="applyDurationButton" class="icon-button" type="button">应用时值</button>
+                    <button data-bridge="deleteToneButton" class="icon-button danger" type="button">删除该音</button>
+                    <button data-bridge="deleteEventButton" class="icon-button danger" type="button">删除拍位</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Alt input tab -->
+              <div class="ribbon-group" data-ribbon-tab="alt" hidden>
+                <div class="ribbon-section">
+                  <h4>批量输入</h4>
+                  <p class="ribbon-hint">把文本按"音高:时值"格式贴进下方文本框，一次性填到五线谱（会覆盖当前鼠标输入）。</p>
+                </div>
+              </div>
+            </aside>
+
+            <!-- 中央：五线谱大画布 -->
+            <div class="editor-canvas-wrap">
+              <div class="editor-canvas-status" aria-live="polite">
+                <div class="editor-status-row">
+                  <strong id="measureStatus">第 1 小节：0 / 4 拍</strong>
+                  <span class="editor-status-sep" aria-hidden="true">·</span>
+                  <span id="editorMessage">待输入</span>
+                </div>
+                <div class="measure-progress" aria-hidden="true">
+                  <span id="measureProgress"></span>
+                </div>
+              </div>
+              <div id="scoreViewport" class="score-viewport editor-score-viewport">
+                <div id="noteCanvas" class="note-canvas" aria-label="五线谱输入区"></div>
+              </div>
+            </div>
+
+            <!-- 右侧：inspector（选中拍位时显示 — selectionBar 改名为 inspector 主体） -->
+            <aside id="selectionBar" class="editor-inspector selection-bar" hidden aria-label="属性面板">
+              <div class="inspector-section">
+                <div class="inspector-header">
+                  <h3>当前拍位</h3>
+                  <strong id="selectedEventLabel">-</strong>
+                </div>
+              </div>
+
+              <div class="inspector-section">
+                <h4>和弦音</h4>
+                <select id="selectedToneSelect" class="inspector-full"></select>
+              </div>
+
+              <div class="inspector-section" id="selectedToneField">
+                <h4>演奏 / 强弱</h4>
+                <div class="inspector-grid">
+                  <label class="inspector-field"><span>演奏</span>
+                    <select id="articulationSelect">
+                      <option value="">无</option>
+                      <option value="staccato">断奏</option>
+                      <option value="accent">重音</option>
+                      <option value="tenuto">保持</option>
+                      <option value="marcato">强音</option>
+                    </select>
+                  </label>
+                  <label class="inspector-field"><span>强弱</span>
+                    <select id="dynamicSelect">
+                      <option value="">无</option>
+                      <option value="ppp">ppp</option>
+                      <option value="pp">pp</option>
+                      <option value="p">p</option>
+                      <option value="mp">mp</option>
+                      <option value="mf">mf</option>
+                      <option value="f">f</option>
+                      <option value="ff">ff</option>
+                      <option value="fff">fff</option>
+                      <option value="sfz">sfz</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              <div class="inspector-section">
+                <h4>装饰 / 表情</h4>
+                <div class="inspector-grid">
+                  <label class="inspector-field"><span>装饰</span>
+                    <select id="ornamentSelect">
+                      <option value="">无</option>
+                      <option value="trill">颤音</option>
+                      <option value="mordent">上波音</option>
+                      <option value="mordent-inverted">下波音</option>
+                      <option value="turn">回音</option>
+                      <option value="turn-inverted">逆回</option>
+                      <option value="upprall">上行波</option>
+                      <option value="downprall">下行波</option>
+                      <option value="lineprall">经过波</option>
+                    </select>
+                  </label>
+                  <label class="inspector-field"><span>渐强</span>
+                    <select id="hairpinSelect">
+                      <option value="">无</option>
+                      <option value="cresc-start">渐强开始</option>
+                      <option value="decresc-start">渐弱开始</option>
+                      <option value="stop">结束</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="inspector-grid">
+                  <label class="inspector-field"><span>踏板</span>
+                    <select id="pedalSelect">
+                      <option value="">无</option>
+                      <option value="start">踩下</option>
+                      <option value="stop">抬起</option>
+                    </select>
+                  </label>
+                  <label class="inspector-field"><span>指法</span>
+                    <input id="fingeringInput" type="text" placeholder="1-5" maxlength="1" />
+                  </label>
+                </div>
+                <div class="inspector-grid">
+                  <label class="inspector-field inspector-check"><input type="checkbox" id="arpeggioCheck" /><span>琶音</span></label>
+                  <label class="inspector-field inspector-check"><input type="checkbox" id="breathCheck" /><span>呼吸</span></label>
+                </div>
+                <div class="inspector-grid">
+                  <button id="togglePhraseStartButton" class="icon-button toggle" type="button" aria-pressed="false">乐句起</button>
+                  <button id="togglePhraseStopButton" class="icon-button toggle" type="button" aria-pressed="false">乐句止</button>
+                  <button id="toggleFermataButton" class="icon-button toggle" type="button" aria-pressed="false">Fermata 𝄐</button>
+                </div>
+                <div class="inspector-grid">
+                  <button id="toggleTieStartButton" class="icon-button toggle" type="button" aria-pressed="false">延音⌒</button>
+                  <button id="toggleTieStopButton" class="icon-button toggle" type="button" aria-pressed="false">延音止</button>
+                  <button id="toggleSlurStartButton" class="icon-button toggle" type="button" aria-pressed="false">连~</button>
+                  <button id="toggleSlurStopButton" class="icon-button toggle" type="button" aria-pressed="false">连止</button>
+                  <button id="toggleTripletButton" class="icon-button toggle" type="button" aria-pressed="false">3 连音</button>
+                </div>
+                <label class="inspector-field"><span>连音类型</span>
+                  <select id="tupletTypeSelect">
+                    <option value="triplet">三连音</option>
+                    <option value="quintuplet">五连音</option>
+                    <option value="sextuplet">六连音</option>
+                  </select>
+                </label>
+              </div>
+
+              <!-- P22.5-Symbol-A.4 — 曲式 / 段标 -->
+              <div class="inspector-section">
+                <h4>曲式 / 段标</h4>
+                <div class="inspector-grid">
+                  <label class="inspector-field"><span>段标</span>
+                    <input id="rehearsalMarkInput" type="text" placeholder="A / Intro / Verse 1" maxlength="8" />
+                  </label>
+                  <label class="inspector-field"><span>反复 (volta)</span>
+                    <select id="voltaSelect">
+                      <option value="">无</option>
+                      <option value="1">1. 结束</option>
+                      <option value="2">2. 结束</option>
+                      <option value="3">3. 结束</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              <div class="inspector-section">
+                <h4>文本 / 标记</h4>
+                <label class="inspector-field"><span>和弦符号</span><input id="chordSymbolInput" type="text" placeholder="C、Am、G7" /></label>
+                <label class="inspector-field"><span>文本标注</span><input id="textMarkInput" type="text" placeholder="dolce、rit.、I" /></label>
+                <label class="inspector-field"><span>倚音</span><input id="graceInput" type="text" placeholder="C5" /></label>
+              </div>
+
+              <div class="inspector-section inspector-actions">
+                <button id="applyDurationButton" class="icon-button" type="button">应用时值</button>
+                <button id="deleteToneButton" class="icon-button danger" type="button">删除该音</button>
+                <button id="deleteEventButton" class="icon-button danger" type="button">删除拍位</button>
+              </div>
+            </aside>
+          </div>
+
+          <!-- ============ 底部：批量输入 + 导出 ============ -->
+          <div class="editor-bottom">
+            <div class="alt-input-section" data-ribbon-tab="alt">
+              <label class="alt-input-field">
+                <span>批量文本（会<strong>替换</strong>五线谱内容，谨慎使用）</span>
+                <input id="noteInput" value="" placeholder="C5:4 | D5:4 | R:4 | C5:4 || F5:4 | E5:4 | D5:4 | C5:4" />
+              </label>
+              <button id="noteButton" class="icon-button primary" type="button" title="把下方文本框的音符解析后填到上方五线谱">↓ 填入到五线谱</button>
+              <p class="entry-hint">默认请直接在<strong>上方五线谱</strong>用鼠标点输入音符，下方文本框只用于批量粘贴。改了文本记得清空五线谱再点此按钮。</p>
+            </div>
+
+            <div class="score-export-panel">
+              <div class="score-export-actions">
+                <span id="scoreExportStatus" class="ribbon-status">等待生成</span>
+                <strong id="scoreExportStatusHidden" hidden></strong>
+              </div>
+              <textarea id="scoreDataOutput" readonly placeholder="这里会生成后续 AI / MusicXML / 和声分析可读取的谱面数据"></textarea>
+            </div>
+          </div>
+        </section>
+
+        <section class="answer-panel view-panel" data-view="answer">
+          <header class="answer-panel-header">
+            <div>
+              <p>参考答案生成</p>
+              <h2>四部和声参考答案</h2>
+            </div>
+            <div class="answer-meta-actions">
+              <label class="dot-control">
+                <span>题型</span>
+                <select id="questionTypeSelect">
+                  <option value="melody">旋律题</option>
+                  <option value="bass">低音题</option>
+                </select>
+              </label>
+              <label class="dot-control" title="Sposobin 章节范围：早期正三和弦 / 中段 V7 / 全功能。题目越靠后、升降号越多，建议用更宽的池子。">
+                <span>章节范围</span>
+                <select id="chordPoolProfile">
+                  <option value="auto" selected>自动（按调号推断）</option>
+                  <option value="ch1-4_triad_only">ch1-4 早期正三和弦</option>
+                  <option value="ch5-7_triad_plus_v64">ch5-7 正三和弦 + V6/4</option>
+                  <option value="ch8-20_v7">ch8-20 + V7</option>
+                  <option value="ch21-22_d7_ii7_vii7">ch21-22 + ii7/vii°7</option>
+                  <option value="ch23_v9">ch23 + V9</option>
+                  <option value="ch24-26_dd">ch24-26 副属体系</option>
+                  <option value="full_p0-p7">full P0-P7 (默认上册中段)</option>
+                  <option value="full_p0-p9">full P0-P9 (含 P9 变音)</option>
+                </select>
+              </label>
+              <label class="dot-control" title="在指定小节切换到新调, 多个用 | 分隔, 例: 2→G | 4→a">
+                <span>转调 (P7.5)</span>
+                <input id="keyChangesInput" type="text" placeholder="例: 2→G | 4→a" />
+              </label>
+              <button id="fourPartButton" type="button">生成四部和声参考答案</button>
+              <button id="aiExplainButton" class="secondary-button" type="button" disabled title="基于 RAG + DeepSeek 教师式中文讲解">🧠 AI 讲解</button>
+            </div>
+          </header>
+          <div class="answer-meta">
+            <span>可直接读取上方文本，多小节用 || 分隔</span>
+            <div class="answer-meta-actions">
+              <button id="applyFourPartButton" class="secondary-button" type="button" disabled>套用到制谱区</button>
+              <strong id="fourPartStatus">等待生成</strong>
+            </div>
+          </div>
+          <div class="score-viewport answer-score-viewport">
+            <div id="fourPartCanvas" class="four-part-canvas" aria-label="四部和声答案谱"></div>
+          </div>
+          <div id="fourPartDetails" class="answer-details empty">尚无参考答案</div>
+          <div id="aiExplanationPanel" class="ai-explanation-panel" hidden>
+            <header>
+              <h3>🧠 AI 教师讲解</h3>
+              <span id="aiExplanationMeta" class="ai-explanation-meta"></span>
+            </header>
+            <div id="aiExplanationBody" class="ai-explanation-body"></div>
+            <div id="aiExplanationRules" class="ai-explanation-rules"></div>
+          </div>
+        </section>
+
+        <section class="result-grid view-panel" data-view="analysis">
+          <article class="panel summary-panel">
+            <header>
+              <h2>读谱概要</h2>
+              <span id="readStatus">等待上传</span>
+            </header>
+            <dl id="summaryList" class="summary-list">
+              <div><dt>文件</dt><dd>-</dd></div>
+              <div><dt>调性</dt><dd>-</dd></div>
+              <div><dt>声部</dt><dd>-</dd></div>
+              <div><dt>小节</dt><dd>-</dd></div>
+            </dl>
+          </article>
+
+          <article class="panel">
+            <header><h2>小节预览</h2></header>
+            <div id="measurePreview" class="measure-preview empty">尚无乐谱数据</div>
+          </article>
+
+          <article class="panel">
+            <header><h2>纵向和声 (斯波索宾分析)</h2></header>
+            <div id="harmonyPreview" class="harmony-preview empty">尚无和声数据</div>
+          </article>
+
+          <article class="panel">
+            <header><h2>和声分析 (功能 / 终止 / 离调 / 转调)</h2></header>
+            <div id="theory-analysis" class="empty">尚无和声分析数据</div>
+          </article>
+
+          <article class="panel">
+            <header><h2>校验警告</h2></header>
+            <div id="warningList" class="warning-list empty">尚无校验结果</div>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="vendor/vexflow/vexflow.js"></script>
+    <!-- P22.4-B.2: CoordinateSystem v1 (统一坐标层) — 必须在 app.js 前加载 -->
+    <script src="coordinate-system.js?v=28"></script>
+    <!-- P22.5-B.1: Score Model (数据契约层) — 必须在 app.js 前加载 -->
+    <script src="score-model.js?v=32"></script>
+    <script src="app.js?v=28"></script>
+  </body>
+</html>

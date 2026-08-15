@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "id": "autumn_leaves",
+    "composer": "Joseph Kosma (orig. French) / Johnny Mercer (English lyrics)",
+    "title": "Autumn Leaves",
+    "opus": "",
+    "period": "Jazz Standard (1945)",
+    "style_profile": "jazz",
+    "analysis_framework": "jazz_functional",
+    "excerpt": "mm.1-16 (A section, first 16 bars of 32-bar form)",
+    "difficulty": 3,
+    "source_url": "https://www.jazzstandards.com/compositions-1/autumnleaves.htm"
+  },
+  "analysis": {
+    "key": "G minor (intro) / Bb major (A section)",
+    "key_changes": [
+      {"measure": 1, "new_key": "Bb major (A section enters)", "notes": "from Gm intro"}
+    ],
+    "phrase_structure": {
+      "type": "aaba' (32-bar AABA' form)",
+      "length": "8+8+8+8",
+      "antecedent": "mm.1-8 (statement: ends PAC)",
+      "consequent": "mm.9-16 (repeat with variation)"
+    },
+    "harmony": {
+      "roman_progression": ["iim7", "V7", "IM7", "VIm7", "iim7", "V7", "IM7", "VI7"],
+      "functional_analysis": ["ii-V-I", "vi", "ii-V-I", "V/V", "(repeat)"]
+    },
+    "cadences": [
+      {"type": "PAC", "measure": 8, "confidence": 0.95},
+      {"type": "PAC", "measure": 16, "confidence": 0.95}
+    ],
+    "form_role": "A section (statement + repetition)"
+  },
+  "errors_expected": [
+    "Agent may analyze as classical ii-V-i (WRONG — should be ii-V-I in Bb major)",
+    "Agent may miss 7th chord extensions (iim7 not ii)"
+  ],
+  "teaching_points": [
+    "Classic ii-V-I cycle in major (Bb major)",
+    "All chords are 7ths — jazz harmony",
+    "32-bar AABA' form is jazz standard"
+  ],
+  "alternative_analysis": [
+    {
+      "framework": "jazz_functional",
+      "interpretation": "ii-V-I-VI-ii-V-I (all 7th chords, Bb major)",
+      "confidence": 0.95
+    },
+    {
+      "framework": "modal",
+      "interpretation": "Bb dorian emphasis in bridge (m.17-24)",
+      "confidence": 0.5
+    }
+  ],
+  "needs_expert_review": false,
+  "review_notes": "well-known jazz standard, my analysis is solid"
+}
