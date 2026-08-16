@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import mimetypes
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+# Register woff2 mime (Python <3.13 不自带). StaticFiles 用 mimetypes 推断 Content-Type.
+mimetypes.add_type("font/woff2", ".woff2")
+mimetypes.add_type("font/woff", ".woff")
+mimetypes.add_type("font/ttf", ".ttf")
+mimetypes.add_type("font/otf", ".otf")
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -23,7 +30,22 @@ from manual_notes import locate_manual_notes
 # The Sposobin solver (solver.py, P0-P7 + bass-given) now handles ALL
 # four-part problems — both melody-given and bass-given.  See git log
 # for the removal commit.
-import solver as sposobin_solver
+#
+# P2.6-C3 (2026-08-15): server defaults to v1.6 (beam K=50, 50 alternatives)
+# to expose multi-solution paths.  Set SOLVER_VERSION=v1.5 to revert to
+# the previous P0-P7 frozen solver (K=3, top_n=1).
+import os
+if os.environ.get("SOLVER_VERSION") == "v1.5":
+    import solver as sposobin_solver  # legacy P0-P7 frozen (K=3, top_n=1)
+else:
+    import importlib.util
+    _V16_PATH = CURRENT_DIR / "frozen_v1_6" / "solver.py"
+    _v16_spec = importlib.util.spec_from_file_location(
+        "solver_v16", str(_V16_PATH))
+    sposobin_solver = importlib.util.module_from_spec(_v16_spec)
+    sys.modules["solver_v16"] = sposobin_solver
+    _v16_spec.loader.exec_module(sposobin_solver)
+
 from editor_to_solver import (
     _APPJS_ACCIDENTAL_TO_SOLVER,
     _APPJS_DURATION_TO_QUARTER,
@@ -125,7 +147,7 @@ async def _safe_exception_handler(_request: _FastAPIRequest, exc: Exception) -> 
     return _JSONResponse(
         status_code=200,
         content={
-            "source": {"engine": "sposobin-solver", "version": "P18.6", "fallback": False},
+            "source": {"engine": "sposobin-solver", "version": "P0-P2.6 v1.6", "fallback": False},
             "summary": {
                 "status": "error",
                 "partCount": 4,
@@ -208,6 +230,161 @@ async def read_score_upload(file: UploadFile = File(...)) -> dict:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/parse-score")
+async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
+    """P2.7+: take a MusicXML file → run reader.py → run reader_to_editor.py →
+    return editor entry format (melodyMeasures + bassMeasures) that the
+    frontend can directly feed to /solve-melody or load into the editor.
+
+    The key difference from /read-score:
+      /read-score:      returns raw reader output (parts + events, no voice
+                        separation).  Frontend only displays it.
+      /parse-score:     returns editor entry format (melody/bass already
+                        separated by voice).  Frontend can load directly.
+
+    Both endpoints share the same upload + tempdir + OMR fallback path.
+    """
+    from reader_to_editor import reader_payload_to_editor  # P2.7+
+
+    suffix = Path(file.filename or "").suffix.lower()
+    supported = SUPPORTED_EXTENSIONS | SUPPORTED_OMR_EXTENSIONS
+    if suffix not in supported:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
+
+    with tempfile.TemporaryDirectory(prefix="music-reader-parse-") as temp_dir:
+        target = Path(temp_dir) / (file.filename or f"upload{suffix}")
+        with target.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle)
+
+        try:
+            if suffix in SUPPORTED_OMR_EXTENSIONS:
+                omr_dir = Path(temp_dir) / "omr-output"
+                omr_result = transcribe_with_audiveris(target, omr_dir)
+                raw_payload = read_score(omr_result["exportedPath"])
+            else:
+                raw_payload = read_score(target)
+        except OmrError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # 把 reader output 转 editor entry format (voice separation 做完)
+    editor_payload = reader_payload_to_editor(raw_payload)
+    # 附上原始 summary 给前端 (keyPerMeasure, cadences, etc.)
+    editor_payload["rawSummary"] = raw_payload.get("summary", {})
+    return editor_payload
+
+
+# ---------------------------------------------------------------------------
+# P2.7+: XML 文件列表 + 按 file_id 解析
+# ---------------------------------------------------------------------------
+# 用户在 step 3 五线谱制谱区点 XML 文件名 → 直接灌入五线谱 (不走 OS file dialog).
+# 全部 XML 在 SHTE_ROOT (eval-data/extracted/hamony dataset/) 下面, 388 个.
+# 限制: 一次最多返 N 个 (默认 1 个, 让用户先试通流程).
+
+SHTE_ROOT = Path(r"C:\Users\Administrator\Documents\try\eval-data\extracted\hamony dataset")
+_XML_FILE_REGISTRY: dict[str, Path] = {}
+
+
+def _index_xml_files() -> None:
+    """Walk SHTE_ROOT and index all .xml files by an opaque id.
+
+    P2.7+ 策略: SHTE dataset 每个 case 有 2 个版本:
+      - ch4/original/ch4-01_a minor.xml  → 单声部 melody (用户输入形态)
+      - ch4/four/ch4-01_a minor.xml      → 4 voice SATB gold 答案
+    默认 id 指向 `original/` (单声部), 让 user 看到的是题, 不是 gold 答案.
+    `four/` 版本用 disambiguated id ("four/ch4-01_a minor").
+    """
+    if _XML_FILE_REGISTRY:
+        return
+    # 按 path 排序保证 deterministic; original/ 优先匹配 stem.
+    for xml in sorted(SHTE_ROOT.glob("**/*.xml"), key=lambda p: (p.stem, 0 if "original" in p.parts else 1)):
+        fid = xml.stem
+        if fid in _XML_FILE_REGISTRY:
+            # 已经指向 original/, 跳过后续的 four/ (因为 sort 把 original 排前面)
+            stem_with_parent = f"{xml.parent.name}/{xml.stem}"
+            _XML_FILE_REGISTRY[stem_with_parent] = xml
+        else:
+            # 第一次: 指向 original/ (单声部)
+            _XML_FILE_REGISTRY[fid] = xml
+
+
+@app.get("/list-xml")
+async def list_xml_files(query: str = "", limit: int = 1) -> dict:
+    """List XML files in SHTE dataset, with optional query filter and limit.
+
+    Args:
+      query: case-insensitive substring filter on filename.  e.g. "ch4-01" or "f minor".
+      limit: max number of results (default 1, capped at 50).
+
+    Returns:
+      {
+        "files": [{"id": "ch4-01_a minor", "name": "ch4-01_a minor.xml", "path": "...", "chapter": "ch4"}],
+        "total": 388,
+        "filtered": 1,
+        "limit": 1
+      }
+    """
+    _index_xml_files()
+    all_ids = sorted(_XML_FILE_REGISTRY.keys())
+    if query:
+        q = query.lower()
+        all_ids = [fid for fid in all_ids if q in fid.lower()]
+    total = len(_XML_FILE_REGISTRY)
+    filtered = len(all_ids)
+    limit = max(1, min(int(limit), 50))
+    items = []
+    for fid in all_ids[:limit]:
+        path = _XML_FILE_REGISTRY[fid]
+        # chapter: ch4 (取 fid 第一个 ch 段)
+        chapter = ""
+        for seg in path.parts:
+            if seg.startswith("ch") and seg[2:].isdigit():
+                chapter = seg
+                break
+        items.append({
+            "id": fid,
+            "name": path.name,
+            "path": str(path),
+            "chapter": chapter,
+        })
+    return {"files": items, "total": total, "filtered": filtered, "limit": limit}
+
+
+@app.post("/parse-score-by-id")
+async def parse_score_by_id(request: Request) -> dict:
+    """Same as /parse-score but takes a file_id (from /list-xml) instead of multipart upload.
+
+    Used by the in-page XML file list (P2.7+): user clicks a filename, this endpoint
+    loads it by id and returns the editor entry payload.
+
+    Body: {"file_id": "ch4-01_a minor"}
+    """
+    body = await request.json()
+    file_id = body.get("file_id")
+    if not file_id:
+        raise HTTPException(status_code=400, detail="file_id is required in request body")
+
+    _index_xml_files()
+    if file_id not in _XML_FILE_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"file_id not found: {file_id}")
+    target = _XML_FILE_REGISTRY[file_id]
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"file no longer exists: {target}")
+
+    from reader_to_editor import reader_payload_to_editor
+    try:
+        raw_payload = read_score(target)
+    except OmrError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    editor_payload = reader_payload_to_editor(raw_payload)
+    editor_payload["rawSummary"] = raw_payload.get("summary", {})
+    return editor_payload
 
 
 @app.post("/manual-chords")
@@ -358,8 +535,8 @@ def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartReq
         return {
             "id": voice_name,
             "name": voice_name.capitalize(),
-            "clef": "treble" if voice_name in ("soprano", "alto") else (
-                "bass" if voice_name == "bass" else "tenor"),
+            # P22.5-SATB-render: standard SATB clefs (alto=C clef 3rd line, tenor=C clef 4th line)
+            "clef": {"soprano": "treble", "alto": "alto", "tenor": "tenor", "bass": "bass"}.get(voice_name, "treble"),
             "entries": entries,
             "measures": per_measure,
         }
@@ -387,10 +564,16 @@ def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartReq
             "harmonies": per_measure_harmonies,
         })
 
+    # P2.6-C3 (2026-08-15): solver.alternatives is the multi-solution payload
+    # (top-50 in v1.6, top-1 in legacy).  Surface it at the top level so
+    # the frontend can render alternative voicings.
+    raw_alternatives = solver_result_dict.get("alternatives", []) or []
+
     return {
         "source": {
             "engine": "sposobin-solver",
-            "version": "P0-P8",  # P8 (2026-08-09) added bass-given mode
+            # P2.6-C3 (2026-08-15): v1.6 = v1.5 + K=50 default (top_n=50)
+            "version": "P0-P2.6 v1.6",
             "fallback": False,
         },
         "summary": {
@@ -435,6 +618,10 @@ def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartReq
         },
         "warnings": solver_result_dict.get("warnings", []),
         "harmonyTimeline": harmonies_per_measure,
+        # P2.6-C3 (2026-08-15): 透传 v1.6 的 50 alternatives 到前端.
+        # 每个 alternative 是 {rank, deltaScore, summary, measures} dict.
+        "alternatives": raw_alternatives,
+        "alternativesCount": len(raw_alternatives),
     }
 
 
@@ -456,7 +643,8 @@ def _safe_four_part_error_response(request: FourPartRequest, user_message: str, 
     return {
         "source": {
             "engine": "sposobin-solver",
-            "version": "P0-P18.6",
+            # P2.6-C3 (2026-08-15): mirror the success-path version
+            "version": "P0-P2.6 v1.6",
             "fallback": False,
         },
         "summary": {

@@ -4,16 +4,39 @@ P22 第一刀: 把 app.js 编辑器内部 entry 数据结构
 转换为 solver.solve_melody 所需的 melody_pitches /
 bass_pitches 格式.
 
-格式约定:
-    app.js entry:
-        { kind: "note", voice, pitches: [{step, octave, accidental, display}],
+数据契约: 跟 docs/ENTRY_SCHEMA.md 严格一致. 任何修改请同步更新 schema 文档.
+
+格式约定 (entry 形状, 完整定义见 ENTRY_SCHEMA.md §2):
+    app.js editor entry (UI 内部, voice="1"|"2" legacy):
+        { kind: "note", voice: "1"|"2", pitches: [{step, octave, accidental, display}],
           duration: "1|2|4|8|16|32|64|0", dotted: 0|1|2, units,
           tieStart, tieStop, ... }
-        { kind: "rest", voice, duration, dotted, units, ... }
+        { kind: "rest", voice: "1"|"2", duration, dotted, units, ... }
 
     solver input:
         list[measure][beat] -> solver.Note | None
         1 beat = 1 quarter note (1.0)
+
+    server 端两个 list 接口:
+        melodyMeasures: 1 voice (soprano), treble.voice="1" 收集
+        bassMeasures:   1 voice (bass),   bass.voice="2"   收集
+        alto.voice="2" 和 tenor.voice="1" 不送 solver (UI 内部声部).
+
+Voice 字段处理:
+    当前实现 (P2.7+ 集成) **忽略 entry.voice 字段** — server 端按
+    "哪个 list 在哪" 判断声部 (melodyMeasures 全部当 soprano,
+    bassMeasures 全部当 bass). 这是因为:
+      1. 用户实际操作只输 1 voice (melody 或 bass), 其他由 solver 填
+      2. treble.voice="2" (alto) 和 bass.voice="1" (tenor) 是 UI 内部用,
+         solver 不知道也不需要
+    后续如果需要支持 4-voice 完整输入, 加一个 appjs_split_4voice 函数
+    按 voice 字段拆 4 个 list (schema §3 映射), 见 ENTRY_SCHEMA.md §7.
+
+Roundtrip 不变量 (跟 ENTRY_SCHEMA.md §6 对齐):
+    1. 小节数 = N (N ≥ 1)
+    2. 每小节总 units = 32 (4/4)
+    3. pitches[].display == f"{step}{octave}{accidental}"
+    4. duration ↔ units 一致 (4↔8, 2↔16, 1↔32, 8↔4, 16↔2)
 
 迁移记录:
     原 server.py 4 个函数 (_appjs_entry_to_soprano_note /

@@ -18,7 +18,12 @@ const manualKey = findEl("manualKey");
 const manualTime = findEl("manualTime");
 const manualProgression = findEl("manualProgression");
 const noteButton = findEl("noteButton");
-const examplePreset = findEl("examplePreset");
+// P2.7+: 课本例题 dropdown 已删, 改成 XML 文件列表 (见 /list-xml endpoint).
+const examplePreset = findEl("examplePreset"); // unused, kept for backward compat
+const xmlFileList = findEl("xmlFileList");
+const xmlFileListMeta = findEl("xmlFileListMeta");
+const xmlFileSearch = findEl("xmlFileSearch");
+const xmlFileSearchButton = findEl("xmlFileSearchButton");
 const keyChangesInput = findEl("keyChangesInput");
 const staffMode = findEl("staffMode");
 const noteClef = findEl("noteClef");
@@ -61,6 +66,11 @@ const fingeringField = findEl("fingeringField");
 const fingeringInput = findEl("fingeringInput");
 const arpeggioField = findEl("arpeggioField");
 const arpeggioCheck = findEl("arpeggioCheck");
+// P22.5 — 浮动操作条 refs (贴近主谱面的应用时值/删除按钮)
+const floatingActions = findEl("floatingActions");
+const floatingApplyDurationButton = findEl("floatingApplyDurationButton");
+const floatingDeleteToneButton = findEl("floatingDeleteToneButton");
+const floatingDeleteEventButton = findEl("floatingDeleteEventButton");
 // P22.5-Symbol-A.4 — 曲式分析
 const rehearsalMarkInput = findEl("rehearsalMarkInput");
 const voltaSelect = findEl("voltaSelect");
@@ -90,8 +100,8 @@ const endBarlineSelect = findEl("endBarlineSelect");
 const validateScoreButton = findEl("validateScoreButton");
 const exportJsonButton = findEl("exportJsonButton");
 const exportMusicXmlButton = findEl("exportMusicXmlButton");
-const importMusicXmlButton = findEl("importMusicXmlButton");
-const musicXmlFileInput = findEl("musicXmlFileInput");
+const importMusicXmlButton = findEl("importMusicXmlButton"); // legacy, kept for back-compat
+const musicXmlFileInput = findEl("musicXmlFileInput"); // legacy, kept for back-compat
 const scoreExportStatus = findEl("scoreExportStatus");
 const scoreDataOutput = findEl("scoreDataOutput");
 const fourPartButton = findEl("fourPartButton");
@@ -450,6 +460,35 @@ async function uploadScore(file) {
     renderResult(payload);
   } catch (error) {
     setError(error.message || "读取失败");
+    return;
+  }
+
+  // P2.7+: also fetch /parse-score (reader_to_editor) so the editor can be
+  // auto-loaded with the imported melody + bass.  User-confirmed to avoid
+  // silent overwrite of in-progress edits.
+  try {
+    const parseData = new FormData();
+    parseData.append("file", file);
+    const parseResp = await fetch("/parse-score", { method: "POST", body: parseData });
+    const editorPayload = await parseResp.json();
+    if (!parseResp.ok) throw new Error(editorPayload.detail || "解析失败");
+
+    // Detect if editor already has content — confirm overwrite
+    const hasContent = ["treble", "bass"].some((sk) =>
+      (staffScores[sk]?.measures || []).some((m) => (m || []).length > 0)
+    );
+    if (hasContent) {
+      const ok = window.confirm(
+        "检测到五线谱区已有内容。导入 XML 会覆盖当前旋律 (treble 声部 1) 和低音 (bass 声部 2)。\n" +
+        "alto (treble 声部 2) 和 tenor (bass 声部 1) 会留空。\n\n" +
+        "是否继续？"
+      );
+      if (!ok) return;
+    }
+    loadParsedPayloadToEditor(editorPayload);
+  } catch (error) {
+    // /parse-score failure is non-fatal: /read-score already succeeded.
+    setError(`解析为编辑器格式失败: ${error.message || "未知错误"}`);
   }
 }
 
@@ -501,187 +540,12 @@ async function submitManualNotes() {
 }
 
 // ---------------------------------------------------------------------------
-// Sposobin 课本例题预置 (P0-P7.5)
-// ---------------------------------------------------------------------------
-// 这些例题来自 Sposobin《和声学教程》上/下册的经典谱例. 选了一个就
-// 自动填到 noteInput + 调好 key/time/转调 + 自动载入谱面. 用户在 web
-// 端不需要手打就能立刻试新算法 (P0-P7.5).
-//
-// 格式: melody 用 parseScoreTextInput 接受的格式 (用 | 分拍, 用 : 分
-// duration, 用 || 分 measure). 升降号用 # / b (e.g. Eb5, F#4).
-const EXAMPLE_PRESETS = {
-  // ---- 0 升降 ----
-  // P0: I-IV-V-I 经典终止 (C 大调, 无升降)
-  p0_cadence: {
-    label: "P0 C 大调 I-IV-V-I",
-    key: "C", time: "4/4",
-    melody: "C5:4 | D5:4 | E5:4 | C5:4 || F5:4 | F5:4 | F5:4 | F5:4 || G5:4 | G5:4 | G5:4 | G5:4 || C5:4 | C5:4 | C5:4 | C5:4",
-    keyChanges: [],
-  },
-  // P5: a 小调自然/和声终止 (a 小调, 无升降)
-  p5_a_minor: {
-    label: "P5 a 小调终止",
-    key: "a", time: "4/4",
-    melody: "A4:4 | A4:4 | A4:4 | A4:4 || E5:4 | E5:4 | E5:4 | E5:4 || G#5:4 | G#5:4 | G#5:4 | G#5:4 || A4:4 | A4:4 | A4:4 | A4:4",
-    keyChanges: [],
-  },
-  // ---- 1 升降 ----
-  // P1.5: F 大调 (1 降 Bb) 经典终止 — 限制在 C4-C5/C5 范围
-  p1_5_f_major: {
-    label: "P1.5 F 大调 I-V7-I",
-    key: "F", time: "4/4",
-    melody: "F4:4 | G4:4 | A4:4 | F4:4 || C5:4 | C5:4 | C5:4 | C5:4 || A4:4 | A4:4 | A4:4 | A4:4 || F4:4 | F4:4 | F4:4 | F4:4",
-    keyChanges: [],
-  },
-  // P1.6: G 大调 (1 升 F#) 经典终止 — 限制在 C4-C6 范围
-  p1_6_g_major: {
-    label: "P1.6 G 大调 I-V7-I",
-    key: "G", time: "4/4",
-    melody: "G4:4 | A4:4 | B4:4 | G4:4 || D5:4 | D5:4 | D5:4 | D5:4 || B4:4 | B4:4 | B4:4 | B4:4 || G4:4 | G4:4 | G4:4 | G4:4",
-    keyChanges: [],
-  },
-  // P5.3: d 小调 (1 升 F#) 和声终止 — 限制在 C4-C6 范围
-  p5_3_d_minor: {
-    label: "P5.3 d 小调和声终止",
-    key: "d", time: "4/4",
-    melody: "D4:4 | D4:4 | D4:4 | D4:4 || A4:4 | A4:4 | A4:4 | A4:4 || C#5:4 | C#5:4 | C#5:4 | C#5:4 || D4:4 | D4:4 | D4:4 | D4:4",
-    keyChanges: [],
-  },
-  // ---- 2 升降 ----
-  // P1.7: D 大调 (2 升 F#C#) 经典终止
-  p1_7_d_major: {
-    label: "P1.7 D 大调 I-V7-I",
-    key: "D", time: "4/4",
-    melody: "D5:4 | E5:4 | F#5:4 | D5:4 || A5:4 | A5:4 | A5:4 | A5:4 || F#5:4 | F#5:4 | F#5:4 | F#5:4 || D5:4 | D5:4 | D5:4 | D5:4",
-    keyChanges: [],
-  },
-  // P3.6: Bb 大调 (2 降 BbEb) I-IV-V-I
-  p3_6_bb_major: {
-    label: "P3.6 Bb 大调 I-IV-V-I",
-    key: "Bb", time: "4/4",
-    melody: "Bb4:4 | C5:4 | D5:4 | Bb4:4 || Eb5:4 | Eb5:4 | Eb5:4 | Eb5:4 || F5:4 | F5:4 | F5:4 | F5:4 || Bb4:4 | Bb4:4 | Bb4:4 | Bb4:4",
-    keyChanges: [],
-  },
-  // P5.4: g 小调 (2 降 BbEb) 和声终止
-  p5_4_g_minor: {
-    label: "P5.4 g 小调和声终止",
-    key: "g", time: "4/4",
-    melody: "G4:4 | G4:4 | G4:4 | G4:4 || D5:4 | D5:4 | D5:4 | D5:4 || F#5:4 | F#5:4 | F#5:4 | F#5:4 || G4:4 | G4:4 | G4:4 | G4:4",
-    keyChanges: [],
-  },
-  // ---- 3 升降 ----
-  // P2.6: A 大调 (3 升 F#C#G#) V7/V 副属 — 限制在 C4-C6 范围
-  p2_6_a_major: {
-    label: "P2.6 A 大调 V7/V 副属",
-    key: "A", time: "4/4",
-    melody: "A4:4 | B4:4 | C#5:4 | D5:4 || E5:4 | E5:4 | E5:4 | E5:4 || G#4:4 | G#4:4 | G#4:4 | G#4:4 || E4:4 | E4:4 | E4:4 | A4:4",
-    keyChanges: [],
-  },
-  // P3.5: Eb 大调 (3 降 BbEbAb) bVI 借用 — modal mixture
-  p3_5_modal_mixture: {
-    label: "P3.5 Eb 大调 bVI 借用",
-    key: "Eb", time: "4/4",
-    melody: "Eb5:4 | Eb5:4 | Eb5:4 | Bb4:4 || Ab5:4 | Ab5:4 | Ab5:4 | Ab5:4 || Bb5:4 | Bb5:4 | Bb5:4 | Bb5:4 || Eb5:4 | Eb5:4 | Eb5:4 | Eb5:4",
-    keyChanges: [],
-  },
-  // P5.5: c 小调 (3 降) Phrygian 终止
-  p5_phrygian: {
-    label: "P5.5 c 小调 Phrygian 终止",
-    key: "c", time: "4/4",
-    melody: "C5:4 | C5:4 | C5:4 | C5:4 || Ab5:4 | Ab5:4 | Ab5:4 | Ab5:4 || G5:4 | G5:4 | G5:4 | G5:4 || Eb5:4 | Eb5:4 | Eb5:4 | C5:4",
-    keyChanges: [],
-  },
-  // ---- 4 升降 ----
-  // P3.7: Ab 大调 (4 降) I-IV-V-I — 简化的同音重复旋律 (Ab4 个降号调 pool 大, beam 友好)
-  p3_7_ab_major: {
-    label: "P3.7 Ab 大调 I-IV-V-I",
-    key: "Ab", time: "4/4",
-    melody: "Ab4:4 | Ab4:4 | Ab4:4 | Ab4:4 || Db5:4 | Db5:4 | Db5:4 | Db5:4 || Eb5:4 | Eb5:4 | Eb5:4 | Eb5:4 || Ab4:4 | Ab4:4 | Ab4:4 | Ab4:4",
-    keyChanges: [],
-  },
-  // ---- 变和弦 + 转调 ----
-  // P1: V7 7-3 延留
-  p1_v7_suspension: {
-    label: "P1 V7 7-3 延留",
-    key: "C", time: "4/4",
-    melody: "C5:4 | C5:4 | C5:4 | C5:4 || F5:4 | F5:4 | F5:4 | F5:4 || G5:4 | F5:4 | G5:4 | F5:4 || E5:4 | E5:4 | E5:4 | C5:4",
-    keyChanges: [],
-  },
-  // P2: 副属 V7/V
-  p2_v7v: {
-    label: "P2 C 大调 V7/V 副属",
-    key: "C", time: "4/4",
-    melody: "C5:4 | D5:4 | E5:4 | F5:4 || G5:4 | G5:4 | G5:4 | G5:4 || C#5:4 | C#5:4 | C#5:4 | C#5:4 || F5:4 | F5:4 | F5:4 | F5:4",
-    keyChanges: [],
-  },
-  // P3: 增六和弦 Ger+6
-  p3_aug6_ger: {
-    label: "P3 Ger+6 增六和弦",
-    key: "C", time: "4/4",
-    melody: "C5:4 | B4:4 | C5:4 | D5:4 || Ab4:4 | G4:4 | G4:4 | G4:4 || G5:4 | G5:4 | G5:4 | G5:4 || C5:4 | C5:4 | C5:4 | C5:4",
-    keyChanges: [],
-  },
-  // P7.5: C → G 上五度转调
-  p7_5_c_to_g: {
-    label: "P7.5 C → G 转调",
-    key: "C", time: "4/4",
-    melody: "C5:4 | D5:4 | E5:4 | F5:4 || G5:4 | G5:4 | G5:4 | G5:4 || A5:4 | A5:4 | A5:4 | A5:4 || B5:4 | B5:4 | B5:4 | B5:4",
-    keyChanges: [[2, "G"]],
-  },
-  // P7.5: C → a 关系调转调
-  p7_5_c_to_a: {
-    label: "P7.5 C → a 关系调",
-    key: "C", time: "4/4",
-    melody: "C5:4 | D5:4 | E5:4 | F5:4 || G5:4 | G5:4 | G5:4 | G5:4 || A5:4 | A5:4 | A5:4 | A5:4 || B5:4 | B5:4 | B5:4 | B5:4",
-    keyChanges: [[2, "a"]],
-  },
-};
+// (P2.7+ 集成 2026-08-15: 课本例题 EXAMPLE_PRESETS 数据 + loadExamplePreset
+//  函数已删除, 改成 "导入 MusicXML" 按钮走 /parse-score (server reader.py +
+//  reader_to_editor.py) 把任意 XML 谱例直接转化到制谱页面. 五线谱只显示
+//  用户输入 (melody + bass), 不显示 alto/tenor/gold 4 voice 答案.
+//  P0-P7 solver 规则 (frozen_v1_6/solver.py) 不动.)
 
-function loadExamplePreset(presetKey) {
-  const preset = EXAMPLE_PRESETS[presetKey];
-  if (!preset) {
-    if (typeof showEditorMessage === "function") {
-      showEditorMessage(`未找到例题：${presetKey}`, "error");
-    }
-    return;
-  }
-  // 1) 填到 noteInput
-  if (noteInput) noteInput.value = preset.melody;
-  // 2) 调好 key + time (主编辑器 + 手动和弦区域)
-  if (editorKey) editorKey.value = preset.key;
-  if (editorTime) editorTime.value = preset.time;
-  if (manualKey) manualKey.value = preset.key;
-  if (manualTime) manualTime.value = preset.time;
-  // 3) 转调点 → keyChangesInput (用户能直接看到) + localStorage
-  const kcStr = (preset.keyChanges || [])
-    .map(([m, k]) => `${m + 1}→${k}`)
-    .join(" | ");
-  if (keyChangesInput) keyChangesInput.value = kcStr;
-  try {
-    localStorage.setItem("musicreader:key_changes", JSON.stringify(preset.keyChanges || []));
-  } catch (e) {
-    // localStorage 可能被禁用, 不影响主流程
-  }
-  // 4) 自动载入谱面
-  try {
-    const measures = parseScoreTextInput(preset.melody);
-    loadParsedMeasuresIntoEditor(measures);
-    // P18.8.3 — 重新激活 staff 引用 + 重渲染（loadParsedMeasuresIntoEditor 改了 staffScores 但不重画）
-    activateStaff();
-    currentMeasureIndex = 0;
-    try { renderNotation(); } catch (e) { handleRenderError(e); }
-    if (typeof showEditorMessage === "function") {
-      showEditorMessage(
-        `已载入课本例题「${preset.label}」 (${preset.key} ${preset.time}, ${preset.keyChanges?.length || 0} 个转调). 点"生成四部和声"看结果.`,
-        "success"
-      );
-    }
-  } catch (err) {
-    if (typeof showEditorMessage === "function") {
-      showEditorMessage(err.message || "谱面载入失败", "error");
-    }
-  }
-}
 
 function loadParsedMeasuresIntoEditor(parsedMeasures) {
   const voiceId = activeVoiceId();
@@ -709,6 +573,121 @@ function loadParsedMeasuresIntoEditor(parsedMeasures) {
     selectLastEntryInActiveVoice();
   });
   showEditorMessage(`已载入 ${nextMeasures.length} 个小节到${activeStaffLabel()} ${activeVoiceLabel()}。`, "success");
+}
+
+
+// P2.7+: load full 4-voice payload from /parse-score into editor.
+//   - melodyMeasures → treble staff, voice "1"  (soprano)
+//   - bassMeasures   → bass staff,   voice "2"  (bass)
+//   - alto (treble.2) and tenor (bass.1) are left empty for user to fill
+//     or for /solve-melody output to overwrite via applyFourPartAnswerToEditor.
+//
+// Editor entry shape per docs/ENTRY_SCHEMA.md §2:
+//   { kind, voice, pitches: [{step, octave, accidental, display}],
+//     duration, dotted, units }
+// Voice field is normalised to "1"|"2" here (UI legacy) before injection.
+// 规范化 key 字符串: server/reader_to_editor 返回 "C major"/"A minor"/"F# minor" 等长形式,
+// editorKey <select> options 是 "C"/"G"/"Am"/"F#m" 等短形式, 需要转换.
+function normalizeKeyForSelect(keyLabel) {
+  if (!keyLabel) return null;
+  const k = String(keyLabel).trim();
+  // 已经是短形式 (如 "Am" / "F#m" / "Bb"), 直接返回
+  if (/^[A-G][#b]?m?$/.test(k)) return k;
+  // "A minor" -> "Am", "C major" -> "C", "F# minor" -> "F#m", "Bb major" -> "Bb"
+  const m = k.match(/^([A-G][#b]?)\s*(major|minor)$/i);
+  if (!m) return null;
+  const tonic = m[1];
+  const isMinor = m[2].toLowerCase() === "minor";
+  return isMinor ? tonic + "m" : tonic;
+}
+
+function loadParsedPayloadToEditor(editorPayload) {
+  // P2.7.1: 支持 4 voice 完整 SATB (server / reader_to_editor 现在返 soprano/alto/tenor/bass 4 组).
+  // 兼容老 server (只返 melodyMeasures + bassMeasures) → 自动当 S + B, alto/tenor 留空.
+  const sopranoMeasures = editorPayload?.sopranoMeasures || editorPayload?.melodyMeasures || [];
+  const altoMeasures    = editorPayload?.altoMeasures    || [];
+  const tenorMeasures   = editorPayload?.tenorMeasures   || [];
+  const bassMeasures    = editorPayload?.bassMeasures    || [];
+
+  const nMeasures = Math.max(
+    sopranoMeasures.length, altoMeasures.length,
+    tenorMeasures.length,   bassMeasures.length,
+    1
+  );
+  const requiredCount = Math.min(16, Math.max(
+    nMeasures,
+    staffScores.treble.measures.length,
+    staffScores.bass.measures.length
+  ));
+
+  // Set key + time signature.
+  // editorKey 是 <select>, options 是 "C"/"G"/"Am"/"F#m" 这种短形式,
+  // server / reader_to_editor 返回 "C major" / "A minor" 等长形式,
+  // 需要规范化才能 select value 匹配得上.
+  if (editorPayload.key) {
+    const normalizedKey = normalizeKeyForSelect(editorPayload.key);
+    if (normalizedKey) editorKey.value = normalizedKey;
+  }
+  if (editorPayload.timeSignature) {
+    editorTime.value = editorPayload.timeSignature;
+  }
+
+  // P2.7.1 NOTE: 不自动切 staffMode 到 "piano" 双谱表.
+  // piano 模式 renderPianoNotation 有独立分支, 自动切换会触发 render 路径 bug.
+  // 让用户手动在 "谱表模式" 下拉里选 "钢琴双谱表" 来同时看 S/A/T/B 4 voice.
+  // 当前单谱表模式默认显示 treble (S 在 voice 1, A 在 voice 2 stem 向下叠).
+
+  // Prepare measures arrays
+  ["treble", "bass"].forEach((staffKey) => {
+    while (staffScores[staffKey].measures.length < requiredCount) staffScores[staffKey].measures.push([]);
+    while (staffScores[staffKey].settings.length < requiredCount) staffScores[staffKey].settings.push(defaultMeasureSettings());
+  });
+
+  // 灌入 helper: 把 voice 数组按 voice id 写到对应 staff measure.
+  // 同一 staff 内 voice 编号是相对的 (1 = 上, 2 = 下).
+  // SATB → UI 映射: S→treble.1, A→treble.2, T→bass.1, B→bass.2.
+  const writeVoice = (staffKey, voiceId, measures) => {
+    for (let mi = 0; mi < measures.length; mi += 1) {
+      const entries = (measures[mi] || [])
+        .filter((e) => e && e.kind !== undefined)
+        .map((e) => ({ ...e, voice: String(voiceId) }));
+      const existing = staffScores[staffKey].measures[mi] || [];
+      staffScores[staffKey].measures[mi] = [
+        ...existing.filter((entry) => String(entryVoice(entry)) !== String(voiceId)),
+        ...entries,
+      ];
+    }
+  };
+
+  commitEdit(() => {
+    writeVoice("treble", 1, sopranoMeasures);  // S → treble voice 1
+    writeVoice("treble", 2, altoMeasures);     // A → treble voice 2
+    writeVoice("bass",   1, tenorMeasures);    // T → bass voice 1
+    writeVoice("bass",   2, bassMeasures);     // B → bass voice 2
+
+    currentMeasureIndex = 0;
+    noteMeasure.value = "1";
+    activateStaff("treble");
+    selectLastEntryInActiveVoice();
+  });
+
+  // Status: 报告 4 voice 灌入情况, 让用户知道 alto/tenor 有没有.
+  const filled = [
+    sopranoMeasures.length ? "S" : null,
+    altoMeasures.length    ? "A" : null,
+    tenorMeasures.length   ? "T" : null,
+    bassMeasures.length    ? "B" : null,
+  ].filter(Boolean).join("/") || "(空)";
+  const missing = [
+    !sopranoMeasures.length ? "S" : null,
+    !altoMeasures.length    ? "A" : null,
+    !tenorMeasures.length   ? "T" : null,
+    !bassMeasures.length    ? "B" : null,
+  ].filter(Boolean).join("/") || "(无)";
+  showEditorMessage(
+    `已载入 XML: 4 voice [${filled}] 各 ${nMeasures} 小节. 缺失: ${missing}.`,
+    missing === "(无)" ? "success" : "info"
+  );
 }
 
 async function submitFourPartAnswer() {
@@ -1547,105 +1526,178 @@ function renderFourPartScore(voices, timeSignature, harmonies = [], cadence = ""
   fourPartCanvas.classList.remove("notation-error");
   const width = Math.max(720, Math.floor(fourPartCanvas.parentElement.clientWidth - 2));
   const measureCount = Math.max(1, ...voices.map((voice) => (voice.measures || []).length));
-  const rowHeight = 84;
-  const systemHeight = voices.length * rowHeight + 34;
-  const height = Math.max(130, measureCount * systemHeight + 38);
+
+  // P22.5-SATB-render: 标准合唱谱排版
+  // 1 system = 1 measure + 4 voice 紧密垂直 (S/A/T/B)
+  // 4 measure 4 system 垂直堆叠. brace 连 S+A + T+B, bracket 包 4 stave
+  const systemTopY = 36;
+  const staveHeight = 40;       // 4 voice 紧密 (合唱谱标准)
+  const systemHeight = staveHeight * 4 + 18;
+  const xStart = 56;            // 给 voice label + brace/bracket 留位
+  const usableWidth = Math.max(360, width - xStart - 16);
+  const height = Math.max(180, measureCount * systemHeight + 60);
   fourPartCanvas.style.width = `${width}px`;
   fourPartCanvas.style.height = `${height}px`;
 
   const renderer = new VF.Renderer(fourPartCanvas, VF.Renderer.Backends.SVG);
   renderer.resize(width, height);
   const context = renderer.getContext();
-  const usableWidth = Math.max(360, width - 170);
   const meter = meterForTimeSignature(timeSignature);
   const keySpec = keySpecFromLabel(manualKey.value);
-  const sopranoNoteXs = [];
+
+  // 4 voice 顺序固定: soprano, alto, tenor, bass
+  const orderedVoices = ["soprano", "alto", "tenor", "bass"]
+    .map((id) => voices.find((v) => v.id === id))
+    .filter(Boolean);
+  if (orderedVoices.length === 0) {
+    fourPartCanvas.textContent = "没有可渲染的声部数据。";
+    return;
+  }
+
+  // 收集每个 system soprano note X 位置 (用于罗马数字标注)
+  const systemSopranoXs = [];
 
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
-    let sopranoNotes = null;
-    voices.forEach((voiceData, voiceIndex) => {
-      const y = 28 + measureIndex * systemHeight + voiceIndex * rowHeight;
-      const stave = new VF.Stave(72, y, width - 96);
-      stave.addClef(voiceData.clef || "treble");
-      if (measureIndex === 0 && voiceIndex === 0 && keySpec) stave.addKeySignature(keySpec);
-      if (voiceIndex === 0) stave.addTimeSignature(timeSignature);
-      stave.setContext(context).draw();
+    const systemY = systemTopY + measureIndex * systemHeight;
+    const staves = [];
+    const vexVoices = [];   // VexFlow Voice (nullable for empty voice)
+    const voiceNoteLists = [];  // raw StaveNote[] for each voice (for X lookup)
 
-      const hasMeasureData = Array.isArray(voiceData.measures);
-      const entries = hasMeasureData ? (voiceData.measures[measureIndex]?.entries || []) : (voiceData.entries || []);
-      const notes = entries.map((entry) => createVexNote(entry, voiceData.clef || "treble", timeSignature));
-      if (!notes.length) return;
-      if (voiceData.id === "soprano") sopranoNotes = notes;
+    // 1) 4 voice 各建 1 stave, 第 1 个 system 加 clef/key/time, 其后复用
+    for (let v = 0; v < 4; v += 1) {
+      const vData = orderedVoices[v];
+      if (!vData) {
+        staves.push(null);
+        vexVoices.push(null);
+        voiceNoteLists.push([]);
+        continue;
+      }
+      const stave = new VF.Stave(xStart, systemY + v * staveHeight, usableWidth);
+      const clef = vData.clef || "treble";
+      if (measureIndex === 0) {
+        stave.addClef(clef);
+        if (v === 0 && keySpec) stave.addKeySignature(keySpec);
+        if (v === 0) stave.addTimeSignature(timeSignature);
+      }
+      stave.setContext(context).draw();
+      staves.push(stave);
+
+      // 2) 这个 voice 的当前 measure entries → VexFlow notes
+      const entries = (vData.measures && vData.measures[measureIndex]?.entries) || [];
+      const voiceId = vData.id;
+      const notes = entries.map((e) => createVexNote(e, clef, timeSignature, undefined, voiceId));
+      voiceNoteLists.push(notes);
+
+      if (!notes.length) {
+        vexVoices.push(null);
+        continue;
+      }
       const voice = new VF.Voice({ numBeats: meter.numerator, beatValue: meter.denominator });
       voice.setMode(VF.Voice.Mode.SOFT);
       voice.addTickables(notes);
-      VF.Accidental.applyAccidentals([voice], "C");
-      const beams = VF.Beam.generateBeams(notes, {
-        groups: VF.Beam.getDefaultBeamGroups(timeSignature)
+      vexVoices.push(voice);
+    }
+
+    // 3) Brace + Bracket (S+A 一组, T+B 一组, 整 4 stave 包 bracket)
+    if (staves[0] && staves[1]) {
+      new VF.StaveConnector(staves[0], staves[1]).setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
+    }
+    if (staves[2] && staves[3]) {
+      new VF.StaveConnector(staves[2], staves[3]).setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
+    }
+    if (staves[0] && staves[3]) {
+      new VF.StaveConnector(staves[0], staves[3]).setType(VF.StaveConnector.type.BRACKET).setContext(context).draw();
+    }
+
+    // 4) 4 voice 共享 Formatter — X 坐标对齐到同一 beat
+    const nonEmpty = vexVoices.filter((v) => v !== null);
+    if (nonEmpty.length > 0) {
+      VF.Accidental.applyAccidentals(nonEmpty, "C");
+      new VF.Formatter().joinVoices(nonEmpty).format(nonEmpty, usableWidth - 60);
+      vexVoices.forEach((v, i) => {
+        if (v && staves[i]) v.draw(context, staves[i]);
       });
-      new VF.Formatter().joinVoices([voice]).format([voice], usableWidth);
-      voice.draw(context, stave);
-      beams.forEach((beam) => beam.setContext(context).draw());
-    });
-    sopranoNoteXs.push(sopranoNotes ? sopranoNotes.map((note) => note.getAbsoluteX()) : []);
+    }
+
+    // 5) 连梁 (beams) — 用所有 voice 的 tickables 一起算
+    const allTickables = vexVoices.filter((v) => v).flatMap((v) => v.getTickables());
+    if (allTickables.length > 0) {
+      try {
+        const beams = VF.Beam.generateBeams(allTickables, {
+          groups: VF.Beam.getDefaultBeamGroups(timeSignature)
+        });
+        beams.forEach((b) => b.setContext(context).draw());
+      } catch (_) { /* beam 算失败不影响音符 */ }
+    }
+
+    // 6) 记录 soprano X 位置给罗马数字标注
+    const sopranoNotes = voiceNoteLists[0] || [];
+    systemSopranoXs.push(sopranoNotes.map((n) => n.getAbsoluteX()));
   }
 
+  // 7) SVG 文字标注
   const svg = fourPartCanvas.querySelector("svg");
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
-    voices.forEach((voiceData, voiceIndex) => {
+    const systemY = systemTopY + measureIndex * systemHeight;
+
+    // voice label (S/A/T/B) 在每个 system 左侧
+    for (let v = 0; v < 4; v += 1) {
+      const vData = orderedVoices[v];
+      if (!vData) continue;
       const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      label.setAttribute("x", "18");
-      label.setAttribute("y", String(58 + measureIndex * systemHeight + voiceIndex * rowHeight));
+      label.setAttribute("x", "12");
+      label.setAttribute("y", String(systemY + v * staveHeight + 24));
       label.setAttribute("fill", "#24332c");
-      label.setAttribute("font-size", "13");
+      label.setAttribute("font-size", "11");
       label.setAttribute("font-weight", "700");
-      label.textContent = voiceData.name || `Voice ${voiceIndex + 1}`;
+      label.textContent = vData.id[0].toUpperCase();
       svg?.append(label);
-    });
+    }
+
+    // 小节号
     const measureLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    measureLabel.setAttribute("x", "72");
-    measureLabel.setAttribute("y", String(20 + measureIndex * systemHeight));
+    measureLabel.setAttribute("x", "34");
+    measureLabel.setAttribute("y", String(systemY - 10));
     measureLabel.setAttribute("fill", "#607065");
-    measureLabel.setAttribute("font-size", "12");
-    measureLabel.textContent = `第 ${measureIndex + 1} 小节`;
+    measureLabel.setAttribute("font-size", "11");
+    measureLabel.textContent = `${measureIndex + 1}`;
     svg?.append(measureLabel);
 
-    // 和声标注：罗马数字标在 Soprano 谱表上方
-    const topY = 28 + measureIndex * systemHeight;
-    const measureHarmonies = harmonies.filter((item) => item.measure === measureIndex + 1);
-    const xs = sopranoNoteXs[measureIndex] || [];
+    // 罗马数字标注
+    const measureHarmonies = harmonies.filter((h) => h.measure === measureIndex + 1);
+    const xs = systemSopranoXs[measureIndex] || [];
     measureHarmonies.forEach((item) => {
       const x = xs[item.beat - 1] ?? (100 + (item.beat - 1) * 42);
       const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
       el.setAttribute("x", String(x));
-      el.setAttribute("y", String(topY - 12));
+      el.setAttribute("y", String(systemY - 10));
       el.setAttribute("text-anchor", "middle");
       el.setAttribute("fill", "#b4452a");
-      el.setAttribute("font-size", "13");
+      el.setAttribute("font-size", "12");
       el.setAttribute("font-weight", "800");
       el.textContent = item.romanNumeral || item.root || "";
       svg?.append(el);
     });
 
-    // 终止式：最后一个小节上方
+    // 终止式 (最末 system)
     if (cadence && measureIndex === measureCount - 1) {
       const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      el.setAttribute("x", "72");
-      el.setAttribute("y", String(topY - 30));
+      el.setAttribute("x", "34");
+      el.setAttribute("y", String(systemY - 26));
       el.setAttribute("fill", "#1f7a56");
-      el.setAttribute("font-size", "13");
+      el.setAttribute("font-size", "12");
       el.setAttribute("font-weight", "800");
-      el.textContent = `终止式：${cadence}`;
+      el.textContent = `终止: ${cadence}`;
       svg?.append(el);
     }
 
-    // 斯波索宾警告小节：右上角红点
+    // 警告 (右上角红点)
     if (warningMeasures.has(measureIndex + 1)) {
       const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      el.setAttribute("x", String(width - 60));
-      el.setAttribute("y", String(topY - 12));
+      el.setAttribute("x", String(width - 32));
+      el.setAttribute("y", String(systemY - 10));
       el.setAttribute("fill", "#c0392b");
-      el.setAttribute("font-size", "15");
+      el.setAttribute("font-size", "14");
       el.setAttribute("font-weight", "800");
       el.textContent = "⚠";
       svg?.append(el);
@@ -2813,6 +2865,11 @@ function renderPianoNotation() {
   const bassNotesByMeasure = new Map();
   const bassStavesByMeasure = new Map();
 
+  // P2.7.1 fix: trebleState/bassState 提到 forEach 外 (函数级 scope),
+  // 否则 line 2889 的 buildScoreEntries 访问不到 — 报 "trebleState is not defined".
+  const trebleState = staffScores.treble;
+  const bassState = staffScores.bass;
+
   visibleIndices.forEach((measureIndex, slot) => {
     const isCurrent = measureIndex === currentIdx;
     const slotX = slot * slotWidth;
@@ -2822,8 +2879,6 @@ function renderPianoNotation() {
     const bassY = trebleY + 110;
     const isFirstInRow = slot === 0;
 
-    const trebleState = staffScores.treble;
-    const bassState = staffScores.bass;
     const trebleStave = new VF.Stave(x, trebleY, w);
     applyBarlineSettings(trebleStave, trebleState.settings[measureIndex] || defaultMeasureSettings());
     if (measureIndex === 0) {
@@ -3343,20 +3398,24 @@ function createVexNote(entry, clef = noteClef.value, timeSignature = editorTime.
   const note = new VF.StaveNote(noteOptions);
 
   // P22.5-Symbol-Accidental — 升降还原记号显式渲染
-  // VexFlow 4.x 的 key 串 ("c#/5" / "eb/5") 只决定音高位置, 不会自动画 ♯/♭ 字符,
-  // 必须 addModifier(Accidental) 才会在 note 头上画出临时记号。
-  // 对每个 pitch 单独加 (支持和弦), accidental 是 "#"/"b"/"##"/"bb" 之一。
+  // VexFlow 4.x: StaveNote 有专门的 addAccidental(index, accidental) 便捷方法,
+  // 它内部把 Accidental 当 modifier 加上并设置 position/style 默认值.
+  // 直接 addModifier(Accidental, index) 在某些 4.x 版本不会被渲染.
+  // 对每个 pitch 单独加 (支持和弦), accidental 是 "#"/"b"/"##"/"bb" 之一; "n"/"" 跳过.
   if (entry.kind === "note" && Array.isArray(entry.pitches) && VF.Accidental) {
     entry.pitches.forEach((pitch, pitchIndex) => {
       const acc = pitch.accidental;
       if (!acc || acc === "n" || acc === "") return;
-      // 还原号 "n" / "" 不画; 其它都画
       try {
         const accMod = new VF.Accidental(acc);
-        note.addModifier(accMod, pitchIndex);
+        // VexFlow 4.x: 优先用 addAccidental(index, accidental), 回退到 addModifier
+        if (typeof note.addAccidental === "function") {
+          note.addAccidental(pitchIndex, accMod);
+        } else {
+          note.addModifier(accMod, pitchIndex);
+        }
       } catch (e) {
-        // 防御: VexFlow 偶尔对不识别的 accidental 串抛错, 不影响其它渲染
-        console.warn("[createVexNote] accidental modifier failed for pitch", pitchIndex, acc, e?.message);
+        console.warn("[createVexNote] accidental add failed for pitch", pitchIndex, acc, e?.message);
       }
     });
   }
@@ -4038,6 +4097,8 @@ function updateEditorControls() {
 function renderSelectionBar() {
   const entry = measureEntries[selectedEntryIndex];
   if (selectionBar) selectionBar.hidden = !entry;
+  // P22.5 — 浮动操作条: 选中 entry 时贴主谱面右下角
+  if (floatingActions) floatingActions.hidden = !entry;
   if (!entry) return;
 
   if (selectedEventLabel) selectedEventLabel.textContent = entryLabel(entry, selectedEntryIndex);
@@ -4071,6 +4132,8 @@ function renderSelectionBar() {
   if (breathField) breathField.hidden = entry.kind !== "note";
   if (breathCheck) breathCheck.checked = Boolean(entry.breath);
   if (deleteToneButton) deleteToneButton.hidden = entry.kind !== "note";
+  // P22.5 — 浮动按钮: 应用时值总是显示, 删除该音仅 note, 删除拍位总是显示
+  if (floatingDeleteToneButton) floatingDeleteToneButton.hidden = entry.kind !== "note";
   if (toggleTieStartButton) toggleTieStartButton.hidden = entry.kind !== "note";
   if (toggleTieStopButton) toggleTieStopButton.hidden = entry.kind !== "note";
   if (toggleSlurStartButton) toggleSlurStartButton.hidden = entry.kind !== "note";
@@ -4708,20 +4771,24 @@ function exportScoreMusicXml() {
 }
 
 function importMusicXmlFile(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const parsed = parseMusicXmlText(String(reader.result));
-      if (!parsed.staves.treble.length && !parsed.staves.bass.length) {
-        throw new Error("没有解析到有效小节。");
+  // P2.7+ 集成: 走 server /parse-score (reader.py + reader_to_editor.py),
+  // 把 XML 直接转化到制谱页面. 只装 melody (treble.1) + bass (bass.2),
+  // alto (treble.2) 和 tenor (bass.1) 留空, 不显示 gold 4 voice 答案.
+  const formData = new FormData();
+  formData.append("file", file);
+  setBusy(file.name);
+  fetch("/parse-score", { method: "POST", body: formData })
+    .then((resp) => resp.json().then((body) => ({ status: resp.status, body })))
+    .then(({ status, body }) => {
+      if (!status || status >= 400) {
+        throw new Error(body.detail || body.error || `HTTP ${status}`);
       }
-      loadParsedMusicXml(parsed);
-    } catch (error) {
+      loadParsedPayloadToEditor(body);
+    })
+    .catch((error) => {
+      setError(error.message || "MusicXML 导入失败");
       showEditorMessage("MusicXML 导入失败：" + error.message, "error");
-    }
-  };
-  reader.onerror = () => showEditorMessage("MusicXML 文件读取失败。", "error");
-  reader.readAsText(file);
+    });
 }
 
 function loadParsedMusicXml(parsed) {
@@ -5522,11 +5589,6 @@ bindEvent(fileInput, "change", () => {
 
 bindEvent(manualButton, "click", submitManualChords);
 bindEvent(noteButton, "click", submitManualNotes);
-bindEvent(examplePreset, "change", (event) => {
-  loadExamplePreset(event.target.value);
-  // 重置下拉, 让用户能再选同一个
-  event.target.value = "";
-});
 // 自动保存输入到 localStorage (debounce 500ms)
 if (noteInput) {
   bindEvent(noteInput, "input", scheduleNoteInputSave);
@@ -5599,6 +5661,10 @@ document.querySelectorAll('input[name="entryMode"]').forEach((control) => {
 
 bindEvent(undoNotesButton, "click", undoEdit);
 bindEvent(deleteToneButton, "click", deleteSelectedTone);
+// P22.5 — 浮动操作条 (贴近主谱面) 转发到原 handler
+bindEvent(floatingApplyDurationButton, "click", applyDurationToSelected);
+bindEvent(floatingDeleteToneButton, "click", deleteSelectedTone);
+bindEvent(floatingDeleteEventButton, "click", deleteSelectedEvent);
 // P22+: noteAccidental 改变时实时更新选中 entry 的 accidental
 // P22.3 Phase 5: 全部 UI 控件 (duration/dotted/accidental) 改变时必须立即刷新 ghost
 // 关键: 鼠标不动时, ghost 必须跟 UI 状态同步变化
@@ -5773,13 +5839,76 @@ bindEvent(endBarlineSelect, "change", updateCurrentMeasureBarlines);
 bindEvent(validateScoreButton, "click", showScoreValidation);
 bindEvent(exportJsonButton, "click", exportScoreJson);
 bindEvent(exportMusicXmlButton, "click", exportScoreMusicXml);
-bindEvent(importMusicXmlButton, "click", () => musicXmlFileInput.click());
-bindEvent(musicXmlFileInput, "change", () => {
-  const file = musicXmlFileInput.files?.[0];
-  if (file) importMusicXmlFile(file);
-  musicXmlFileInput.value = "";
-});
+// P2.7+: 用 XML 文件列表代替 importMusicXmlButton + file picker. 见 initXmlFileList().
+bindEvent(xmlFileSearchButton, "click", () => loadXmlFileList(xmlFileSearch.value, 50));
+bindEvent(xmlFileSearch, "keydown", (e) => { if (e.key === "Enter") loadXmlFileList(xmlFileSearch.value, 50); });
 bindEvent(deleteEventButton, "click", deleteSelectedEvent);
+
+// P2.7+: XML 文件列表 (替代 OS file picker + 课本例题 dropdown)
+async function loadXmlFileList(query = "", limit = 1) {
+  if (!xmlFileList) return;
+  xmlFileList.innerHTML = '<div class="xml-file-empty">加载中...</div>';
+  try {
+    const params = new URLSearchParams();
+    if (query) params.set("query", query);
+    params.set("limit", String(limit));
+    const resp = await fetch(`/list-xml?${params.toString()}`);
+    const data = await resp.json();
+    renderXmlFileList(data, query, limit);
+  } catch (err) {
+    xmlFileList.innerHTML = `<div class="xml-file-empty">加载失败: ${err.message}</div>`;
+  }
+}
+
+function renderXmlFileList(data, query, limit) {
+  if (!xmlFileList) return;
+  const files = data.files || [];
+  const meta = data.filtered != null
+    ? `共 ${data.total} 个, 过滤后 ${data.filtered} 个, 显示 ${files.length} 个${query ? ` (搜索: "${query}")` : ""}`
+    : `${files.length} 个`;
+  if (xmlFileListMeta) xmlFileListMeta.textContent = meta;
+  if (files.length === 0) {
+    xmlFileList.innerHTML = '<div class="xml-file-empty">没有匹配的 XML 文件. 换个关键词试试.</div>';
+    return;
+  }
+  xmlFileList.innerHTML = "";
+  for (const f of files) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "xml-file-button";
+    btn.dataset.fileId = f.id;
+    btn.innerHTML = `
+      <span class="xml-file-chapter">${f.chapter || "?"}</span>
+      <span class="xml-file-name">${f.name}</span>
+    `;
+    btn.title = `点击加载 ${f.name} 到五线谱 (走 /parse-score-by-id)`;
+    btn.addEventListener("click", () => loadXmlFileIntoEditor(f.id, f.name));
+    xmlFileList.appendChild(btn);
+  }
+}
+
+async function loadXmlFileIntoEditor(fileId, fileName) {
+  setBusy(fileName || fileId);
+  try {
+    const resp = await fetch("/parse-score-by-id", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_id: fileId }),
+    });
+    const body = await resp.json();
+    if (!resp.ok) {
+      throw new Error(body.detail || body.error || `HTTP ${resp.status}`);
+    }
+    loadParsedPayloadToEditor(body);
+  } catch (err) {
+    setError(err.message || "XML 加载失败");
+    showEditorMessage("XML 加载失败: " + err.message, "error");
+  }
+}
+
+// 默认加载 1 个 (ch4-01_a minor, Sposobin 入门, 单声部 melody + bass).
+// 让用户先试通流程: 1 个最简单的题, 而不是 388 个全列.
+loadXmlFileList("ch4-01", 1);
 
 bindEvent(clearNotesButton, "click", () => {
   if (!currentVoiceEntries().length) return;
@@ -5818,13 +5947,17 @@ checkHealth();
 window.setInterval(checkHealth, 10000);
 window.addEventListener("focus", checkHealth);
 
-// 音乐字体本地化：VexFlow 5 默认从 CDN 加载字体，被墙/慢时装饰音等 SMuFL 符号会退化成字母。
-// 改为从本机 /assets/vendor/fonts 加载，加载完成后重渲染一次。
+// 音乐字体本地化：VexFlow 4 用 SMuFL 字符 (PUA) 画谱号/装饰音，缺字体 fallback 错。
+// 把字体文件放在 web/vendor/fonts/{name}/{name}.woff2, 然后 HOST_URL 指向 /vendor/fonts/.
+// server.py mount("/assets" → web/) + mount("/vendor/vexflow" → ...), 但没 mount /vendor/fonts —
+// 走 server.py 默认路由 / → web/ 根目录, /vendor/fonts/... 会 404. 所以走 /assets/vendor/fonts/ 路径.
+// 字体位置: web/vendor/fonts/bravura/bravura.woff2 等.
+// 加载完成后重渲染一次 (字体在, 谱号/装饰音才能正确画).
 try {
   if (VF?.Font) {
     VF.Font.HOST_URL = "/assets/vendor/fonts/";
     if (VF.Font.load) {
-      const fontTasks = ["Leland", "Leland Text", "Bravura"]
+      const fontTasks = ["Leland", "Leland Text", "Bravura", "Bravura Text"]
         .map((name) => VF.Font.load(name).catch(() => {}));
       Promise.all(fontTasks).then(() => { try { renderNotation(); } catch (e) {} }).catch(() => {});
     }
@@ -5833,28 +5966,6 @@ try {
 try { renderNotation(); } catch (e) {
   console.error("[init] renderNotation err:", e);
 }
-
-// P18.8.3 — hash preset 钩子（提前到 init 早期，避免被后面 IIFE 错误阻断）
-//  支持 URL #preset=p0_cadence 等 — 直接载入对应课本例题
-(function applyHashPresetEarly() {
-  const m = (location.hash || "").match(/preset=([a-z0-9_]+)/i);
-  if (!m || typeof loadExamplePreset !== "function") return;
-  const preset = m[1];
-  if (typeof EXAMPLE_PRESETS === "undefined" || !EXAMPLE_PRESETS[preset]) return;
-  try {
-    loadExamplePreset(preset);
-  } catch (e) {
-    if (typeof showEditorMessage === "function") {
-      showEditorMessage(`[hash preset] 载入失败：${e.message}`, "error");
-    }
-  }
-  // 强制重渲染 + 自动切到制谱视图（不然用户看不到）
-  try { if (typeof renderNotation === "function") renderNotation(); } catch (e) {}
-  try {
-    const editorLink = document.querySelector('.sidebar-link[data-view="editor"]');
-    if (editorLink) editorLink.click();
-  } catch (e) {}
-})();
 
 // 调试用：把核心函数挂到 window，方便在 Puppeteer / DevTools 里直接调用
 if (typeof window !== "undefined") {
@@ -5980,25 +6091,6 @@ if (typeof window !== "undefined") {
       if (altTab && altTab.getAttribute("aria-selected") !== "true") altTab.click();
     });
   }
-
-  // 调试钩子：URL hash #preset=p0_cadence 自动加载课本例题（方便无键盘环境验证）
-  // 初始加载已由 applyHashPresetEarly IIFE 处理；这里只挂 hashchange 监听
-  function applyHashPreset() {
-    const m = (location.hash || "").match(/preset=([a-z0-9_]+)/i);
-    if (m && typeof loadExamplePreset === "function" && typeof EXAMPLE_PRESETS !== "undefined" && EXAMPLE_PRESETS[m[1]]) {
-      try {
-        loadExamplePreset(m[1]);
-      } catch (e) {
-        if (typeof showEditorMessage === "function") {
-          showEditorMessage(`[hash preset] 载入失败：${e.message}`, "error");
-        }
-      }
-      if (typeof renderNotation === "function") {
-        try { renderNotation(); } catch (e) {}
-      }
-    }
-  }
-  window.addEventListener("hashchange", applyHashPreset);
 
   // P18.8.3 — top-level error 透传到 editorMessage
   window.addEventListener("error", (e) => {

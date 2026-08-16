@@ -7,6 +7,30 @@
   -webkit-font-smoothing: antialiased;
 }
 
+/* VexFlow 4.x SMuFL Bravura 字体: alto/tenor C clef (U+E05C), treble G clef (U+E050),
+   bass F clef (U+E062) 全部 PUA, 必须有 Bravura 字体才能正确显示. 用 CSS @font-face
+   优先于 VexFlow FontFace API — 浏览器解析 HTML 时就 preload, 不会因为 JS 时序错过. */
+@font-face {
+  font-family: "Bravura";
+  src: url("/assets/vendor/fonts/bravura/bravura.woff2") format("woff2");
+  font-display: block;
+}
+@font-face {
+  font-family: "Bravura Text";
+  src: url("/assets/vendor/fonts/bravuratext/bravuratext.woff2") format("woff2");
+  font-display: block;
+}
+@font-face {
+  font-family: "Leland";
+  src: url("/assets/vendor/fonts/leland/leland.woff2") format("woff2");
+  font-display: block;
+}
+@font-face {
+  font-family: "Leland Text";
+  src: url("/assets/vendor/fonts/lelandtext/lelandtext.woff2") format("woff2");
+  font-display: block;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -704,6 +728,31 @@ h2 {
 
 .note-canvas svg {
   display: block;
+}
+
+/* P22.5 浮动操作条: 贴在主谱面右下角, 离五线谱很近 */
+.floating-actions {
+  position: absolute;
+  right: 12px;
+  bottom: 8px;
+  display: inline-flex;
+  gap: 6px;
+  z-index: 20;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #dfe4dc;
+  border-radius: 6px;
+  padding: 4px 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.floating-actions[hidden] {
+  display: none;
+}
+
+.floating-actions .icon-button {
+  font-size: 12px;
+  padding: 4px 8px;
+  min-height: 26px;
 }
 
 .answer-meta {
@@ -1799,4 +1848,68 @@ dd {
 .tonicization-list li,
 .modulation-list li {
   margin-bottom: 4px;
+}
+
+/* P2.7+: XML �ļ��б��� (step 3 ���������� header ����) */
+.xml-file-list-panel {
+  padding: 8px 12px;
+  background: var(--panel-bg, #f8f8f6);
+  border-bottom: 1px solid var(--border, #ddd);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.xml-file-list-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.xml-file-list-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text, #2a3a2c);
+}
+.xml-file-list-meta {
+  font-size: 11px;
+  color: var(--muted, #6a7a6c);
+}
+.xml-file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+.xml-file-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--button-bg, #fff);
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text, #24332c);
+  transition: background 0.15s, border-color 0.15s;
+}
+.xml-file-button:hover {
+  background: var(--button-hover, #e8f0ea);
+  border-color: var(--accent, #4a8a5a);
+}
+.xml-file-button:active { transform: translateY(1px); }
+.xml-file-chapter {
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--accent, #4a8a5a);
+  color: #fff;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.xml-file-name { font-family: monospace; }
+.xml-file-empty {
+  font-size: 12px;
+  color: var(--muted, #8a8a8a);
+  padding: 4px 0;
 }
