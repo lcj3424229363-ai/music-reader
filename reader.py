@@ -203,11 +203,30 @@ def _active_key_signature(measure: stream.Measure) -> dict[str, Any] | None:
     if not active:
         return None
 
+    declared_mode = active.mode if isinstance(active, key.Key) else None
+    declared_name = active.tonic.name if isinstance(active, key.Key) else None
     return {
         "sharps": active.sharps,
         "majorName": active.asKey("major").name,
         "minorName": active.asKey("minor").name,
+        "declaredMode": declared_mode,
+        "declaredName": declared_name,
+        "declaredLabel": f"{declared_name} {declared_mode}" if declared_name and declared_mode else None,
     }
+
+
+def _voice_id(element) -> str | None:
+    """P22.5 supervise v2 (2026-08-17): expose MusicXML <voice> id on every event.
+
+    music21 doesn't expose `element.voice` directly; the canonical lookup is
+    `element.getContextByClass(stream.Voice)`.  Used by reader_to_editor.py
+    to split piano SATB into S/A/T/B by voice instead of by pitch (the
+    chord-top/bot model broke on real long cases like ch23-06_F major m1
+    where voice 1 had a half note and voice 2 had six 16th grace notes
+    — pitch-grouping merged them, and the offset cursor dropped 5 of 8 events).
+    """
+    v = element.getContextByClass(stream.Voice)
+    return v.id if v is not None else None
 
 
 def _note_event(element: note.Note, measure: stream.Measure) -> dict[str, Any]:
@@ -217,6 +236,7 @@ def _note_event(element: note.Note, measure: stream.Measure) -> dict[str, Any]:
         "duration": _round_float(element.duration.quarterLength),
         "pitch": element.pitch.nameWithOctave,
         "pitchClass": element.pitch.pitchClass,
+        "voice": _voice_id(element),
     }
 
 
@@ -225,6 +245,7 @@ def _rest_event(element: note.Rest, measure: stream.Measure) -> dict[str, Any]:
         "type": "rest",
         "offset": _round_float(element.getOffsetInHierarchy(measure)),
         "duration": _round_float(element.duration.quarterLength),
+        "voice": _voice_id(element),
     }
 
 
@@ -237,6 +258,7 @@ def _chord_event(element: chord.Chord, measure: stream.Measure) -> dict[str, Any
         "pitchClasses": sorted(set(pitch.pitchClass for pitch in element.pitches)),
         "commonName": _safe_common_name(element),
         "root": _safe_root(element),
+        "voice": _voice_id(element),
     }
 
 
@@ -402,4 +424,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

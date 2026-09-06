@@ -44,8 +44,9 @@ Roundtrip 不变量 (跟 ENTRY_SCHEMA.md §6 对齐):
     _appjs_measures_to_solver_bass) 一字不改照搬到此模块.
 
 后续 (P22.1+):
-    修 Bug #1 eighth-overcount: 4/4 8 个八分音符同 pitch
-    应合并成 4 beats 而非 8 beats. 当前未做 (留给第二刀).
+    Bug #1 eighth-overcount 已在第二刀修复: `appjs_entry_to_solver_beats`
+    现在按拍号把时值精确换算成整拍, 非整拍时值(八分/附点四分等)直接抛
+    明确的 ValueError, 不再用 `round()` 银行家舍入把 0.5 拍抬成 1 拍.
 """
 
 from __future__ import annotations
@@ -115,41 +116,87 @@ def appjs_entry_to_soprano_note(entry: dict) -> "sposobin_solver.Note | None":
         return None
 
 
-def appjs_entry_to_solver_beats(entry: dict) -> int:
-    """How many quarter-note beats does this app.js entry cover?
+def _beat_units(time_signature: str) -> int:
+    """一个"拍"的 32 分单位数: 32/den (4/4→8, 6/8→4, 2/2→16)."""
+    try:
+        den = int(str(time_signature).split("/")[1])
+    except (ValueError, IndexError):
+        den = 4
+    if den <= 0:
+        den = 4
+    return max(1, 32 // den)
 
-    P18.7 fix: app.js durationUnits uses 1 quarter = 8 units (1 unit = a
-    sixteenth), but the previous server logic used "1 quarter = 2 units"
-    so a 4-quarter note became 16 beats and overflowed the measure,
-    causing solver IndexError.  Now we read the duration code (the
-    authoritative source) and round to the nearest integer beat count.
-    A dotted quarter (duration '4', dotted 1) yields 1.5 → 2 beats in
-    practice (we round up to preserve the entry's actual span).
+
+def _entry_units(entry: dict) -> float:
+    """Entry 时值, 单位 = 32 分音符 (1 四分 = 8 单位, 与前端 units 一致).
+
+    前端 `units` 字段为准 (已含附点/三连音); 缺失时退回 duration 码 + dotted.
     """
+    units = entry.get("units")
+    if isinstance(units, (int, float)) and units > 0:
+        return float(units)
     dur = str(entry.get("duration") or "4")
     quarter = _APPJS_DURATION_TO_QUARTER.get(dur)
     if quarter is None:
-        # Fall back to units/8 (1 quarter = 8 units per app.js)
-        units = float(entry.get("units", 8) or 8)
-        quarter = units / 8.0
+        quarter = 1.0
+    base = quarter * 8.0
     dotted = int(entry.get("dotted") or 0)
     if dotted >= 2:
-        quarter *= 1.75
+        base *= 1.75
     elif dotted == 1:
-        quarter *= 1.5
-    # Round to the nearest 0.25 beat (eighth-note resolution).  The
-    # solver stores one Note per beat, so an entry that lasts 0.5 beat
-    # fills 1 beat (held for the second half) — but we mark the note
-    # as repeating, see caller.  Beat counts of 0 round up to 1.
-    n_beats = max(1, int(round(quarter * 4) / 4))
-    # Actually round to nearest 0.5 beat
-    n_beats_quarter = max(0.25, quarter)
-    # Convert quarter-fraction to integer beat count: we want each
-    # quarter fraction to map to whole beats when possible.  An entry
-    # that lasts 1 quarter = 1 beat; 0.5 quarter = 0.5 beat (we round
-    # to 1 in the array; sub-beat entries are out of solver's scope).
-    n_beats = max(1, int(round(quarter)))
-    return n_beats
+        base *= 1.5
+    return base
+
+
+def _gcd_int(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def appjs_measures_subdivision(measures: list[list[dict]], time_signature: str = "4/4") -> int:
+    """网格细分因子 S (1/2/4...): 由全曲最细音符时值决定.
+
+    例 (4/4): 全四分 → 1 (向后兼容); 含八分 → 2; 含十六分 → 4.
+    6/8 含十六分 → 2.  用所有音符时值的 GCD 对齐到拍 (1 拍 = 32/den 单位).
+    """
+    beat_units = _beat_units(time_signature)
+    unit_list: list[int] = []
+    for measure in (measures or []):
+        for entry in (measure or []):
+            if entry is None:
+                continue
+            # 休止符也要参与 GCD (如 2/2 拍里四分休止符比二分音符更细,
+            # 网格必须细到能表示休止符, 否则四分休止符无法落格).
+            u = _entry_units(entry)
+            if u > 0:
+                unit_list.append(int(round(u)))
+    if not unit_list:
+        return 1
+    cell = unit_list[0]
+    for u in unit_list[1:]:
+        cell = _gcd_int(cell, u)
+        if cell == 1:
+            break
+    cell = max(1, cell)
+    if cell >= beat_units:
+        return 1
+    return beat_units // cell
+
+
+def appjs_entry_to_solver_cells(entry: dict, cell_units: int) -> int:
+    """Entry → 网格格数 (entry_units / cell_units). 必须整除, 否则 ValueError."""
+    units = _entry_units(entry)
+    n_cells = units / cell_units
+    nearest = int(round(n_cells))
+    if abs(n_cells - nearest) > 1e-6:
+        raise ValueError(
+            f"音符时值 {units:g} 单位无法落到 {cell_units} 单位的网格上："
+            f"当前求解器只支持四分/八分/十六分及其附点、整拍组合。"
+        )
+    if nearest < 1:
+        raise ValueError(f"音符时值 {units:g} 单位小于一个网格格，无法表示。")
+    return nearest
 
 
 # ---------------------------------------------------------------------------
@@ -157,25 +204,18 @@ def appjs_entry_to_solver_beats(entry: dict) -> int:
 # ---------------------------------------------------------------------------
 
 
-def appjs_measures_to_solver_melody(measures: list[list[dict]]) -> list[list["sposobin_solver.Note | None"]]:
+def appjs_measures_to_solver_melody(
+    measures: list[list[dict]],
+    time_signature: str = "4/4",
+) -> list[list["sposobin_solver.Note | None"]]:
     """Convert app.js per-measure entries to solver's melody_pitches
-    format: list[measure][beat] -> Note | None.
+    format: list[measure][cell] -> Note | None (B1 细分网格).
 
-    P18 bug fix: the previous version treated each entry as one beat.
-    That's wrong — a 4/4 measure with 1 whole-note entry (units=8) was
-    sent as 1 beat, and 8 eighth-notes (each units=1) as 8 beats, both
-    claiming to fill a 4/4 measure.  Solver ended up with whatever
-    length the user typed in entry count, not in rhythmic units.
-
-    P18.7 fix: app.js units field is 1/16 of a whole note (so 1 quarter
-    = 8 units), but the prior code used "1 quarter = 2 units" which
-    over-expanded every entry by 4× and overflowed measure capacity,
-    causing IndexError inside the solver.
-
-    Now: each entry is expanded to (entry duration in quarter fraction,
-    rounded) beats.  duration code '4' (quarter) = 1 beat, '2' (half)
-    = 2 beats, '1' (whole) = 4 beats, '8' (eighth) = 1 beat (rounded).
+    网格格长 = 拍 / S, S 由全曲最细时值决定 (``appjs_measures_subdivision``).
+    例 4/4 S=2: 全音符→8 格, 二分→4, 四分→2, 八分→1.  6/8 四分→4 格 (S=2).
     """
+    subdiv = appjs_measures_subdivision(measures, time_signature)
+    cell_units = _beat_units(time_signature) // subdiv
     out: list[list[sposobin_solver.Note | None]] = []
     for measure in measures:
         line: list[sposobin_solver.Note | None] = []
@@ -184,29 +224,48 @@ def appjs_measures_to_solver_melody(measures: list[list[dict]]) -> list[list["sp
                 line.append(None)
                 continue
             note = appjs_entry_to_soprano_note(entry)
-            n_beats = appjs_entry_to_solver_beats(entry)
+            n_cells = appjs_entry_to_solver_cells(entry, cell_units)
             if note is None:
-                # Rest or failed parse.  Spend the entry's beat count as
-                # None beats so the measure still sums to the right
-                # length.  If duration missing, default to 1 quarter
-                # (1 beat).
-                line.extend([None] * n_beats)
+                # Rest: 占 n_cells 个空拍, 保持小节长度对齐.
+                line.extend([None] * n_cells)
             else:
-                # Duplicate the note across its beat span — solver
-                # stores one Note per beat, so a held whole-note shows
-                # up as 4 quarter beats at the same pitch.
-                line.extend([note] * n_beats)
+                # 一个音跨多格时复制到每一格 (solver 每格一个音),
+                # 输出侧按 rhythm_template 再合并回原时值.
+                line.extend([note] * n_cells)
         out.append(line)
     return out
 
 
-def appjs_measures_to_solver_bass(measures: list[list[dict]]) -> list[list["sposobin_solver.Note | None"]]:
-    """P8: convert app.js per-measure entries to solver's bass_pitches
-    format.  Identical to the melody converter — the difference is only
-    in what the solver does with the result (anchors bass instead of
-    soprano).  Kept as a separate function for clarity at call sites.
+def appjs_measures_to_solver_bass(
+    measures: list[list[dict]],
+    time_signature: str = "4/4",
+) -> list[list["sposobin_solver.Note | None"]]:
+    """P8: bass 转换 = melody 转换 (同一细分网格)."""
+    return appjs_measures_to_solver_melody(measures, time_signature)
+
+
+def appjs_measures_rhythm_template(
+    measures: list[list[dict]],
+    time_signature: str = "4/4",
+) -> list[list[tuple[dict, int]]]:
+    """Per-measure list of ``(entry, cell_count)`` in solver grid order.
+
+    Used by the server to rebuild the original rhythm on the output side:
+    the solver works at one note per cell, so this template lets the response
+    re-merge a whole/half/eighth note back into a single long note instead of
+    a run of repeated cells.
     """
-    return appjs_measures_to_solver_melody(measures)
+    subdiv = appjs_measures_subdivision(measures, time_signature)
+    cell_units = _beat_units(time_signature) // subdiv
+    out: list[list[tuple[dict, int]]] = []
+    for measure in measures:
+        row: list[tuple[dict, int]] = []
+        for entry in measure:
+            if entry is None:
+                continue
+            row.append((entry, appjs_entry_to_solver_cells(entry, cell_units)))
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +274,8 @@ def appjs_measures_to_solver_bass(measures: list[list[dict]]) -> list[list["spos
 
 # 保持原 server.py 的下划线命名以最小化 diff. 外部 import 推荐用 public 名.
 public_appjs_entry_to_soprano_note = appjs_entry_to_soprano_note
-public_appjs_entry_to_solver_beats = appjs_entry_to_solver_beats
+public_appjs_measures_subdivision = appjs_measures_subdivision
+public_appjs_entry_to_solver_cells = appjs_entry_to_solver_cells
 public_appjs_measures_to_solver_melody = appjs_measures_to_solver_melody
 public_appjs_measures_to_solver_bass = appjs_measures_to_solver_bass
+public_appjs_measures_rhythm_template = appjs_measures_rhythm_template

@@ -1913,3 +1913,30 @@ dd {
   color: var(--muted, #8a8a8a);
   padding: 4px 0;
 }
+
+/* XML 例题库放在 upload-panel(grid 布局)内时的定位与覆盖 */
+.upload-panel .xml-file-list-panel {
+  grid-column: 1 / -1;
+  width: 100%;
+  align-self: start;
+  justify-self: stretch;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 6px;
+}
+/* upload-panel 默认隐藏所有 input(含 fileInput)，这里恢复搜索框显示 */
+.upload-panel .xml-file-list-panel input {
+  display: inline-block;
+  flex: 1;
+  min-width: 160px;
+  min-height: 30px;
+  padding: 4px 8px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  font-size: 12px;
+}
+/* 搜索按钮在 header 内用小号样式，避免沿用大绿色上传按钮 */
+.upload-panel .xml-file-list-panel .xml-file-list-header button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}

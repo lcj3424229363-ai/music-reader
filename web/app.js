@@ -200,6 +200,7 @@ const staffScores = {
   treble: { measures: scoreMeasures, settings: measureSettings },
   bass: { measures: Array.from({ length: DEFAULT_MEASURE_COUNT }, () => []), settings: Array.from({ length: DEFAULT_MEASURE_COUNT }, () => defaultMeasureSettings()) }
 };
+let scoreDocumentTitle = "Manual score";
 let currentMeasureIndex = 0;
 let measureEntries = scoreMeasures[currentMeasureIndex];
 let editHistory = [];
@@ -601,9 +602,32 @@ function normalizeKeyForSelect(keyLabel) {
   return isMinor ? tonic + "m" : tonic;
 }
 
+// P22.5 监督 v2 (2026-08-17): 把 server 来的 nested-dict measures 序列化成跟
+// #noteInput 文本框格式一致的 "音高:时值 | 音高:时值 || 音高:时值 | ..." 字符串.
+// 之前 loadParsedPayloadToEditor 不写 #noteInput.value, 文本框是空, 跟 score 不同步.
+function serializeMelodyMeasuresToText(measures) {
+  return (measures || [])
+    .map((m) => (m || [])
+      .filter((e) => e && e.kind === "note")
+      .map((e) => {
+        const p = (e.pitches || [])[0];
+        if (!p) return "R:4";
+        const acc = p.accidental || "";
+        return `${p.step || "C"}${acc}${p.octave == null ? 4 : p.octave}:${e.duration || 4}`;
+      })
+      .join(" | ")
+    )
+    .join(" || ");
+}
+
 function loadParsedPayloadToEditor(editorPayload) {
-  // P2.7.1: 支持 4 voice 完整 SATB (server / reader_to_editor 现在返 soprano/alto/tenor/bass 4 组).
-  // 兼容老 server (只返 melodyMeasures + bassMeasures) → 自动当 S + B, alto/tenor 留空.
+  // Plain MusicXML is the lossless editor source. The reader/solver payload is
+  // intentionally only a computational projection and omits engraving fields.
+  if (editorPayload?.sourceMusicXml) {
+    loadParsedMusicXml(parseMusicXmlText(editorPayload.sourceMusicXml));
+    return;
+  }
+  // 普通 MusicXML 导入必须保留文件中实际存在的全部 SATB 声部。
   const sopranoMeasures = editorPayload?.sopranoMeasures || editorPayload?.melodyMeasures || [];
   const altoMeasures    = editorPayload?.altoMeasures    || [];
   const tenorMeasures   = editorPayload?.tenorMeasures   || [];
@@ -631,11 +655,17 @@ function loadParsedPayloadToEditor(editorPayload) {
   if (editorPayload.timeSignature) {
     editorTime.value = editorPayload.timeSignature;
   }
+  // P22.5 监督 v2 (2026-08-17): 同步 manualKey (step 4 solver 用). 否则 solver 永远拿默认
+  // "C major" 算 A minor melody → 答案 bass 全 C3, 调性错. 用 server 原始长形式
+  // (如 "A minor") 让 solver /api/solve-melody 路径直接消费.
+  if (editorPayload.key && manualKey) {
+    manualKey.value = editorPayload.key;
+  }
 
-  // P2.7.1 NOTE: 不自动切 staffMode 到 "piano" 双谱表.
-  // piano 模式 renderPianoNotation 有独立分支, 自动切换会触发 render 路径 bug.
-  // 让用户手动在 "谱表模式" 下拉里选 "钢琴双谱表" 来同时看 S/A/T/B 4 voice.
-  // 当前单谱表模式默认显示 treble (S 在 voice 1, A 在 voice 2 stem 向下叠).
+  // 自动决定显示模式: 有低音谱表内容(tenor/bass)就切"钢琴双谱表", 让导入的题目
+  // (旋律+低音 或 4声部) 直接可见; 只有旋律则保持单谱表显示 treble。
+  // 旧 P2.7.1 曾因 piano 渲染 bug 不自动切, 现已修复渲染路径, 改为自动切换。
+  const hasBassContent = tenorMeasures.length > 0 || bassMeasures.length > 0;
 
   // Prepare measures arrays
   ["treble", "bass"].forEach((staffKey) => {
@@ -660,33 +690,40 @@ function loadParsedPayloadToEditor(editorPayload) {
   };
 
   commitEdit(() => {
-    writeVoice("treble", 1, sopranoMeasures);  // S → treble voice 1
-    writeVoice("treble", 2, altoMeasures);     // A → treble voice 2
-    writeVoice("bass",   1, tenorMeasures);    // T → bass voice 1
-    writeVoice("bass",   2, bassMeasures);     // B → bass voice 2
+    if (hasBassContent && staffMode) staffMode.value = "piano";
+    ["treble", "bass"].forEach((staffKey) => {
+      for (let measureIndex = 0; measureIndex < requiredCount; measureIndex += 1) {
+        staffScores[staffKey].measures[measureIndex] = [];
+      }
+    });
+    writeVoice("treble", 1, sopranoMeasures);
+    writeVoice("treble", 2, altoMeasures);
+    writeVoice("bass",   1, tenorMeasures);
+    writeVoice("bass",   2, bassMeasures);
 
     currentMeasureIndex = 0;
     noteMeasure.value = "1";
     activateStaff("treble");
-    selectLastEntryInActiveVoice();
+    // P22.5 监督 v2 (2026-08-17): XML 加载后默认选 m1 beat 1 (不是最后).
+    // 9 个调用点中只有这里需要"选第一", 其他 (新输入/撤销) 仍要选最后.
+    selectFirstEntryInActiveVoice();
   });
 
-  // Status: 报告 4 voice 灌入情况, 让用户知道 alto/tenor 有没有.
+  // P22.5 监督 v2 (2026-08-17): 同步批量文本框 (soprano 旋律按 "音高:时值 | 音高:时值 || 音高:时值 | ..." 格式)
+  // 之前不写 #noteInput.value, 截图看到的是 HTML placeholder, 实际 value 是空, 跟 score 不同步
+  if (noteInput && sopranoMeasures.length) {
+    noteInput.value = serializeMelodyMeasuresToText(sopranoMeasures);
+  }
+
   const filled = [
-    sopranoMeasures.length ? "S" : null,
-    altoMeasures.length    ? "A" : null,
-    tenorMeasures.length   ? "T" : null,
-    bassMeasures.length    ? "B" : null,
-  ].filter(Boolean).join("/") || "(空)";
-  const missing = [
-    !sopranoMeasures.length ? "S" : null,
-    !altoMeasures.length    ? "A" : null,
-    !tenorMeasures.length   ? "T" : null,
-    !bassMeasures.length    ? "B" : null,
-  ].filter(Boolean).join("/") || "(无)";
+    sopranoMeasures.length ? "旋律" : null,
+    altoMeasures.length    ? "女低音" : null,
+    tenorMeasures.length   ? "男高音" : null,
+    bassMeasures.length    ? "低音" : null,
+  ].filter(Boolean).join(" + ") || "(空)";
   showEditorMessage(
-    `已载入 XML: 4 voice [${filled}] 各 ${nMeasures} 小节. 缺失: ${missing}.`,
-    missing === "(无)" ? "success" : "info"
+    `MusicXML 已载入：${filled}，共 ${nMeasures} 小节。`,
+    "success"
   );
 }
 
@@ -871,16 +908,20 @@ async function submitFourPartAnswer() {
 }
 
 function collectMelodyMeasuresForAnswer(questionType = "melody") {
-  activateStaff();
-
   // P8: melody collection is independent of questionType.  For bass-given
   // problems, the user enters the bass line on the lower staff (voice 2
   // in the bass clef) and the melody slot is typically empty.  We don't
   // try to read the bass slot here — that's collectBassMeasuresForAnswer's
   // job.  Just collect the melody (which may be empty in bass-given mode).
-
-  const voiceId = activeVoiceId();
-  const perMeasure = scoreMeasures.map((measure) => entriesForVoice(measure, voiceId));
+  //
+  // 修复(音对齐): 旋律 = 女高音。钢琴模式固定读高音谱表声部1, 不再依赖"当前激活
+  // 谱表/声部" —— 旧代码 activateStaff()+activeVoiceId() 在钢琴模式下若 noteClef
+  // 停在 bass 或 voice 停在 2, 会误读低音谱表(tenor)或中音声部(alto), 导致旋律
+  // 被采空或采错, 传给后端的就是错的音。
+  const staffKey = isPianoMode() ? "treble" : activeStaffKey();
+  const state = staffScores[staffKey] || staffScores.treble;
+  const voiceId = isPianoMode() ? "1" : activeVoiceId();
+  const perMeasure = state.measures.map((measure) => entriesForVoice(measure, voiceId));
   const normalized = normalizeCollectedMeasures(perMeasure, voiceId);
   if (normalized) return normalized;
 
@@ -922,8 +963,15 @@ function normalizeCollectedMeasures(perMeasure, voiceId) {
     const capacity = currentMeter().capacity;
     return perMeasure.slice(0, lastUsed + 1).map((entries) => {
       if (entries.length) return JSON.parse(JSON.stringify(entries));
-      // 中间的空小节 → 全小节休止，保持小节编号对齐
-      return [{ kind: "rest", voice: voiceId, duration: "1", dotted: false, units: capacity }];
+      // 中间的空小节 → 全小节休止，保持小节编号对齐。
+      // 用与拍号容量匹配的时值（3/4 → 附点二分休止，2/4 → 二分休止），
+      // 而不是固定全休止符，否则 3/4 会被后端算成 4 拍而超拍。
+      let restDuration = "4", restDotted = 0;
+      if (capacity >= 32) { restDuration = "1"; restDotted = 0; }
+      else if (capacity >= 24) { restDuration = "2"; restDotted = 1; }
+      else if (capacity >= 16) { restDuration = "2"; restDotted = 0; }
+      else if (capacity >= 8) { restDuration = "4"; restDotted = 0; }
+      return [{ kind: "rest", voice: voiceId, duration: restDuration, dotted: restDotted, units: capacity }];
     });
   }
   return null;
@@ -1229,9 +1277,80 @@ function renderTheoryAnalysis(theory) {
   container.innerHTML = sections.join("") || "<div class=\"empty\">无和声分析数据</div>";
 }
 
+// 同音合并表: units(1四分=8) → (duration, dotted)。只做精确匹配，不精确就不合并，
+// 避免把无法用单个音符时值表示的组合错误并成一个音。
+const HELD_DURATION_TABLE = [
+  { duration: "1", dotted: 0, units: 32 },   // 全音符
+  { duration: "2", dotted: 1, units: 24 },   // 附点二分
+  { duration: "2", dotted: 0, units: 16 },   // 二分
+  { duration: "4", dotted: 1, units: 12 },   // 附点四分
+  { duration: "4", dotted: 0, units: 8 },    // 四分
+  { duration: "8", dotted: 1, units: 6 },    // 附点八分
+  { duration: "8", dotted: 0, units: 4 },    // 八分
+  { duration: "16", dotted: 1, units: 3 },   // 附点十六分
+  { duration: "16", dotted: 0, units: 2 },   // 十六分
+  { duration: "32", dotted: 0, units: 1 }    // 三十二分
+];
+
+function samePitchSet(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((p, i) => {
+    const q = b[i];
+    return p.step === q.step
+      && Number(p.octave) === Number(q.octave)
+      && (p.accidental || "") === (q.accidental || "");
+  });
+}
+
+// 把相邻、音高完全相同的单音合并成一个长音。solver 对非锚定声部"每格一个音"，
+// 一个全音符会被拆成 4 个同音四分音符；这里按总 units 精确匹配合法时值并回一个音，
+// 保证答案谱节奏对齐、不出现"一串重复四分音符"。
+function mergeHeldNotes(entries) {
+  if (!Array.isArray(entries) || entries.length < 2) return entries;
+  const out = [];
+  let i = 0;
+  while (i < entries.length) {
+    const e = entries[i];
+    if (!e || e.kind !== "note" || !Array.isArray(e.pitches) || e.pitches.length !== 1 || e.dotted) {
+      out.push(e);
+      i += 1;
+      continue;
+    }
+    let j = i + 1;
+    let totalUnits = Number(e.units) || unitsForEntry(e);
+    while (j < entries.length) {
+      const n = entries[j];
+      if (!n || n.kind !== "note" || !Array.isArray(n.pitches) || n.pitches.length !== 1) break;
+      if (!samePitchSet(e.pitches, n.pitches)) break;
+      if (n.dotted) break;
+      totalUnits += (Number(n.units) || unitsForEntry(n));
+      j += 1;
+    }
+    const exact = HELD_DURATION_TABLE.find((c) => Math.abs(c.units - totalUnits) < 0.001);
+    if (exact && j - i > 1) {
+      out.push({ ...e, duration: exact.duration, dotted: exact.dotted, units: exact.units });
+    } else {
+      for (let k = i; k < j; k += 1) out.push(entries[k]);
+    }
+    i = j;
+  }
+  return out;
+}
+
 function renderFourPartAnswer(result) {
   try {
   const answer = result.fourPart || {};
+  // 合并非锚定声部相邻同音（幂等：锚定声部已是正确长音，合并不会改动它）。
+  // 直接原地归一化 answer.voices，让后续 renderFourPartScore 和
+  // applyFourPartAnswerToEditor 都读到合并后的节奏。
+  if (Array.isArray(answer.voices)) {
+    answer.voices.forEach((v) => {
+      if (Array.isArray(v.measures)) {
+        v.measures.forEach((m) => { m.entries = mergeHeldNotes(m.entries || []); });
+      }
+      if (Array.isArray(v.entries)) v.entries = mergeHeldNotes(v.entries);
+    });
+  }
   const voices = answer.voices || [];
   // fourPartStatus.textContent 已经在 submitFourPartAnswer 里设好了
   // (sposobin-solver / 失败), 这里只负责"是否能套用", 不要覆盖.
@@ -1242,6 +1361,8 @@ function renderFourPartAnswer(result) {
     const match = String(line).match(/第 (\d+) 小节/);
     if (match) warningMeasures.add(Number(match[1]));
   });
+  // P2: 结构化的降级小节 (solver 端已记录), 不依赖字符串解析.
+  (result.summary?.degradedMeasures || []).forEach((m) => warningMeasures.add(Number(m)));
 
   // P18.6: server 端 schema 是 [{measure, harmonies: [{offset, beat, ...}]}],
   // 前端要解嵌套拿到每个 beat 的 chord.  防御性: 如果 server 给的是扁平
@@ -1304,8 +1425,42 @@ function renderFourPartAnswer(result) {
     </div>`;
   }
 
+  // P2: 降级合成的小节, 顶部给醒目提示 (不伪装成确定答案).
+  const degradedMeasures = summary.degradedMeasures || [];
+  const degradedBanner = degradedMeasures.length
+    ? `<div class="warning-row" style="font-weight:700">⚠ 本答案有 ${degradedMeasures.length} 个小节自动降级合成（第 ${degradedMeasures.join("、")} 小节），和声可能不正确，请人工核对。</div>`
+    : "";
+
+  // P5-3: 结构化错误码 → 稳定提示 (不解析中文字符串).
+  const errorCodeHint = {
+    EMPTY_MELODY: "请先在「3 五线谱制谱」区输入旋律，再生成答案。",
+    EMPTY_BASS: "请先在「3 五线谱制谱」区低音谱表（声部 2）输入低音，再生成答案。",
+    OUT_OF_RANGE: "有音符超出该声部的音域，请调整音符音高。",
+    BAD_DURATION: "有音符的时值无法落到当前拍号网格，请改用四分/八分/十六分及其附点。",
+    SOLVER_ERROR: "求解器遇到内部错误，请重试或换一道题。",
+  }[result.errorCode];
+  const errorCodeBanner = result.errorCode
+    ? `<div class="warning-row" style="font-weight:700">[${escapeHtml(result.errorCode)}] ${escapeHtml(errorCodeHint || "")}</div>`
+    : "";
+
+  // P2: 渲染 top-N 备选方案 (多解并存). 每个 alternative 是 {rank, deltaScore,
+  // measures:[{number, beats:[{roman}], cadence}]}. 只列和弦进行, 不整谱重渲.
+  const alternatives = Array.isArray(result.alternatives) ? result.alternatives : [];
+  let alternativesBlock = "";
+  if (alternatives.length) {
+    const rows = alternatives.slice(0, 8).map((alt) => {
+      const prog = (alt.measures || []).map((m) => {
+        const romans = (m.beats || []).map((b) => b.roman || "?").join(" ");
+        return `${m.number}:${romans}`;
+      }).join("  |  ");
+      const delta = typeof alt.deltaScore === "number" ? `（分数差 ${alt.deltaScore}）` : "";
+      return `<div class="answer-row alt-row"><strong>方案 ${alt.rank}${delta}</strong><p>${escapeHtml(prog)}</p></div>`;
+    }).join("");
+    alternativesBlock = `<div class="answer-row"><strong>备选方案（多解并存，共 ${alternatives.length} 个）</strong></div>${rows}`;
+  }
+
   fourPartDetails.className = "answer-details";
-  fourPartDetails.innerHTML = [confidenceBlock, ...harmonyRows, ...explanationRows, ...warningRows].filter(Boolean).join("") || "没有生成文字说明。";
+  fourPartDetails.innerHTML = [errorCodeBanner, degradedBanner, confidenceBlock, alternativesBlock, ...harmonyRows, ...explanationRows, ...warningRows].filter(Boolean).join("") || "没有生成文字说明。";
   } catch (err) {
     // P18.6: 任何内部错误都不让用户看到 "list index out of range" 这种
     // Python 风格错误, 改成中文提示 + 让用户刷新或重试.
@@ -1329,7 +1484,6 @@ function _extractMeasureVoicesForExplain(result) {
   const answer = result.fourPart || {};
   const flatHarmonies = (answer.harmonies || []).flatMap((item) => {
     if (!item) return [];
-    if (Array.isArray(item.harmories)) return [];
     if (Array.isArray(item.harmonies)) {
       return item.harmonies.map((h) => ({
         measure: item.measure,
@@ -1776,6 +1930,16 @@ function normalizeAnswerEntryForEditor(entry, voiceId) {
     tupletGroup: entry.tupletGroup || "",
     tupletPosition: entry.tupletPosition || ""
   };
+
+  // 修饰音/演奏记号透传 (后端已原样返回, 套用回制谱区时不截断)
+  const passthrough = [
+    "chordSymbol", "articulation", "ornament", "grace", "pedal", "hairpin",
+    "fingering", "arpeggiate", "phraseStart", "phraseStop", "textMark", "breath",
+    "rehearsalMark", "volta"
+  ];
+  for (const field of passthrough) {
+    if (entry[field] !== undefined && entry[field] !== null) base[field] = entry[field];
+  }
 
   if (base.kind === "rest") return base;
   return {
@@ -2420,13 +2584,12 @@ function renderSingleNotationSafe() {
   }
 
   // 加上"切小节"覆盖按钮和 prev/next 视觉提示
-  // 传入 row 数组 (而不是纯 index 数组)
-  const measureIdxArr = visibleIndices.map(v => v.index);
-  addMeasureJumpButtons(measureIdxArr, currentIdx, slotWidth, staveHeight);
+  // 传入 {index,row,slot} 结构，让按钮/蒙层按行列定位（多行换行不再错位）。
+  addMeasureJumpButtons(visibleIndices, currentIdx, slotWidth, staveHeight, rowGap);
 
   // 节拍网格（Flat.io 风格：每个 beat 一条虚线）
   if (isCurrentMeasureEmpty()) {
-    drawBeatGrid(context, visibleIndices, currentIdx, slotWidth, staveHeight);
+    drawBeatGrid(context, visibleIndices, currentIdx, slotWidth, staveHeight, rowGap);
   }
 
   noteCanvas.dataset.entryCount = String(currentVoiceEntries().length);
@@ -2479,65 +2642,57 @@ function pickVisibleMeasureIndices(currentIdx, totalMeasures) {
  * P18.8.3 — 在画布的 prev/next 小节上叠"切小节"按钮（点击切换 currentMeasureIndex）。
  * 用 DOM button 覆盖 VexFlow svg 之上，z-index: 5。
  */
-function addMeasureJumpButtons(visibleIndices, currentIdx, slotWidth, staveHeight) {
+function addMeasureJumpButtons(measures, currentIdx, slotWidth, staveHeight, rowGap = 10) {
   const wrap = noteCanvas.parentElement;   // .editor-score-viewport
   if (!wrap) return;
+  // measures 统一成 {index, row, slot}。兼容旧调用传纯数字数组(视为单行 row=0)。
+  // 旧实现用 indexOf(currentIdx-1) 拿到的是"绝对索引"，多行换行时 left/top 会错位。
+  const layout = (measures || []).map((m, i) =>
+    (typeof m === "object" && m !== null)
+      ? { index: m.index, row: m.row || 0, slot: (m.slot ?? i) }
+      : { index: m, row: 0, slot: i }
+  );
+  const find = (idx) => layout.find((m) => m.index === idx);
+
+  const placeButton = (idx, className, text, title, onSwitch) => {
+    const item = find(idx);
+    if (!item) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = className;
+    btn.textContent = text;
+    btn.title = title;
+    btn.style.left = `${item.slot * slotWidth + 8}px`;
+    btn.style.top = `${item.row * (staveHeight + rowGap) + staveHeight - 6}px`;
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      onSwitch();
+    });
+    noteCanvas.appendChild(btn);
+  };
+
+  const placeFade = (idx, className) => {
+    const item = find(idx);
+    const fade = document.createElement("div");
+    fade.className = className;
+    if (item) fade.style.left = `${item.slot * slotWidth}px`;
+    else fade.style.left = "0";
+    fade.style.width = `${slotWidth}px`;
+    noteCanvas.appendChild(fade);
+  };
+
   // prev 按钮（如果 currentIdx > 0）
   if (currentIdx > 0) {
-    const prevSlot = visibleIndices.indexOf(currentIdx - 1);
-    if (prevSlot >= 0) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "measure-jump-button prev";
-      btn.textContent = `← 第 ${currentIdx} 小节`;
-      btn.title = `跳到第 ${currentIdx} 小节`;
-      btn.style.left = `${prevSlot * slotWidth + 8}px`;
-      btn.style.top = `${staveHeight - 6}px`;
-      btn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        switchToMeasure(currentIdx - 1);
-      });
-      noteCanvas.appendChild(btn);
-    }
+    placeButton(currentIdx - 1, "measure-jump-button prev", `← 第 ${currentIdx} 小节`, `跳到第 ${currentIdx} 小节`, () => switchToMeasure(currentIdx - 1));
   }
   // next 按钮（如果 currentIdx < totalMeasures - 1）
   if (currentIdx < scoreMeasures.length - 1) {
     const nextIdx = currentIdx + 1;
-    const nextSlot = visibleIndices.indexOf(nextIdx);
-    if (nextSlot >= 0) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "measure-jump-button next";
-      btn.textContent = `第 ${nextIdx + 1} 小节 →`;
-      btn.title = `跳到第 ${nextIdx + 1} 小节`;
-      btn.style.left = `${nextSlot * slotWidth + 8}px`;
-      btn.style.top = `${staveHeight - 6}px`;
-      btn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        switchToMeasure(nextIdx);
-      });
-      noteCanvas.appendChild(btn);
-    }
+    placeButton(nextIdx, "measure-jump-button next", `第 ${nextIdx + 1} 小节 →`, `跳到第 ${nextIdx + 1} 小节`, () => switchToMeasure(nextIdx));
   }
   // prev/next 两侧半透明蒙层
-  if (currentIdx > 0) {
-    const fade = document.createElement("div");
-    fade.className = "score-prev-fade";
-    const prevSlot = visibleIndices.indexOf(currentIdx - 1);
-    if (prevSlot >= 0) fade.style.left = `${prevSlot * slotWidth}px`;
-    else fade.style.left = "0";
-    fade.style.width = `${slotWidth}px`;
-    noteCanvas.appendChild(fade);
-  }
-  if (currentIdx < scoreMeasures.length - 1) {
-    const fade = document.createElement("div");
-    fade.className = "score-next-fade";
-    const nextSlot = visibleIndices.indexOf(currentIdx + 1);
-    if (nextSlot >= 0) fade.style.left = `${nextSlot * slotWidth}px`;
-    else fade.style.right = "0";
-    fade.style.width = `${slotWidth}px`;
-    noteCanvas.appendChild(fade);
-  }
+  if (currentIdx > 0) placeFade(currentIdx - 1, "score-prev-fade");
+  if (currentIdx < scoreMeasures.length - 1) placeFade(currentIdx + 1, "score-next-fade");
 }
 
 function clearMeasureJumpButtons() {
@@ -2548,19 +2703,27 @@ function isCurrentMeasureEmpty() {
   return currentVoiceEntries().length === 0;
 }
 
-function drawBeatGrid(context, visibleIndices, currentIdx, slotWidth, staveHeight) {
+function drawBeatGrid(context, visibleIndices, currentIdx, slotWidth, staveHeight, rowGap = 10) {
   if (!context) return;
-  const rect = visibleIndices.map((i) => i === currentIdx).indexOf(true);
-  if (rect < 0) return;
+  // 修复: 旧代码 `visibleIndices.map(i => i === currentIdx)` 拿对象跟数字比，恒 false，
+  // 导致节拍网格从不渲染。这里按 {index,row,slot} 结构正确找当前小节。
+  const current = (visibleIndices || []).find((m) => m && m.index === currentIdx);
+  if (!current) return;
   const meter = currentMeter();
   const beats = meter.numerator;
   if (beats <= 1) return;
-  const slotX = rect * slotWidth;
+  const slotX = current.slot * slotWidth;
   const usableW = slotWidth - 8;
-  // 用 svg 的线条画（用 SVG path 比 div 容易控制）
   const startX = slotX + 4;
-  const topY = 12;
-  const bottomY = topY + staveHeight - 30;
+  // 用当前小节真实 stave 线位置（staffGeometry 在渲染主循环已填充），回退到固定估算。
+  let topY, bottomY;
+  if (staffGeometry && staffGeometry.staveY != null) {
+    topY = staffGeometry.staveY + (staffGeometry.topY || 0);
+    bottomY = staffGeometry.staveY + (staffGeometry.bottomY || 40);
+  } else {
+    topY = 12 + current.row * (staveHeight + rowGap);
+    bottomY = topY + 40;
+  }
   for (let b = 1; b < beats; b += 1) {
     const x = startX + (usableW * b) / beats;
     const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
@@ -2976,7 +3139,8 @@ function renderPianoNotation() {
     drawEntryHairpins(context, bassScoreEntries, bassNotesByMeasure, bassStavesByMeasure);
   }
 
-  addMeasureJumpButtons(visibleIndices, currentIdx, slotWidth, staveHeight);
+  // piano 双谱表是单行窗口，把纯数字数组包成 {index,row:0,slot} 结构。
+  addMeasureJumpButtons(visibleIndices.map((index, slot) => ({ index, row: 0, slot })), currentIdx, slotWidth, staveHeight);
 
   noteCanvas.dataset.entryCount = String(currentVoiceEntries().length);
   noteCanvas.dataset.chordSizes = currentVoiceEntries().map((entry) => entry.kind === "note" ? entry.pitches.length : 0).join(",");
@@ -4520,6 +4684,19 @@ function selectLastEntryInActiveVoice() {
   }
 }
 
+// P22.5 监督 v2 (2026-08-17): XML 加载后默认选第一拍 (m1 beat 1), 不是最后.
+//   原 selectLastEntryInActiveVoice 在 9 处被调, 多数场景"想选最后"是合理的
+//   (新输入的 entry 在最后, 撤销后想回退). 所以只加一个新函数, 不改原函数.
+function selectFirstEntryInActiveVoice() {
+  selectedEntryIndex = -1;
+  for (let index = 0; index < measureEntries.length; index += 1) {
+    if (entryVoice(measureEntries[index]) === activeVoiceId()) {
+      selectedEntryIndex = index;
+      break;
+    }
+  }
+}
+
 function collectScoreDocument() {
   const maxMeasureCount = Math.max(
     1,
@@ -4530,7 +4707,7 @@ function collectScoreDocument() {
 
   return {
     schemaVersion: "manual-score-v1",
-    title: "Manual score",
+    title: scoreDocumentTitle,
     timeSignature: editorTime.value,
     keySignature: editorKey.value,
     tempo: Number(tempoInput.value) || 0,
@@ -4610,6 +4787,8 @@ function normalizeEntryForExport(entry, index) {
     phraseStop: Boolean(entry.phraseStop),
     textMark: entry.textMark || "",
     breath: Boolean(entry.breath),
+    volta: entry.volta == null ? null : entry.volta,
+    rehearsalMark: entry.rehearsalMark || "",
     tupletType: entry.tupletType || "",
     tupletGroup: entry.tupletGroup || "",
     tupletPosition: entry.tupletPosition || ""
@@ -4771,9 +4950,24 @@ function exportScoreMusicXml() {
 }
 
 function importMusicXmlFile(file) {
-  // P2.7+ 集成: 走 server /parse-score (reader.py + reader_to_editor.py),
-  // 把 XML 直接转化到制谱页面. 只装 melody (treble.1) + bass (bass.2),
-  // alto (treble.2) 和 tenor (bass.1) 留空, 不显示 gold 4 voice 答案.
+  const suffix = file.name.toLowerCase().split(".").pop();
+  if (suffix === "xml" || suffix === "musicxml") {
+    setBusy(file.name);
+    file.text()
+      .then((xmlText) => {
+        loadParsedMusicXml(parseMusicXmlText(xmlText));
+        readStatus.textContent = "已导入";
+      })
+      .catch((error) => {
+        setError(error.message || "MusicXML 导入失败");
+        showEditorMessage("MusicXML 导入失败：" + error.message, "error");
+      });
+    return;
+  }
+  importMusicXmlViaServer(file);
+}
+
+function importMusicXmlViaServer(file) {
   const formData = new FormData();
   formData.append("file", file);
   setBusy(file.name);
@@ -4792,14 +4986,21 @@ function importMusicXmlFile(file) {
 }
 
 function loadParsedMusicXml(parsed) {
+  scoreDocumentTitle = parsed.title || "Manual score";
   editorTime.value = parsed.timeSignature;
   editorKey.value = parsed.keySignature;
+  if (manualKey) manualKey.value = parsed.keySignature;
+  if (tempoInput) tempoInput.value = parsed.tempo || "";
+  if (anacrusisCheck) anacrusisCheck.checked = Boolean(parsed.anacrusis);
+  if (staffMode) staffMode.value = parsed.staffMode || (parsed.staves.bass.length ? "piano" : "single");
+  const measureCount = Math.max(parsed.measureCount || 0, parsed.staves.treble.length, parsed.staves.bass.length, 1);
   ["treble", "bass"].forEach((staffKey) => {
     const state = staffScores[staffKey];
     const parsedMeasures = parsed.staves[staffKey] || [];
-    state.measures = parsedMeasures.map((measure) => {
+    state.measures = Array.from({ length: measureCount }, (_, measureIndex) => {
+      const measure = parsedMeasures[measureIndex];
       const entries = [];
-      (measure.voices || []).forEach((voice) => {
+      (measure?.voices || []).forEach((voice) => {
         (voice.entries || []).forEach((entry) => {
           entries.push({ ...entry, voice: voice.id });
         });
@@ -4807,15 +5008,20 @@ function loadParsedMusicXml(parsed) {
       return entries;
     });
     state.settings = state.measures.map((_, idx) => {
-      const parsed = parsedMeasures[idx];
+      const parsedMeasure = parsedMeasures[idx];
       return {
-        beginBarline: parsed?.beginBarline || "single",
-        endBarline: parsed?.endBarline || "single"
+        beginBarline: parsedMeasure?.beginBarline || "single",
+        endBarline: parsedMeasure?.endBarline || "single"
       };
     });
   });
   currentMeasureIndex = 0;
   noteMeasure.value = "1";
+  if (parsed.staffMode === "single" && parsed.staves.bass.length && !parsed.staves.treble.length) {
+    noteClef.value = "bass";
+  } else {
+    noteClef.value = "treble";
+  }
   activateStaff();
   selectLastEntryInActiveVoice();
   editHistory = [];
@@ -4834,6 +5040,7 @@ function buildMusicXml(documentData) {
   body.push('<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">');
   body.push('<score-partwise version="4.0">');
   body.push(`  <work><work-title>${xmlEscape(documentData.title)}</work-title></work>`);
+  body.push('  <identification><encoding><software>Music Reader Frontend</software></encoding></identification>');
   body.push('  <part-list>');
   body.push(`    <score-part id="${partId}"><part-name>Manual Score</part-name></score-part>`);
   body.push('  </part-list>');
@@ -4854,24 +5061,23 @@ function buildMusicXml(documentData) {
         body.push('      </direction>');
       }
     }
-    let writtenUnits = 0;
+    const streams = [];
     documentData.staves.forEach((staff) => {
       staff.measures[measureIndex].voices.forEach((voice) => {
         if (!voice.entries.length) return;
-        if (writtenUnits > 0) {
-          body.push('      <backup>');
-          body.push(`        <duration>${Math.round(writtenUnits * DIVISIONS_PER_UNIT)}</duration>`);
-          body.push('      </backup>');
-        }
-        voice.entries.forEach((entry) => {
-          body.push(...musicXmlEntry(entry, staff.staffNumber, musicXmlVoiceNumber(staff.staffNumber, voice.id), divisions, meter.capacity));
+        streams.push({
+          staffNumber: staff.staffNumber,
+          voiceNumber: musicXmlVoiceNumber(staff.staffNumber, voice.id),
+          entries: voice.entries
         });
-        writtenUnits += voice.entries.reduce((sum, entry) => sum + (entry.units || 0), 0);
       });
     });
-    if (writtenUnits === 0) {
+    if (!streams.length) {
       documentData.staves.forEach((staff) => {
-        body.push(...musicXmlEntry({
+        streams.push({
+          staffNumber: staff.staffNumber,
+          voiceNumber: musicXmlVoiceNumber(staff.staffNumber, "1"),
+          entries: [{
           kind: "rest",
           units: meter.capacity,
           duration: "1",
@@ -4883,10 +5089,23 @@ function buildMusicXml(documentData) {
           slurStart: false,
           slurStop: false,
           fermata: false,
-          dynamic: ""
-        }, staff.staffNumber, musicXmlVoiceNumber(staff.staffNumber, "1"), divisions, meter.capacity));
+            dynamic: ""
+          }]
+        });
       });
     }
+    let previousStreamUnits = 0;
+    streams.forEach((stream, streamIndex) => {
+      if (streamIndex > 0) {
+        body.push('      <backup>');
+        body.push(`        <duration>${Math.round(previousStreamUnits * DIVISIONS_PER_UNIT)}</duration>`);
+        body.push('      </backup>');
+      }
+      stream.entries.forEach((entry) => {
+        body.push(...musicXmlEntry(entry, stream.staffNumber, stream.voiceNumber, divisions, meter.capacity));
+      });
+      previousStreamUnits = stream.entries.reduce((sum, entry) => sum + (entry.units || 0), 0);
+    });
     body.push(...musicXmlBarlines(documentData.staves[0].measures[measureIndex]));
     body.push('    </measure>');
   }
@@ -4926,13 +5145,14 @@ function musicXmlAttributes(documentData, includeClefs, divisions, staffCount) {
 function musicXmlEntry(entry, staffNumber, voiceNumber, divisions, capacity) {
   const lines = [];
   if (entry.chordSymbol) {
-    lines.push(...musicXmlHarmony(entry));
+    lines.push(...musicXmlHarmony(entry, staffNumber));
   }
   if (entry.pedal) {
     lines.push('      <direction placement="below">');
     lines.push('        <direction-type>');
     lines.push(`          <pedal type="${entry.pedal}"/>`);
     lines.push('        </direction-type>');
+    lines.push(`        <voice>${voiceNumber}</voice>`);
     lines.push(`        <staff>${staffNumber}</staff>`);
     lines.push('      </direction>');
   }
@@ -4942,6 +5162,16 @@ function musicXmlEntry(entry, staffNumber, voiceNumber, divisions, capacity) {
     lines.push('        <direction-type>');
     lines.push(`          <wedge type="${wedgeType}"/>`);
     lines.push('        </direction-type>');
+    lines.push(`        <voice>${voiceNumber}</voice>`);
+    lines.push(`        <staff>${staffNumber}</staff>`);
+    lines.push('      </direction>');
+  }
+  if (entry.rehearsalMark) {
+    lines.push('      <direction placement="above">');
+    lines.push('        <direction-type>');
+    lines.push(`          <rehearsal>${xmlEscape(entry.rehearsalMark)}</rehearsal>`);
+    lines.push('        </direction-type>');
+    lines.push(`        <voice>${voiceNumber}</voice>`);
     lines.push(`        <staff>${staffNumber}</staff>`);
     lines.push('      </direction>');
   }
@@ -4950,6 +5180,7 @@ function musicXmlEntry(entry, staffNumber, voiceNumber, divisions, capacity) {
     lines.push('        <direction-type>');
     lines.push(`          <words>${xmlEscape(entry.textMark)}</words>`);
     lines.push('        </direction-type>');
+    lines.push(`        <voice>${voiceNumber}</voice>`);
     lines.push(`        <staff>${staffNumber}</staff>`);
     lines.push('      </direction>');
   }
@@ -4958,6 +5189,7 @@ function musicXmlEntry(entry, staffNumber, voiceNumber, divisions, capacity) {
     lines.push('        <direction-type>');
     lines.push(`          <dynamics><${xmlEscape(entry.dynamic)}/></dynamics>`);
     lines.push('        </direction-type>');
+    lines.push(`        <voice>${voiceNumber}</voice>`);
     lines.push(`        <staff>${staffNumber}</staff>`);
     lines.push('      </direction>');
   }
@@ -4968,8 +5200,10 @@ function musicXmlEntry(entry, staffNumber, voiceNumber, divisions, capacity) {
     lines.push(`          <step>${xmlEscape(entry.grace.step)}</step>`);
     if (entry.grace.accidental === "#") lines.push('          <alter>1</alter>');
     if (entry.grace.accidental === "b") lines.push('          <alter>-1</alter>');
+    if (entry.grace.accidental === "n") lines.push('          <alter>0</alter>');
     lines.push(`          <octave>${entry.grace.octave}</octave>`);
     lines.push('        </pitch>');
+    if (entry.grace.accidental === "n") lines.push('        <accidental>natural</accidental>');
     lines.push(`        <voice>${voiceNumber}</voice>`);
     lines.push('        <type>16th</type>');
     lines.push(`        <staff>${staffNumber}</staff>`);
@@ -4997,10 +5231,11 @@ function musicXmlSingleNote(entry, staffNumber, voiceNumber, pitch, isChordTone,
     lines.push(`          <step>${xmlEscape(pitch.step)}</step>`);
     if (pitch.accidental === "#") lines.push('          <alter>1</alter>');
     if (pitch.accidental === "b") lines.push('          <alter>-1</alter>');
+    if (pitch.accidental === "n") lines.push('          <alter>0</alter>');
     lines.push(`          <octave>${pitch.octave}</octave>`);
     lines.push('        </pitch>');
+    if (pitch.accidental === "n") lines.push('        <accidental>natural</accidental>');
   }
-  if (entry.arpeggiate) lines.push('        <arpeggiate/>');
   lines.push(`        <duration>${Math.round(entry.units * DIVISIONS_PER_UNIT)}</duration>`);
   lines.push(`        <voice>${voiceNumber}</voice>`);
   lines.push(`        <type>${musicXmlTypes[entry.duration] || "quarter"}</type>`);
@@ -5039,8 +5274,13 @@ function musicXmlNotations(entry) {
     notationLines.push(`            <${articulation}/>`);
     notationLines.push('          </articulations>');
   }
+  const customOrnaments = ["upprall", "downprall", "lineprall"];
   const ornament = ornamentXml[entry.ornament];
-  if (ornament) {
+  if (customOrnaments.includes(entry.ornament)) {
+    notationLines.push('          <ornaments>');
+    notationLines.push(`            <other-ornament>${xmlEscape(entry.ornament)}</other-ornament>`);
+    notationLines.push('          </ornaments>');
+  } else if (ornament) {
     notationLines.push('          <ornaments>');
     notationLines.push(`            <${ornament}/>`);
     notationLines.push('          </ornaments>');
@@ -5050,19 +5290,29 @@ function musicXmlNotations(entry) {
     notationLines.push(`            <fingering>${xmlEscape(entry.fingering)}</fingering>`);
     notationLines.push('          </technical>');
   }
+  if (entry.arpeggiate) notationLines.push('          <arpeggiate/>');
+  if (entry.tupletGroup) {
+    notationLines.push(`          <other-notation type="single">music-reader-tuplet-group:${xmlEscape(entry.tupletGroup)}</other-notation>`);
+  }
   if (!notationLines.length) return [];
   return ['        <notations>', ...notationLines, '        </notations>'];
 }
 
 function musicXmlBarlines(measure) {
   const lines = [];
-  if (measure.beginBarline === "repeat-begin" || measure.endBarline === "repeat-both") {
+  const volta = measure.voices
+    .flatMap((voice) => voice.entries || [])
+    .find((entry) => entry.volta != null)?.volta;
+  if (measure.beginBarline === "repeat-begin" || measure.endBarline === "repeat-both" || volta != null) {
     lines.push('      <barline location="left">');
-    lines.push('        <bar-style>heavy-light</bar-style>');
-    lines.push('        <repeat direction="forward"/>');
+    if (measure.beginBarline === "repeat-begin" || measure.endBarline === "repeat-both") {
+      lines.push('        <bar-style>heavy-light</bar-style>');
+      lines.push('        <repeat direction="forward"/>');
+    }
+    if (volta != null) lines.push(`        <ending number="${xmlEscape(volta)}" type="start"/>`);
     lines.push('      </barline>');
   }
-  if (["double", "end", "repeat-end", "repeat-both"].includes(measure.endBarline)) {
+  if (["double", "end", "repeat-end", "repeat-both"].includes(measure.endBarline) || volta != null) {
     lines.push('      <barline location="right">');
     if (measure.endBarline === "double") lines.push('        <bar-style>light-light</bar-style>');
     if (measure.endBarline === "end") lines.push('        <bar-style>light-heavy</bar-style>');
@@ -5070,6 +5320,7 @@ function musicXmlBarlines(measure) {
       lines.push('        <bar-style>light-heavy</bar-style>');
       lines.push('        <repeat direction="backward"/>');
     }
+    if (volta != null) lines.push(`        <ending number="${xmlEscape(volta)}" type="stop"/>`);
     lines.push('      </barline>');
   }
   return lines;
@@ -5101,7 +5352,7 @@ function parseChordSymbol(symbol) {
       alter: bassMatch[2] === "#" ? 1 : bassMatch[2] === "b" ? -1 : 0
     };
   }
-  return { root, kind, bass };
+  return { root, kind, bass, suffix: match[3] };
 }
 
 function chordKind(suffix) {
@@ -5125,7 +5376,7 @@ function chordKind(suffix) {
   return "other";
 }
 
-function musicXmlHarmony(entry) {
+function musicXmlHarmony(entry, staffNumber) {
   const parsed = parseChordSymbol(entry.chordSymbol);
   if (!parsed) return [];
   const lines = ['      <harmony>'];
@@ -5133,13 +5384,14 @@ function musicXmlHarmony(entry) {
   lines.push(`          <root-step>${xmlEscape(parsed.root.step)}</root-step>`);
   if (parsed.root.alter) lines.push(`          <root-alter>${parsed.root.alter}</root-alter>`);
   lines.push('        </root>');
-  lines.push(`        <kind>${parsed.kind}</kind>`);
+  lines.push(`        <kind text="${xmlEscape(parsed.suffix)}">${parsed.kind}</kind>`);
   if (parsed.bass) {
     lines.push('        <bass>');
     lines.push(`          <bass-step>${xmlEscape(parsed.bass.step)}</bass-step>`);
     if (parsed.bass.alter) lines.push(`          <bass-alter>${parsed.bass.alter}</bass-alter>`);
     lines.push('        </bass>');
   }
+  lines.push(`        <staff>${staffNumber}</staff>`);
   lines.push('      </harmony>');
   return lines;
 }
@@ -5203,42 +5455,67 @@ const xmlRepeatToBarline = {
 function parseMusicXmlText(xmlText) {
   const xml = String(xmlText || "");
   const result = {
+    schemaVersion: "manual-score-v1",
+    title: "Manual score",
     timeSignature: "4/4",
     keySignature: "C",
+    tempo: 0,
+    anacrusis: false,
+    staffMode: "single",
+    measureCount: 0,
     staves: { treble: [], bass: [] }
   };
 
-  const partMatch = /<part[^>]*>([\s\S]*?)<\/part>/i.exec(xml);
-  const partXml = partMatch ? partMatch[1] : xml;
+  const titleMatch = /<work-title>([\s\S]*?)<\/work-title>/i.exec(xml);
+  if (titleMatch) result.title = xmlUnescape(titleMatch[1].trim());
+  const tempoMatch = /<per-minute>([^<]+)<\/per-minute>/i.exec(xml)
+    || /<sound\b[^>]*\btempo="([^"]+)"/i.exec(xml);
+  if (tempoMatch) result.tempo = Number(tempoMatch[1]) || 0;
+  result.anacrusis = /<measure\b[^>]*\bimplicit="yes"/i.test(xml);
 
-  const measureRegex = /<measure[^>]*>([\s\S]*?)<\/measure>/gi;
+  const partMatch = /<part\b[^>]*>([\s\S]*?)<\/part>/i.exec(xml);
+  const partXml = partMatch ? partMatch[1] : xml;
+  const staffCountMatch = /<staves>(\d+)<\/staves>/i.exec(partXml);
+  result.staffMode = Number(staffCountMatch?.[1] || 1) > 1 ? "piano" : "single";
+  const firstClefMatch = /<clef\b[^>]*>[\s\S]*?<sign>\s*([A-Z])\s*<\/sign>[\s\S]*?<\/clef>/i.exec(partXml);
+  result.staffMap = result.staffMode === "single" && firstClefMatch?.[1] === "F"
+    ? { 1: "bass" }
+    : { 1: "treble", 2: "bass" };
+
+  const measureRegex = /<measure\b([^>]*)>([\s\S]*?)<\/measure>/gi;
   let measureMatch;
   while ((measureMatch = measureRegex.exec(partXml))) {
-    const parsed = parseMusicXmlMeasure(measureMatch[1], result);
+    const numberMatch = /\bnumber="([^"]+)"/i.exec(measureMatch[1]);
+    const parsed = parseMusicXmlMeasure(measureMatch[2], result, numberMatch ? numberMatch[1] : undefined);
     if (!parsed) continue;
-    if (parsed.clef === "bass") {
-      result.staves.bass.push(parsed.measures[0]);
-    } else {
-      result.staves.treble.push(parsed.measures[0]);
-    }
+    if (parsed.treble) result.staves.treble.push(parsed.treble);
+    if (parsed.bass) result.staves.bass.push(parsed.bass);
   }
+  result.measureCount = Math.max(result.staves.treble.length, result.staves.bass.length);
+  if (!result.measureCount) throw new Error("MusicXML 中没有可读取的小节");
   return result;
 }
 
-function parseMusicXmlMeasure(measureXml, result) {
+function parseMusicXmlMeasure(measureXml, result, measureNumber = 1) {
+  // MusicXML 的 <divisions> 只在第一个小节的 <attributes> 里声明一次，后续小节继承。
+  // 旧代码每小节重读并默认 24：真实 divisions 是 256 时，第 2 小节起所有时值会被按
+  // 24/256 缩放 ≈ 10.67 倍，音符严重错位、溢出小节。这里改成"读到就更新，读不到就继承"。
   const divMatch = /<divisions>(\d+)<\/divisions>/.exec(measureXml);
-  const divisions = divMatch ? Number(divMatch[1]) : 24;
+  if (divMatch) result.divisions = Number(divMatch[1]);
+  const divisions = result.divisions || 24;
 
   const timeMatch = /<beats>(\d+)<\/beats>[\s\S]*?<beat-type>(\d+)<\/beat-type>/.exec(measureXml);
   if (timeMatch) result.timeSignature = `${timeMatch[1]}/${timeMatch[2]}`;
   const keyMatch = /<fifths>(-?\d+)<\/fifths>/.exec(measureXml);
-  if (keyMatch) result.keySignature = keyFromFifths(Number(keyMatch[1]));
+  const modeMatch = /<mode>(major|minor)<\/mode>/i.exec(measureXml);
+  if (keyMatch) result.keySignature = keyFromFifths(Number(keyMatch[1]), modeMatch?.[1]);
   const clefSign = /<sign>([A-Z])<\/sign>/.exec(measureXml);
   const isBass = clefSign && clefSign[1] === "F";
 
   // 解析起始/结束小节线：<barline location="left|right"><bar-style>...</bar-style></barline>
   let beginBarline = "single";
   let endBarline = "single";
+  let volta = null;
   const leftBarMatch = /<barline[^>]*location="left"[^>]*>([\s\S]*?)<\/barline>/i.exec(measureXml);
   if (leftBarMatch) {
     const style = /<bar-style>([^<]+)<\/bar-style>/.exec(leftBarMatch[1]);
@@ -5252,6 +5529,11 @@ function parseMusicXmlMeasure(measureXml, result) {
     const repeat = /<repeat[^>]*direction="(\w+)"[^>]*\/>/.exec(rightBarMatch[1]);
     if (repeat) endBarline = xmlRepeatToBarline[repeat[1]] || "single";
     else if (style) endBarline = xmlToBarline[style[1].trim()] || "single";
+  }
+  const endingMatch = /<ending\b[^>]*\bnumber="([^"]+)"[^>]*\btype="start"[^>]*\/>/i.exec(measureXml);
+  if (endingMatch) {
+    const parsedVolta = Number(endingMatch[1]);
+    volta = Number.isFinite(parsedVolta) ? parsedVolta : endingMatch[1];
   }
 
   // 解析所有 token（按文档顺序）：note, backup, direction, harmony
@@ -5271,10 +5553,10 @@ function parseMusicXmlMeasure(measureXml, result) {
   // 按 voice 重建时间线；同一时刻的 direction/harmony attach 到当前 cursor 对应的 entry
   const voiceLists = {};
   const pendingDirections = []; // { offset, voice, direction: {dynamic, pedal, hairpin, textMark} }
-  const pendingHarmonies = [];   // { offset, voice, chordSymbol }
+  const pendingHarmonies = [];   // { offset, voice, staff, chordSymbol }
   const pendingGrace = new Map(); // voiceId -> grace pitch（grace note 总是出现在主 note 之前，先暂存）
   let cursor = 0;
-  let currentVoice = "1";
+  let currentVoice = "1:1";
 
   tokens.forEach((token) => {
     if (token.type === "backup") {
@@ -5283,37 +5565,55 @@ function parseMusicXmlMeasure(measureXml, result) {
     }
     if (token.type === "direction") {
       const dir = parseMusicXmlDirection(token.xml);
-      if (dir) pendingDirections.push({ offset: cursor, voice: currentVoice, ...dir });
+      if (dir) {
+        const globalVoice = Number(dir.voice);
+        const staffNumber = Number(dir.staff) || (globalVoice > 2 ? 2 : 1);
+        const relativeVoice = globalVoice > 2 ? globalVoice - 2 : globalVoice;
+        const targetVoice = globalVoice ? `${staffNumber}:${relativeVoice}` : currentVoice;
+        const { voice: _voice, staff: _staff, ...values } = dir;
+        pendingDirections.push({ offset: cursor, voice: targetVoice, ...values });
+      }
       return;
     }
     if (token.type === "harmony") {
-      const sym = parseMusicXmlHarmony(token.xml);
-      if (sym) pendingHarmonies.push({ offset: cursor, voice: currentVoice, chordSymbol: sym });
+      const harmony = parseMusicXmlHarmony(token.xml);
+      if (harmony) pendingHarmonies.push({ offset: cursor, voice: null, ...harmony });
       return;
     }
     const note = parseMusicXmlNote(token.xml, divisions);
     if (!note) return;
-    const voiceId = note.voice <= 2 ? String(note.voice) : String((note.voice % 2 === 0) ? 2 : 1);
-    currentVoice = voiceId;
+    // 修复: 旧代码把 4 声部折叠成 2 声部 (voice3→"1", voice4→"2"), 导致 tenor 混进 soprano、
+    // bass 混进 alto, 且全部落在 treble。现在用 <staff> 区分上下谱表, voice 归到谱表内相对声部。
+    const staffNum = note.staff || 1;
+    const voiceOnStaff = note.voice <= 2 ? note.voice : (note.voice - 2);
+    const voiceKey = `${staffNum}:${voiceOnStaff}`;
+    currentVoice = voiceKey;
+    // Harmony is staff-scoped in MusicXML. The exporter places it directly
+    // before its owning note, which lets us recover the editor voice exactly.
+    pendingHarmonies.forEach((harmony) => {
+      if (!harmony.voice && harmony.staff === staffNum && Math.abs(harmony.offset - cursor) < 0.001) {
+        harmony.voice = voiceKey;
+      }
+    });
 
     // grace note: 暂存到 pendingGrace，等下一个非 grace note 出现时 attach
     if (note.grace) {
-      pendingGrace.set(voiceId, note.pitch);
+      pendingGrace.set(voiceKey, note.pitch);
       return;
     }
 
-    if (!voiceLists[voiceId]) voiceLists[voiceId] = [];
-    if (note.chord && voiceLists[voiceId].length) {
-      const last = voiceLists[voiceId][voiceLists[voiceId].length - 1];
+    if (!voiceLists[voiceKey]) voiceLists[voiceKey] = [];
+    if (note.chord && voiceLists[voiceKey].length) {
+      const last = voiceLists[voiceKey][voiceLists[voiceKey].length - 1];
       if (last.entry.kind === "note") last.entry.pitches.push(note.pitch);
       return;
     }
-    const entry = noteToEntry(note, voiceId);
-    if (pendingGrace.has(voiceId)) {
-      entry.grace = pendingGrace.get(voiceId);
-      pendingGrace.delete(voiceId);
+    const entry = noteToEntry(note, String(voiceOnStaff));
+    if (pendingGrace.has(voiceKey)) {
+      entry.grace = pendingGrace.get(voiceKey);
+      pendingGrace.delete(voiceKey);
     }
-    voiceLists[voiceId].push({ offset: cursor, entry });
+    voiceLists[voiceKey].push({ offset: cursor, entry });
     cursor += note.units;
   });
 
@@ -5322,9 +5622,9 @@ function parseMusicXmlMeasure(measureXml, result) {
     const list = voiceListsArr[voice];
     if (!list) return;
     // 找 offset 完全匹配的 note；找不到就用最后一个小于等于 offset 的
-    let target = list.find((item) => Math.abs(item.offset - offset) < 0.001 && item.entry.kind === "note");
+    let target = list.find((item) => Math.abs(item.offset - offset) < 0.001);
     if (!target) {
-      const candidates = list.filter((item) => item.offset <= offset && item.entry.kind === "note");
+      const candidates = list.filter((item) => item.offset <= offset);
       target = candidates[candidates.length - 1];
     }
     if (target) attach(target.entry);
@@ -5335,25 +5635,45 @@ function parseMusicXmlMeasure(measureXml, result) {
       if (dir.pedal) entry.pedal = dir.pedal;
       if (dir.hairpin) entry.hairpin = dir.hairpin;
       if (dir.textMark) entry.textMark = dir.textMark;
+      if (dir.rehearsalMark) entry.rehearsalMark = dir.rehearsalMark;
     });
   });
-  pendingHarmonies.forEach(({ offset, voice, chordSymbol }) => {
-    attachToEntry(voiceLists, offset, voice, (entry) => { entry.chordSymbol = chordSymbol; });
+  pendingHarmonies.forEach(({ offset, voice, staff, chordSymbol }) => {
+    const targetVoice = voice || Object.keys(voiceLists).find((key) => key.startsWith(`${staff || 1}:`));
+    attachToEntry(voiceLists, offset, targetVoice, (entry) => { entry.chordSymbol = chordSymbol; });
   });
+  if (volta != null) {
+    const firstVoice = Object.keys(voiceLists).sort()[0];
+    const firstEntry = firstVoice && voiceLists[firstVoice]?.[0]?.entry;
+    if (firstEntry) firstEntry.volta = volta;
+  }
 
-  const measures = [{
-    number: 1,
-    beginBarline,
-    endBarline,
-    voices: Object.keys(voiceLists).sort().map((voiceId) => ({
-      id: voiceId,
-      role: "",
-      usedUnits: voiceLists[voiceId].reduce((sum, item) => sum + item.entry.units, 0),
-      entries: voiceLists[voiceId].sort((a, b) => a.offset - b.offset).map((item) => item.entry)
-    }))
-  }];
+  // 按谱表拆成 treble (staff 1) / bass (staff 2) 两个 measure 对象。
+  const buildMeasure = (staffNum) => {
+    const prefix = `${staffNum}:`;
+    const keys = Object.keys(voiceLists).filter((k) => k.startsWith(prefix)).sort();
+    if (!keys.length) return null;
+    return {
+      number: measureNumber,
+      beginBarline,
+      endBarline,
+      voices: keys.map((voiceKey) => {
+        const voiceId = voiceKey.split(":")[1];
+        const list = voiceLists[voiceKey];
+        return {
+          id: voiceId,
+          role: "",
+          usedUnits: list.reduce((sum, item) => sum + item.entry.units, 0),
+          entries: list.sort((a, b) => a.offset - b.offset).map((item) => item.entry)
+        };
+      })
+    };
+  };
 
-  return { clef: isBass ? "bass" : "treble", measures };
+  const staffOne = buildMeasure(1);
+  const staffTwo = buildMeasure(2);
+  if (result.staffMap?.[1] === "bass") return { treble: null, bass: staffOne || staffTwo };
+  return { treble: staffOne, bass: staffTwo };
 }
 
 // 解析一个 <direction> 元素，返回可能的 dynamic / pedal / hairpin / textMark
@@ -5381,7 +5701,13 @@ function parseMusicXmlDirection(dirXml) {
   }
   // words (textMark)
   const wordsMatch = /<words>([^<]+)<\/words>/i.exec(inner);
-  if (wordsMatch) result.textMark = wordsMatch[1].trim();
+  if (wordsMatch) result.textMark = xmlUnescape(wordsMatch[1].trim());
+  const rehearsalMatch = /<rehearsal[^>]*>([^<]+)<\/rehearsal>/i.exec(inner);
+  if (rehearsalMatch) result.rehearsalMark = xmlUnescape(rehearsalMatch[1].trim());
+  const voiceMatch = /<voice>(\d+)<\/voice>/i.exec(dirXml);
+  const staffMatch = /<staff>(\d+)<\/staff>/i.exec(dirXml);
+  if (voiceMatch) result.voice = Number(voiceMatch[1]);
+  if (staffMatch) result.staff = Number(staffMatch[1]);
   return Object.keys(result).length ? result : null;
 }
 
@@ -5403,10 +5729,36 @@ function parseMusicXmlHarmony(harmonyXml) {
   let kind = "";
   if (kindMatch) {
     const k = kindMatch[1].trim();
-    if (k === "major" || k === "") kind = "";
-    else kind = k;
+    const textMatch = /<kind[^>]*\btext="([^"]*)"/i.exec(harmonyXml);
+    if (textMatch) {
+      kind = xmlUnescape(textMatch[1]);
+    } else {
+      kind = {
+        major: "", minor: "m", "major-seventh": "maj7", "minor-seventh": "m7",
+        diminished: "dim", "diminished-seventh": "dim7", augmented: "aug",
+        "suspended-fourth": "sus4", "suspended-second": "sus2",
+        "major-sixth": "6", "minor-sixth": "m6", dominant: "7",
+        "dominant-ninth": "9", "dominant-11th": "11", "dominant-13th": "13",
+        "major-add-ninth": "add9"
+      }[k] ?? k;
+    }
   }
-  return root + kind;
+  const bassMatch = /<bass>([\s\S]*?)<\/bass>/i.exec(harmonyXml);
+  let bass = "";
+  if (bassMatch) {
+    const bassStep = /<bass-step>([A-G])<\/bass-step>/i.exec(bassMatch[1]);
+    const bassAlter = /<bass-alter>(-?\d+)<\/bass-alter>/i.exec(bassMatch[1]);
+    if (bassStep) {
+      bass = bassStep[1];
+      if (Number(bassAlter?.[1]) === 1) bass += "#";
+      if (Number(bassAlter?.[1]) === -1) bass += "b";
+    }
+  }
+  const staffMatch = /<staff>(\d+)<\/staff>/i.exec(harmonyXml);
+  return {
+    chordSymbol: root + kind + (bass ? `/${bass}` : ""),
+    staff: Number(staffMatch?.[1] || 1)
+  };
 }
 
 function parseMusicXmlNote(noteXml, divisions) {
@@ -5417,6 +5769,9 @@ function parseMusicXmlNote(noteXml, divisions) {
 
   const voiceMatch = /<voice>(\d+)<\/voice>/.exec(noteXml);
   result.voice = voiceMatch ? Number(voiceMatch[1]) : 1;
+  // <staff> 区分上下谱表 (1=treble, 2=bass)；缺失时按 voice 推断 (1-2=上谱, 3-4=下谱)。
+  const staffMatch = /<staff>(\d+)<\/staff>/.exec(noteXml);
+  result.staff = staffMatch ? Number(staffMatch[1]) : (result.voice <= 2 ? 1 : 2);
 
   if (/<rest[^>]*\/>/.test(noteXml)) {
     result.rest = true;
@@ -5426,10 +5781,12 @@ function parseMusicXmlNote(noteXml, divisions) {
     const octaveMatch = /<octave>(\d+)<\/octave>/.exec(noteXml);
     if (!stepMatch || !octaveMatch) return null;
     const alter = alterMatch ? Number(alterMatch[1]) : 0;
+    const accidentalMatch = /<accidental[^>]*>([^<]+)<\/accidental>/i.exec(noteXml);
+    const explicitNatural = accidentalMatch?.[1]?.trim().toLowerCase() === "natural";
     result.pitch = {
       step: stepMatch[1].toUpperCase(),
       octave: Number(octaveMatch[1]),
-      accidental: alter > 0 ? "#" : alter < 0 ? "b" : "",
+      accidental: alter > 0 ? "#" : alter < 0 ? "b" : explicitNatural ? "n" : "",
       display: ""
     };
     result.pitch.display = `${result.pitch.step}${displayAccidental(result.pitch.accidental)}${result.pitch.octave}`;
@@ -5440,9 +5797,12 @@ function parseMusicXmlNote(noteXml, divisions) {
   result.dotCount = (noteXml.match(/<dot\/>/g) || []).length;
   result.tieStart = /<tie type="start"\/>/.test(noteXml);
   result.tieStop = /<tie type="stop"\/>/.test(noteXml);
-  result.slurStart = /<slur type="start"/.test(noteXml);
-  result.slurStop = /<slur type="stop"/.test(noteXml);
-  result.fermata = /<fermata\/>/.test(noteXml);
+  const slurTags = noteXml.match(/<slur\b[^>]*\/>/gi) || [];
+  result.slurStart = slurTags.some((tag) => /type="start"/i.test(tag) && !/number="2"/i.test(tag));
+  result.slurStop = slurTags.some((tag) => /type="stop"/i.test(tag) && !/number="2"/i.test(tag));
+  result.phraseStart = slurTags.some((tag) => /type="start"/i.test(tag) && /number="2"/i.test(tag));
+  result.phraseStop = slurTags.some((tag) => /type="stop"/i.test(tag) && /number="2"/i.test(tag));
+  result.fermata = /<fermata\b[^>]*\/>/.test(noteXml);
   result.grace = /<grace[^>]*\/>/.test(noteXml);
 
   // articulations: staccato / accent / tenuto / strong-accent 等
@@ -5459,7 +5819,9 @@ function parseMusicXmlNote(noteXml, divisions) {
   const ornamentMatch = noteXml.match(/<ornaments>([\s\S]*?)<\/ornaments>/i);
   if (ornamentMatch) {
     const inner = ornamentMatch[1];
-    if (/<trill/.test(inner)) result.ornament = xmlToOrnament.trill;
+    const otherOrnament = /<other-ornament[^>]*>([^<]+)<\/other-ornament>/i.exec(inner);
+    if (otherOrnament) result.ornament = xmlUnescape(otherOrnament[1].trim());
+    else if (/<trill/.test(inner)) result.ornament = xmlToOrnament.trill;
     else if (/<inverted-mordent/.test(inner)) result.ornament = xmlToOrnament["inverted-mordent"];
     else if (/<mordent/.test(inner)) result.ornament = xmlToOrnament.mordent;
     else if (/<inverted-turn/.test(inner)) result.ornament = xmlToOrnament["inverted-turn"];
@@ -5491,6 +5853,9 @@ function parseMusicXmlNote(noteXml, divisions) {
     else if (actual === 5 && normal === 4) result.tupletType = "quintuplet";
     else if (actual === 6 && normal === 4) result.tupletType = "sextuplet";
   }
+  if (result.tupletType && !result.tupletPosition) result.tupletPosition = "middle";
+  const tupletGroupMatch = /<other-notation[^>]*>music-reader-tuplet-group:([^<]+)<\/other-notation>/i.exec(noteXml);
+  if (tupletGroupMatch) result.tupletGroup = xmlUnescape(tupletGroupMatch[1]);
 
   // breath
   result.breath = /<breath-mark[^>]*\/>/.test(noteXml);
@@ -5509,6 +5874,8 @@ function noteToEntry(note, voiceId) {
     tieStop: note.tieStop,
     slurStart: note.slurStart,
     slurStop: note.slurStop,
+    phraseStart: note.phraseStart,
+    phraseStop: note.phraseStop,
     fermata: note.fermata,
     dynamic: note.dynamic || "",
     chordSymbol: note.chordSymbol || "",
@@ -5519,10 +5886,10 @@ function noteToEntry(note, voiceId) {
     pedal: note.pedal || "",
     hairpin: note.hairpin || "",
     textMark: note.textMark || "",
+    rehearsalMark: note.rehearsalMark || "",
+    volta: note.volta == null ? null : note.volta,
     breath: Boolean(note.breath),
     arpeggiate: Boolean(note.arpeggiate),
-    phraseStart: Boolean(note.phraseStart),
-    phraseStop: Boolean(note.phraseStop),
     tupletType: note.tupletType || "",
     tupletGroup: note.tupletGroup || "",
     tupletPosition: note.tupletPosition || ""
@@ -5536,9 +5903,12 @@ function noteToEntry(note, voiceId) {
 }
 
 const fifthsToKey = { 0: "C", 1: "G", 2: "D", 3: "A", 4: "E", 5: "B", 6: "F#", 7: "C#", "-1": "F", "-2": "Bb", "-3": "Eb", "-4": "Ab", "-5": "Db", "-6": "Gb", "-7": "Cb" };
+const fifthsToMinorKey = { 0: "Am", 1: "Em", 2: "Bm", 3: "F#m", 4: "C#m", 5: "G#m", 6: "D#m", 7: "A#m", "-1": "Dm", "-2": "Gm", "-3": "Cm", "-4": "Fm", "-5": "Bbm", "-6": "Ebm", "-7": "Abm" };
 
-function keyFromFifths(fifths) {
-  return fifthsToKey[fifths] || "C";
+function keyFromFifths(fifths, mode = "major") {
+  return String(mode).toLowerCase() === "minor"
+    ? (fifthsToMinorKey[fifths] || "Am")
+    : (fifthsToKey[fifths] || "C");
 }
 
 function xmlEscape(value) {
@@ -5549,6 +5919,16 @@ function xmlEscape(value) {
     '"': "&quot;",
     "'": "&apos;"
   }[char]));
+}
+
+function xmlUnescape(value) {
+  return String(value).replace(/&(lt|gt|amp|quot|apos);/g, (entity, name) => ({
+    lt: "<",
+    gt: ">",
+    amp: "&",
+    quot: '"',
+    apos: "'"
+  }[name] || entity));
 }
 
 function bindEvent(element, eventName, handler) {
@@ -5890,9 +6270,13 @@ function renderXmlFileList(data, query, limit) {
 async function loadXmlFileIntoEditor(fileId, fileName) {
   setBusy(fileName || fileId);
   try {
+    // P22.5 supervise v3 (2026-08-17): MUST specify charset=utf-8.
+    // Without it, Chromium on zh-CN Windows encodes the JSON body as GBK,
+    // server FastAPI defaults to UTF-8 decode, Chinese file_id like
+    // "有问题ch23-06_F major" gets mangled → 404 file_id not found.
     const resp = await fetch("/parse-score-by-id", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify({ file_id: fileId }),
     });
     const body = await resp.json();
@@ -5900,6 +6284,15 @@ async function loadXmlFileIntoEditor(fileId, fileName) {
       throw new Error(body.detail || body.error || `HTTP ${resp.status}`);
     }
     loadParsedPayloadToEditor(body);
+    // P22.5 supervise v3 (2026-08-17): auto-switch to step 3 tab (五线谱制谱)
+    // so the user actually sees the loaded score.  Before this, click on a
+    // 题 button silently updated state but the user stayed on step 1
+    // wondering why nothing happened.  The 5 step tabs in the sidebar
+    // are .sidebar-link[data-view="..."] (upload / chords / editor /
+    // answer / analysis).  Switching to data-view="editor" puts the
+    // user on the 五线谱制谱 tab where VexFlow renders the score.
+    const mainTab = document.querySelector('.sidebar-link[data-view="editor"]');
+    if (mainTab) mainTab.click();
   } catch (err) {
     setError(err.message || "XML 加载失败");
     showEditorMessage("XML 加载失败: " + err.message, "error");

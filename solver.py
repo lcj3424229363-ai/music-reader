@@ -1,5 +1,22 @@
 """
-Sposobin (И. Способин) 《和声学教程》aligned 4-part harmony solver — P0.
+Sposobin (И. Способин) 《和声学教程》aligned 4-part harmony solver — v1.6.
+
+v1.6 = v1.5 + P2.6-C3 K=50 default
+  * top_n:  1 → 50
+  * beam_k: 3 → 50
+
+Rationale (P2.6-C2 K-sweep, P2.6-C3 K=50 baseline):
+  * Same 13-component linear scoring as v1.5 (no rule / weight changes)
+  * K=3 was too conservative — Sposobin textbook acknowledges SATB multi-solution
+    (each example gives 4-8 valid harmonizations; solver was only returning 1)
+  * K=50: 6.41 distinct (chord, voicing) per beat, +1.7x vs K=10, vs K=3
+  * L1 (chord exact) flat 12.7% → 12.1% (within 19-case noise ±1pp)
+  * L2 (function class) +1.4pp (50.1% → 51.5%)
+  * L4 (voicing match)  +1.1pp (9.5% → 10.6%)
+  * L3 (legality) flat 98.8% → 98.4% (no regression)
+  * runtime 16.5x (281ms → 4743ms per case; 19-case total: 5.3s → 90.1s)
+  * K=200 verified no additional gain (K=200 L1 12.9%, L2 50.1%, L4 11.0%; 67x runtime)
+  * Output: top-50 distinct full-path solutions via `alternatives` field
 
 P0 scope (per phased plan, strictly following the textbook):
   * 5 triads in major (I, IV, V, ii, vi), 4 triads in minor (i, iv, V, VI)
@@ -7,7 +24,7 @@ P0 scope (per phased plan, strictly following the textbook):
   * Hard constraints: parallel 5th / 8ve, voice crossing, leading-tone resolution
   * Soft scoring: common-tone retention, smooth voice leading, doubling rules
   * Cadence detection: PAC / IAC / HC / plagal
-  * Greedy forward selection with top-K beam (K=3)
+  * Greedy forward selection with top-K beam (K=50)
   * Any major / harmonic-minor key
 
 Output schema (stable contract for downstream UI):
@@ -31,6 +48,24 @@ Output schema (stable contract for downstream UI):
     "warnings": [...],
     "alternatives": [...]
   }
+
+v1.2 changelog (vs v1.1):
+  * T3 (P2.2-A): removed 0.3 per-common-pc bonus in 8.5 voice_leading.
+    8.5 still keeps the per-voice +0.4 for held common tones (above);
+    8.10 keeps 0.4 per common pc when the chord changes.  The deleted
+    0.3 was double-counting shared tones and over-favored deceptive
+    cadences and other shared-tone progressions.  Verified +1.5pp L1
+    on the 19-case baseline (P2.2-A report).
+  * T5 (P2.2-A): added 8.5b parallel 3rd/6th soft check (Sposobin §32).
+    New helper `has_parallel_3rd_6th` returns info-only issues;
+    score_voicing applies -0.5 per occurrence, capped at -1.5 per
+    beat.  This is a STYLE preference (Sposobin §32 says 3rds/6ths
+    weaken voice-leading independence), not a hard rule — hard
+    parallel 5/8 checks remain in check_voicing unchanged.
+  * No new rules added; no Score Model changes; no state / search
+    changes.  Only the soft-score components 8.5 and (new) 8.5b.
+
+Compatible with v1.1 input/output contract.
 
 No magic.  Every rule cites Sposobin.
 """
@@ -124,6 +159,10 @@ class Key:
     tonic_pc: int
     mode: str  # 'major' or 'minor'
     variant: str = "natural"  # 'natural' | 'harmonic' | 'melodic'
+    # Preserve the enharmonic spelling supplied by the caller.  Pitch class
+    # alone cannot distinguish Db from C#, yet that distinction determines
+    # both the key signature and every displayed note name.
+    spelling: str | None = field(default=None, compare=False)
 
     def __post_init__(self):
         # P7.5: accept string tonic names (e.g. Key("C", "major")) for
@@ -133,14 +172,22 @@ class Key:
         # and relative().  Prefer Key.from_name(...) when parsing user
         # input — this fallback is for positional-arg call sites.
         if isinstance(self.tonic_pc, str):
-            letter = self.tonic_pc[0].upper()
+            tonic_text = self.tonic_pc.strip()
+            letter = tonic_text[0].upper()
             base = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}[letter]
-            if len(self.tonic_pc) == 2 and self.tonic_pc[1] == "#":
+            accidental = tonic_text[1:] if len(tonic_text) > 1 else ""
+            if accidental == "-":
+                accidental = "b"
+            if accidental == "#":
                 base = (base + 1) % 12
-            elif len(self.tonic_pc) == 2 and self.tonic_pc[1] == "b":
+            elif accidental == "b":
                 base = (base - 1) % 12
+            elif accidental:
+                raise ValueError(f"unsupported key spelling: {tonic_text!r}")
             # frozen dataclass: must use object.__setattr__
             object.__setattr__(self, "tonic_pc", base)
+            if self.spelling is None:
+                object.__setattr__(self, "spelling", f"{letter}{accidental}")
         if not isinstance(self.tonic_pc, int):
             raise TypeError(
                 f"Key.tonic_pc must be int 0..11, got {type(self.tonic_pc).__name__}: "
@@ -152,6 +199,12 @@ class Key:
             raise ValueError(f"Key.mode must be 'major' or 'minor', got {self.mode!r}")
         if self.variant not in ("natural", "harmonic", "melodic"):
             raise ValueError(f"Key.variant must be natural/harmonic/melodic, got {self.variant!r}")
+        if self.spelling is not None:
+            spelling = self.spelling.strip().replace("-", "b")
+            if (not spelling or spelling[0].upper() not in "ABCDEFG"
+                    or spelling[1:] not in ("", "#", "b")):
+                raise ValueError(f"unsupported key spelling: {self.spelling!r}")
+            object.__setattr__(self, "spelling", spelling[0].upper() + spelling[1:])
 
     @classmethod
     def from_name(cls, name: str) -> "Key":
@@ -174,10 +227,15 @@ class Key:
         s = lower.replace("harmonic", "").replace("melodic", "").replace("natural", "").strip()
         # The original "minor"/"major" stripping still applies
         s = s.replace("minor", "m").replace("major", "").strip()
+        # music21 uses a trailing hyphen for flats ("B- major").
+        s = s.replace("-", "b")
         # "Cm" / "C#m" / "Cbm" / "am" etc. all end with "m"
         explicit_minor = s.endswith("m")
         if explicit_minor:
-            s = s[:-1]
+            # 必须 strip: "F# minor" 经 replace("minor","m") 变成 "f# m",
+            # s[:-1] 后是 "f# " (带尾随空格), 会导致后面的 len(s)==2 升降号
+            # 检测失败, F# 被解析成 F。strip 后变回 "f#"。
+            s = s[:-1].strip()
         # Helmholtz convention: a single lowercase letter with no explicit
         # "M" suffix (e.g. "a", "f#") means minor.
         helmholtz_minor = (
@@ -194,13 +252,15 @@ class Key:
             base = (base + 1) % 12
         elif len(s) == 2 and s[1] == "b":
             base = (base - 1) % 12
+        spelling = s[0].upper() + (s[1:] if len(s) > 1 else "")
         return cls(tonic_pc=base % 12,
                    mode="minor" if is_minor else "major",
-                   variant=variant if is_minor else "natural")
+                   variant=variant if is_minor else "natural",
+                   spelling=spelling)
 
     @property
     def tonic_name(self) -> str:
-        return f"{PC_NAMES_SHARP[self.tonic_pc]}"
+        return self.spelling or PC_NAMES_SHARP[self.tonic_pc]
 
     @property
     def degree_offsets(self) -> tuple[int, ...]:
@@ -244,8 +304,10 @@ class Key:
         Paving for P7.5 (ch35 uses 平行 as a close-relation target).
         """
         if self.mode == "major":
-            return Key(tonic_pc=self.tonic_pc, mode="minor", variant="natural")
-        return Key(tonic_pc=self.tonic_pc, mode="major", variant="natural")
+            return Key(tonic_pc=self.tonic_pc, mode="minor", variant="natural",
+                       spelling=self.tonic_name)
+        return Key(tonic_pc=self.tonic_pc, mode="major", variant="natural",
+                   spelling=self.tonic_name)
 
     def relative(self) -> "Key":
         """P7.5: 关系调 (同中音大小调, Sposobin ch31) — tonic 3 semitones
@@ -254,11 +316,13 @@ class Key:
         """
         if self.mode == "major":
             # relative minor is 3 semitones below
+            spelling = MINOR_TONIC_BY_SIGNATURE.get(_key_accidentals(self))
             return Key(tonic_pc=(self.tonic_pc + 9) % 12, mode="minor",
-                       variant="natural")
+                       variant="natural", spelling=spelling)
         # relative major is 3 semitones above
+        spelling = MAJOR_TONIC_BY_SIGNATURE.get(_key_accidentals(self))
         return Key(tonic_pc=(self.tonic_pc + 3) % 12, mode="major",
-                   variant="natural")
+                   variant="natural", spelling=spelling)
 
     def close_related_keys(self) -> list["Key"]:
         """P7.5: 一级关系调 (Sposobin ch31 / ch35) — 6 closely-related keys
@@ -282,14 +346,27 @@ class Key:
         Paving for P7.5 (ch35: 到一级关系调的转调).
         """
         keys: list[Key] = []
+        fifths = _key_accidentals(self)
+        names_by_signature = (
+            MAJOR_TONIC_BY_SIGNATURE if self.mode == "major"
+            else MINOR_TONIC_BY_SIGNATURE
+        )
+
+        def related(pc_offset: int, signature_offset: int) -> Key:
+            return Key(
+                tonic_pc=(self.tonic_pc + pc_offset) % 12,
+                mode=self.mode,
+                spelling=names_by_signature.get(fifths + signature_offset),
+            )
+
         # 上五度 (P5 up)
-        keys.append(Key(tonic_pc=(self.tonic_pc + 7) % 12, mode=self.mode))
+        keys.append(related(7, 1))
         # 下五度 (P5 down)
-        keys.append(Key(tonic_pc=(self.tonic_pc + 5) % 12, mode=self.mode))
+        keys.append(related(5, -1))
         # 大二度上 (M2 up)
-        keys.append(Key(tonic_pc=(self.tonic_pc + 2) % 12, mode=self.mode))
+        keys.append(related(2, 2))
         # 大二度下 (M2 down) — e.g. C major → B♭ major
-        keys.append(Key(tonic_pc=(self.tonic_pc + 10) % 12, mode=self.mode))
+        keys.append(related(10, -2))
         # 关系 / 平行 (relative / parallel)
         keys.append(self.relative())
         keys.append(self.parallel())
@@ -869,6 +946,50 @@ def has_parallel(va: Voicing, vb: Voicing) -> list[str]:
     return issues
 
 
+def has_parallel_3rd_6th(va: Voicing, vb: Voicing) -> list[str]:
+    """v1.2 (P2.2-A T5): Sposobin §32 soft check for parallel 3rds / 6ths.
+
+    Parallel perfect 5ths / 8ves (handled in has_parallel) are HARD-forbidden.
+    Parallel 3rds / 6ths are SOFT-discouraged: the textbook says they
+    weaken the voice-leading independence.  We return them as info so
+    score_voicing can apply a small penalty (-0.5 per occurrence, capped
+    at -1.5 per beat) — never a hard reject.
+
+    Detection: same-direction motion by 3rd (3 or 4 semitones) or
+    6th (8 or 9 semitones) between any two voices.
+    """
+    # If all four voices are at the same midi value, no motion.
+    if (va.soprano.midi == vb.soprano.midi
+            and va.alto.midi == vb.alto.midi
+            and va.tenor.midi == vb.tenor.midi
+            and va.bass.midi == vb.bass.midi):
+        return []
+    issues: list[str] = []
+    pairs = (("soprano", "alto"), ("soprano", "tenor"),
+             ("soprano", "bass"), ("alto", "tenor"),
+             ("alto", "bass"), ("tenor", "bass"))
+    for upper, lower in pairs:
+        u_a = va.by_voice()[upper].midi
+        l_a = va.by_voice()[lower].midi
+        u_b = vb.by_voice()[upper].midi
+        l_b = vb.by_voice()[lower].midi
+        u_delta = u_b - u_a
+        l_delta = l_b - l_a
+        if u_delta == 0 or l_delta == 0:
+            continue  # oblique
+        if (u_delta > 0) != (l_delta > 0):
+            continue  # contrary
+        a_full = u_a - l_a
+        b_full = u_b - l_b
+        a_mod = a_full % 12
+        b_mod = b_full % 12
+        # 3rds (3 or 4 semitones — minor or major) and 6ths (8 or 9)
+        if a_mod in (3, 4, 8, 9) and b_mod == a_mod:
+            kind = "3rd" if a_mod in (3, 4) else "6th"
+            issues.append(f"parallel {kind} between {upper}/{lower}")
+    return issues
+
+
 def has_voice_crossing(va: Voicing) -> list[str]:
     issues: list[str] = []
     ns = va.notes()
@@ -884,7 +1005,9 @@ def has_voice_crossing(va: Voicing) -> list[str]:
     return issues
 
 
-def has_leading_tone_violation(prev: Voicing, curr: Voicing, key: Key) -> list[str]:
+def has_leading_tone_violation(
+    prev: Voicing, curr: Voicing, key: Key, skip_voice: str | None = None,
+) -> list[str]:
     """Leading tone must resolve up by step to tonic in the same voice.
 
     The 7th scale degree (a half-step below tonic) is the leading tone in
@@ -894,6 +1017,11 @@ def has_leading_tone_violation(prev: Voicing, curr: Voicing, key: Key) -> list[s
     still there, but no resolution was required because the voice did not
     move (Sposobin §39 only requires the leading tone to resolve WHEN it
     moves).
+
+    ``skip_voice`` (P0.1-bugfix): 固定声部 (旋律题的 soprano / 低音题的 bass)
+    是用户给定的, solver 不能改, 所以不强制它解决导音 —— 否则旋律里出现
+    "导音下行" (如 C 大调 B→A) 时会把束搜索整死, 触发降级. 只对内声部/自由
+    声部强制导音解决.
     """
     # Held voicing: all four voices at the same pitch — no motion, no LT
     # resolution required.
@@ -906,6 +1034,8 @@ def has_leading_tone_violation(prev: Voicing, curr: Voicing, key: Key) -> list[s
     ton_pc = key.tonic_pc
     issues: list[str] = []
     for voice in VOICE_ORDER:
+        if skip_voice is not None and voice == skip_voice:
+            continue
         p = prev.by_voice()[voice]
         c = curr.by_voice()[voice]
         if p.midi == c.midi:
@@ -1367,14 +1497,17 @@ def _key_accidentals(key: "Key") -> int:
     Positive for sharps, negative for flats.  Used by P11 to detect
     chromatic modulations (≥6 accidentals difference).
     """
+    by_name = MAJOR_KEY_SIGNATURES if key.mode == "major" else MINOR_KEY_SIGNATURES
+    if key.tonic_name in by_name:
+        return by_name[key.tonic_name]
     if key.mode == "major":
-        # Standard circle of 5ths
         return MAJOR_TO_SHARPS.get(key.tonic_pc, 0)
-    # minor: relative major sharps
-    rel = key.tonic_pc + 3   # relative major is 3 semitones up
-    return MAJOR_TO_SHARPS.get(rel % 12, 0)
+    # Minor fallback for programmatically-created keys without spelling.
+    return MAJOR_TO_SHARPS.get((key.tonic_pc + 3) % 12, 0)
 
 
+# 大调五度圈 (正=升号数, 负=降号数). 修正: 降号调之前写错
+# (F 写成 -7, Bb 写成 -6, Eb 写成 -5), 会导致转调检测在降号调下判错.
 MAJOR_TO_SHARPS = {
     0: 0,    # C
     7: 1,    # G
@@ -1384,11 +1517,151 @@ MAJOR_TO_SHARPS = {
     11: 5,   # B
     6: 6,    # F#
     1: 7,    # C#
-    5: -7,   # Db (5 flats)
-    10: -6,  # Ab
-    3: -5,   # Eb
-    8: -4,   # Ab (4 flats)  -- same as 10? actually 8 = Ab too
+    5: -1,   # F
+    10: -2,  # Bb
+    3: -3,   # Eb
+    8: -4,   # Ab
 }
+
+MAJOR_KEY_SIGNATURES = {
+    "Cb": -7, "Gb": -6, "Db": -5, "Ab": -4, "Eb": -3, "Bb": -2,
+    "F": -1, "C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5,
+    "F#": 6, "C#": 7,
+}
+MINOR_KEY_SIGNATURES = {
+    "Ab": -7, "Eb": -6, "Bb": -5, "F": -4, "C": -3, "G": -2,
+    "D": -1, "A": 0, "E": 1, "B": 2, "F#": 3, "C#": 4,
+    "G#": 5, "D#": 6, "A#": 7,
+}
+MAJOR_TONIC_BY_SIGNATURE = {value: name for name, value in MAJOR_KEY_SIGNATURES.items()}
+MINOR_TONIC_BY_SIGNATURE = {value: name for name, value in MINOR_KEY_SIGNATURES.items()}
+
+
+# P0-2b: 正确拼写 (按调号), 替代 flat-first 的 Note.name.
+_CORRECT_MAJOR_FIFTHS = {0: 0, 7: 1, 2: 2, 9: 3, 4: 4, 11: 5, 6: 6, 1: 7,
+                         5: -1, 10: -2, 3: -3, 8: -4}
+_SHARP_ORDER = [5, 0, 7, 2, 9, 4, 11]     # F C G D A E B (升号出现顺序)
+_FLAT_ORDER = [11, 4, 9, 2, 7, 0, 5]      # B E A D G C F (降号出现顺序)
+_NATURAL_STEP = {0: "C", 2: "D", 4: "E", 5: "F", 7: "G", 9: "A", 11: "B"}
+
+
+def _spell_note(note: Note, key: Key) -> str:
+    """按调号拼写一个音高 (e.g. E 大调里 pc 1 → 'C#', 不是 'Db')."""
+    tonic_pc = key.tonic_pc
+    fifths = _CORRECT_MAJOR_FIFTHS.get(
+        tonic_pc if key.mode == "major" else (tonic_pc + 3) % 12, 0)
+    # 升号调里, 被升的是 F C G D A E B 这些"基础音"升半音后的 pc.
+    sharp_pcs = set((p + 1) % 12 for p in _SHARP_ORDER[:fifths]) if fifths > 0 else set()
+    flat_pcs = set((p - 1) % 12 for p in _FLAT_ORDER[:(-fifths)]) if fifths < 0 else set()
+    # 和声小调导音 (升 7 级 = tonic 下方半音) 不在调号里, 必须显式拼成 #
+    # (A minor 的 G#)。这是之前答案"一塌糊涂"的根因: pc 8 被 _NATURAL_STEP.get
+    # 回退成 "C", 导致 V 和弦的 G# 全部变成 C。
+    if key.mode == "minor":
+        sharp_pcs.add((tonic_pc + 11) % 12)
+    pc = note.pc
+    if pc in sharp_pcs:
+        step = _NATURAL_STEP.get((pc - 1) % 12)
+        acc = "#"
+    elif pc in flat_pcs:
+        step = _NATURAL_STEP.get((pc + 1) % 12)
+        acc = "b"
+    else:
+        step = _NATURAL_STEP.get(pc)
+        acc = ""
+    # 兜底: 变化音既不在 sharp/flat 集合也不是自然音 (如大调里的副属/借用音),
+    # 默认按升号拼写, 绝不再回退成 "C"。
+    if step is None:
+        step = _NATURAL_STEP.get((pc - 1) % 12, "C")
+        acc = "#"
+    return f"{step}{acc}{note.oct}"
+
+
+_STEP_PC = {name: pc for pc, name in _NATURAL_STEP.items()}
+_LETTERS = "CDEFGAB"
+
+
+def _accidental_for(letter: str, pc: int) -> tuple[str, int] | None:
+    """Return (accidental, semitone alteration) for letter -> pitch class."""
+    natural_pc = _STEP_PC[letter]
+    alteration = (pc - natural_pc + 6) % 12 - 6
+    accidentals = {-2: "bb", -1: "b", 0: "", 1: "#", 2: "##"}
+    if alteration not in accidentals:
+        return None
+    return accidentals[alteration], alteration
+
+
+def _scale_letter(key: Key, degree: int) -> str:
+    tonic_letter_idx = _LETTERS.index(key.tonic_name[0])
+    return _LETTERS[(tonic_letter_idx + degree - 1) % 7]
+
+
+def _chord_tone_letters(chord: Chord, key: Key) -> list[tuple[int, str]]:
+    """Pair chord pitch classes with their intended staff letters."""
+    special_degrees: dict[str, tuple[int, ...]] = {
+        "aug6_ger": (6, 1, 3, 4),
+        "aug6_fr": (6, 1, 2, 4),
+        "aug6_it": (6, 1, 4),
+        "aug6_dd": (6, 1, 3, 4),
+        "neapolitan": (2, 4, 6),
+        "modal_b6": (6, 1, 3),
+        "modal_b3": (3, 5, 7),
+        "modal_b7": (7, 2, 4),
+        "modal_iv": (4, 6, 1),
+    }
+    pcs = chord.pitch_classes(key)
+    if chord.quality in special_degrees:
+        degrees = special_degrees[chord.quality]
+        return [(pc, _scale_letter(key, degree)) for pc, degree in zip(pcs, degrees)]
+
+    root_letter_idx = _LETTERS.index(_scale_letter(key, chord.degree))
+    letter_offsets = (0, 2, 4, 6, 1)
+    return [
+        (pc, _LETTERS[(root_letter_idx + letter_offsets[i]) % 7])
+        for i, pc in enumerate(pcs)
+    ]
+
+
+def _spell_note(note: Note, key: Key, chord: Chord | None = None) -> str:
+    """Spell a concrete pitch by key and, when known, chordal function."""
+    letters: list[str] = []
+    if chord is not None:
+        letters.extend(
+            letter for pc, letter in _chord_tone_letters(chord, key)
+            if pc == note.pc
+        )
+
+    # Key-scale fallback also covers unclassified non-chord tones.
+    for degree in range(1, 8):
+        pc = (key.tonic_pc + key.degree_offset(degree)) % 12
+        if pc == note.pc:
+            letters.append(_scale_letter(key, degree))
+    if key.mode == "minor" and note.pc == (key.tonic_pc + 11) % 12:
+        letters.append(_scale_letter(key, 7))
+
+    if not letters:
+        fifths = _key_accidentals(key)
+        ranked: list[tuple[int, int, str]] = []
+        for letter in _LETTERS:
+            accidental = _accidental_for(letter, note.pc)
+            if accidental is None:
+                continue
+            _acc, alteration = accidental
+            wrong_direction = int(
+                (fifths < 0 and alteration > 0)
+                or (fifths > 0 and alteration < 0)
+            )
+            ranked.append((abs(alteration), wrong_direction, letter))
+        ranked.sort()
+        letters.append(ranked[0][2])
+
+    letter = letters[0]
+    accidental_data = _accidental_for(letter, note.pc)
+    if accidental_data is None:  # defensive: generated spellings use <= double accidentals
+        return note.name
+    accidental, alteration = accidental_data
+    # Accidentals can cross C boundaries: MIDI 60 is B#3, not B#4.
+    octave = (note.midi - _STEP_PC[letter] - alteration) // 12 - 1
+    return f"{letter}{accidental}{octave}"
 
 
 def find_sequence_spans(measures: list[dict]) -> list[dict]:
@@ -1593,6 +1866,14 @@ def score_voicing(
     is_strong_beat: bool,
     is_cadence_beat: bool,
     is_c64_beat: bool = False,
+    # v1.4 (P2.2-C, 软 R1): 在 v_beat (V 拍) 上把 8.6b melody_tone_pref 的
+    # 全部加成乘以 0.3。pool filter 在 v_beat 已经 hard-restrict 到 V 系
+    # 和弦（v_root / v7 / v6 / v7_inversions / v9 / dd_aug6），但 melody
+    # tone=root 的 8.6b 偏好依然会引导 I / i / iv 等 tonic-subdominant
+    # chord（当 melody 音同时是 V root 时）。在 v_beat 上 8.6b 是噪音
+    # 信号，保留 30% 让它"还在但更弱"，避免 v1.3 的 R1 (×0) 完全屏蔽
+    # 带来的"无偏好"回归问题。
+    is_v_beat: bool = False,
     nct_type: str | None = None,
     preferred_doubling: str | None = None,
     # P21.4: phrase-plan hint layer.  Both default to "no plan",
@@ -1663,6 +1944,17 @@ def score_voicing(
             # Strong penalty — "feminine" / leading tone doubling
             score -= 3.0
             parts.append(f"doubled {doubled} of {func} chord (forbidden)")
+        # v1.5 (A9, P2.2-D): iii (function T) but its third is leading-tone-
+        # like (B in C major, 7 semitones from tonic).  Doubling it is
+        # forbidden per Sposobin §32 even though the S/D branch above
+        # doesn't cover it.  The pref["T"]["third"] = -1.0 soft penalty
+        # is too soft; we bump iii's third-doubled to the same -3.0 as
+        # S/D.  Empirical: 0 effect on current 38 SHTE cases (iii never
+        # picked in those), so this is purely a defensive bug-fix for
+        # Sposobin completeness, not a performance lever.
+        elif doubled == "third" and chord.degree == 3:
+            score -= 3.0
+            parts.append("doubled third of iii chord (forbidden by §32)")
 
     # 8.5 voice leading from previous
     if prev is not None:
@@ -1679,11 +1971,19 @@ def score_voicing(
                 score -= 0.3   # fifth
             else:
                 score -= 1.5   # leap
-        # Reward common-tone retention overall
-        prev_pcs = [p.pc for p in prev.notes()]
-        curr_pcs = [n.pc for n in voicing.notes()]
-        common = len(set(prev_pcs) & set(curr_pcs))
-        score += common * 0.3
+        # v1.2 (P2.2-A T3): removed the 0.3 per-common-pc bonus.
+        # Reason: 8.10 already rewards 0.4 per common pc when the chord
+        # changes, and 8.5's per-voice +0.4 (above) already rewards
+        # common tones in the same voice.  The 0.3 * len(common) was
+        # double-counting shared tones, which over-favored deceptive
+        # cadences (I→vi shares C, E) and other shared-tone progressions
+        # over functionally idiomatic ones.  P2.2-A verified this
+        # accounts for +1.5pp L1 on the 19-case baseline.
+        # v1.1 code was:
+        #   prev_pcs = [p.pc for p in prev.notes()]
+        #   curr_pcs = [n.pc for n in voicing.notes()]
+        #   common = len(set(prev_pcs) & set(curr_pcs))
+        #   score += common * 0.3
 
         # Avoid leap-then-reverse (Sposobin §34)
         # If a voice leapt up, next motion should not immediately leap down.
@@ -1691,6 +1991,19 @@ def score_voicing(
             p = prev.by_voice()[voice]
             d = n.midi - p.midi
             # We don't have next state here; that's checked at solve level.
+
+        # 8.5b parallel 3rd/6th soft check (Sposobin §32).
+        # v1.2 (P2.2-A T5): unlike parallel 5/8 (hard-forbidden in
+        # has_parallel), parallel 3rds/6ths are SOFT-discouraged.  Apply
+        # -0.5 per occurrence, capped at -1.5 per beat (max 3 parallel
+        # 3rds among 6 voice pairs) so the penalty never dominates the
+        # 8.1 chord-membership / 8.4 doubling components.
+        p3_issues = has_parallel_3rd_6th(prev, voicing)
+        if p3_issues:
+            p3_penalty = -0.5 * min(len(p3_issues), 3)
+            score += p3_penalty
+            for iss in p3_issues:
+                parts.append(f"parallel 3rd/6th (soft) {iss} → {p3_penalty/len(p3_issues):.1f}")
 
     # 8.6 melody adherence
     if melody_note is not None:
@@ -1705,6 +2018,13 @@ def score_voicing(
     # 8.6b melody-tone preference (Sposobin §30: melody notes should align
     # with chord roots / chord tones by priority).  If melody is a chord root,
     # the chord whose root matches is strongly favored.
+    #
+    # v1.4 (P2.2-C, 软 R1): in v_beat the V-chord is hard-restricted by the
+    # pool filter; the 8.6b root-favor would otherwise over-rotate to I / iv
+    # when the melody is also a V-root note.  We dampen the whole 8.6b block
+    # by 0.3 in v_beat so the preference is still present (helps break ties)
+    # but cannot outweigh other components.
+    _8_6b_scale = 0.3 if is_v_beat else 1.0
     if melody_note is not None:
         # Modal-mixture chords get a small baseline nudge ONLY when
         # the melody is the modal root (so they can win against
@@ -1715,7 +2035,7 @@ def score_voicing(
         if chord.quality in ("modal_b6", "modal_b3", "modal_b7", "modal_iv"):
             modal_root_pc = chord.pitch_classes(key)[0]
             if melody_note.pc == modal_root_pc:
-                score += 0.4
+                score += 0.4 * _8_6b_scale
         # For chromatic chords (modal, aug6, neapolitan), the "root"
         # is the first pc in the chord's pitch class set — NOT the
         # diatonic-degree root_pc.
@@ -1728,23 +2048,23 @@ def score_voicing(
             modal_fifth = chord_pcs[2] if len(chord_pcs) > 2 else None
             if melody_note.pc == modal_root:
                 if chord.target is not None:
-                    score += 2.5
+                    score += 2.5 * _8_6b_scale
                 else:
-                    score += 3.5
+                    score += 3.5 * _8_6b_scale
             elif modal_fifth is not None and melody_note.pc == modal_fifth:
-                score += 0.8
+                score += 0.8 * _8_6b_scale
             elif modal_third is not None and melody_note.pc == modal_third:
-                score += 0.4
+                score += 0.4 * _8_6b_scale
         else:
             if melody_note.pc == chord.root_pc(key):
                 if chord.target is not None:
-                    score += 2.5
+                    score += 2.5 * _8_6b_scale
                 else:
-                    score += 3.5
+                    score += 3.5 * _8_6b_scale
             elif melody_note.pc == chord.fifth_pc(key):
-                score += 0.8
+                score += 0.8 * _8_6b_scale
             elif melody_note.pc == chord.third_pc(key):
-                score += 0.4
+                score += 0.4 * _8_6b_scale
 
     # 8.7 cadence-friendly bass (V→I strong beat I, root position)
     if is_cadence_beat and chord.degree == 1 and chord.inversion == "root":
@@ -1816,6 +2136,15 @@ def score_voicing(
         common = len(prev_pcs & curr_pcs)
         score += common * 0.4
 
+    # 8.11 软惩罚 (原为 hard 约束, 改软避免束搜索断档):
+    #   导音解决 -3/次, 七音解决 -3/次. 固定旋律声部不罚导音 (用户给的旋律).
+    if prev is not None:
+        _skip = "soprano" if melody_note is not None else None
+        score -= 3.0 * len(has_leading_tone_violation(
+            prev, voicing, key, skip_voice=_skip))
+        score -= 3.0 * len(has_seventh_resolution_violation(
+            prev, prev_chord, voicing, chord, key))
+
     # P21.4 — phrase-plan hint bonus.
     # ``compute_phrase_bonus`` is already clipped to
     # [PHRASE_BONUS_MIN=-0.5, PHRASE_BONUS_MAX=+1.0] internally and
@@ -1842,15 +2171,20 @@ def check_voicing(
     voicing: Voicing,
     chord: Chord,
     key: Key,
+    skip_voice: str | None = None,
 ) -> list[str]:
-    """Return all hard-constraint violations (empty list == valid)."""
+    """Return all hard-constraint violations (empty list == valid).
+
+    ``skip_voice``: 固定声部 (旋律题 soprano / 低音题 bass) 不强制导音解决.
+    """
     errs: list[str] = []
     errs.extend(has_voice_crossing(voicing))
+    # 只有"平行五八度 + 声部交叉"作为 hard 约束 (fundamental, 绝不能违反).
+    # 导音解决 / 七音解决 / 导音不得重复 都改为软惩罚 (score_voicing),
+    # 否则旋律含导音/七音时束搜索会被整死, 触发降级合成出错误和弦
+    # (用户反馈"规则太死板"的根因).
     if prev is not None:
         errs.extend(has_parallel(prev, voicing))
-        errs.extend(has_leading_tone_violation(prev, voicing, key))
-        errs.extend(has_seventh_resolution_violation(
-            prev, prev_chord, voicing, chord, key))
     # P2: in a seventh chord, all 4 chord tones must be present
     # (Sposobin §45).  With 4 voices and 4 chord tones, one tone may
     # be doubled — but no chord tone may be entirely absent.
@@ -1911,6 +2245,55 @@ def check_voicing(
 # ---------------------------------------------------------------------------
 
 
+def _synthesize_fallback_voicing(
+    chord: Chord,
+    key: Key,
+    *,
+    melody: Note | None = None,
+    bass: Note | None = None,
+) -> Voicing:
+    """P0-1 兜底合成 voicing: 保证锚定音 (melody→soprano / bass→bass) 原样
+    不丢, 其余声部用和弦音就近填充, 尽力避免声部交叉.
+
+    可能违反严格声部规则 — 仅供"永不无解"的降级输出使用, 调用方负责
+    记 warning + 打低置信标记. 核心铁律: 任何情况都不改变旋律/低音音高.
+    """
+    pcs = list(dict.fromkeys(chord.pitch_classes(key)))  # 去重保序
+    if not pcs:
+        pcs = [key.tonic_pc]
+
+    def _note(pc: int, oct_: int) -> Note:
+        return Note(pc=pc, oct=oct_)
+
+    # soprano: 旋律优先, 否则取和弦最高音
+    if melody is not None:
+        sop = melody
+    else:
+        sop = _note(pcs[-1] if pcs else key.tonic_pc, 5)
+
+    # bass: 给定低音优先, 否则用和弦低音
+    if bass is not None:
+        bas = bass
+    else:
+        bas = _note(chord.bass_pitch_class(key), 3)
+
+    # alto/tenor: 在 sop 与 bas 之间找两个和弦音, 尽量不交叉
+    cands: list[Note] = []
+    for pc in pcs:
+        for oct_ in range(1, 7):
+            n = _note(pc, oct_)
+            if bas.midi < n.midi < sop.midi:
+                cands.append(n)
+    cands.sort(key=lambda n: (abs(n.midi - sop.midi), n.midi))
+    if not cands:
+        cands = [_note(sop.pc, sop.oct - 1), _note(bas.pc, bas.oct + 1)]
+    alto = cands[0]
+    tenor = cands[1] if len(cands) > 1 else cands[0]
+    if alto.midi <= tenor.midi:
+        alto, tenor = tenor, alto
+    return Voicing(soprano=sop, alto=alto, tenor=tenor, bass=bas)
+
+
 def enumerate_voicings(
     chord: Chord,
     key: Key,
@@ -1924,6 +2307,8 @@ def enumerate_voicings(
     is_strong_beat: bool = True,
     is_cadence_beat: bool = False,
     is_c64_beat: bool = False,
+    # v1.4 (P2.2-C, 软 R1): 透传给 score_voicing
+    is_v_beat: bool = False,
     require_chord_tones: bool = False,
     max_results: int = 80,
     # P21.4: phrase-plan hint layer.  Default None = "no plan",
@@ -1950,6 +2335,11 @@ def enumerate_voicings(
             "enumerate_voicings: melody and fixed_bass are mutually exclusive; "
             "pass exactly one anchor."
         )
+    if max_results <= 0:
+        return []
+    # P0.1-bugfix: 固定声部 (旋律/低音) 不强制导音解决, 否则旋律导音下行时
+    # 束搜索会被 hard 约束整死. 自由声部才强制.
+    _skip_voice = "soprano" if melody is not None else ("bass" if fixed_bass is not None else None)
     chord_pcs = chord.pitch_classes(key)
     results: list[tuple[Voicing, float, list[str]]] = []
     bass_pc = chord.bass_pitch_class(key)
@@ -2053,7 +2443,8 @@ def enumerate_voicings(
                                 break
                         if v is None:
                             continue
-                    errs = check_voicing(prev, prev_chord, v, chord, key)
+                    errs = check_voicing(prev, prev_chord, v, chord, key,
+                                         skip_voice=_skip_voice)
                     if errs:
                         continue
                     sc, _parts = score_voicing(
@@ -2062,14 +2453,19 @@ def enumerate_voicings(
                         is_strong_beat=is_strong_beat,
                         is_cadence_beat=is_cadence_beat,
                         is_c64_beat=is_c64_beat,
+                        is_v_beat=is_v_beat,
                         nct_type=nct_type,
                         phrase_plan=phrase_plan,
                         beat_idx=beat_idx,
                     )
                     results.append((v, sc, errs))
-                    if len(results) >= max_results:
+                    # Keep the best candidates seen so far without returning
+                    # early.  Enumeration order is pitch-based, not score-
+                    # based, so the first max_results entries are not the
+                    # global Top-K.
+                    if len(results) >= max_results * 4:
                         results.sort(key=lambda r: r[1], reverse=True)
-                        return results
+                        del results[max_results:]
 
     results.sort(key=lambda r: r[1], reverse=True)
     return results[:max_results]
@@ -2127,13 +2523,6 @@ def detect_cadence(prev_chord: Chord | None, last_chord: Chord, last_voicing: Vo
     if prev_chord.degree == 4 and last_chord.degree == 1:
         if prev_chord.quality in ("min", "maj", "modal_b6", "modal_iv"):
             return "plagal"
-    # Sposobin §32 secondary-dominant-to-I: ii7 (V7/V) → I in major is
-    # an "incomplete authentic" — V is missing, but the supertonic
-    # chord functions as a stand-in.  In Sposobin's late 上册 chapter
-    # this is acceptable; mark it as "half_authentic" so the user
-    # sees the solver noticed the resolution.
-    if prev_chord.degree == 2 and last_chord.degree == 1:
-        return "half_authentic"
     return None
 
 
@@ -2660,22 +3049,35 @@ class SolveResult:
         }
 
 
-def _default_beat_durations(time_sig: str, measure_count: int) -> list[list[float]]:
-    """Return per-measure per-beat durations.
+def _parse_time_signature(time_sig: str) -> tuple[int, int]:
+    parts = time_sig.split("/") if isinstance(time_sig, str) else []
+    if len(parts) != 2:
+        raise ValueError(f"拍号格式无效: {time_sig!r}，应为如 4/4、3/4 的格式。")
+    try:
+        numerator, denominator = (int(part.strip()) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"拍号格式无效: {time_sig!r}，应为如 4/4、3/4 的格式。") from exc
+    if numerator <= 0 or denominator <= 0:
+        raise ValueError("拍号的分子和分母必须是正整数。")
+    return numerator, denominator
 
-    The number of beats per measure equals the numerator of the time
-    signature (one beat per "click" the musician counts: 4/4 → 4, 3/8 → 3,
-    6/8 → 6).  Each beat is (4/den) quarter notes long:
-        4/4 → 4 beats × 1.0 quarter
-        3/4 → 3 beats × 1.0 quarter
-        3/8 → 3 beats × 0.5 quarter   (eight-note triplets)
-        6/8 → 6 beats × 0.5 quarter   (compound duple, 6 eighth notes)
+
+def _default_beat_durations(time_sig: str, measure_count: int, subdivision: int = 1) -> list[list[float]]:
+    """Return per-measure per-CELL durations (B1 细分网格).
+
+    A cell = beat / subdivision; 每小节 cell 数 = num × subdivision.
+    subdivision=1 保持历史行为 (1 cell = 1 beat = 4/den quarters):
+        4/4 → 4 cells × 1.0 quarter
+        6/8 → 6 cells × 0.5 quarter
+    subdivision=2 (八分网格): 4/4 → 8 cells × 0.5 quarter.
     """
-    num, den = time_sig.split("/")
-    num = int(num)
-    den = int(den)
+    if not isinstance(subdivision, int) or isinstance(subdivision, bool) or subdivision <= 0:
+        raise ValueError("网格细分 subdivision 必须是正整数。")
+    num, den = _parse_time_signature(time_sig)
     beat_dur = 4.0 / den
-    return [[beat_dur] * num for _ in range(measure_count)]
+    cell_dur = beat_dur / subdivision
+    n_cells = num * subdivision
+    return [[cell_dur] * n_cells for _ in range(measure_count)]
 
 
 def solve_melody(
@@ -2684,6 +3086,9 @@ def solve_melody(
     melody_pitches: list[list[Note | None]],
     *,
     measure_count: int | None = None,
+    # 阶段0 (架构清理): 默认 beam K=3 / top_n=1, 保持单题快速 (测试/CLI).
+    # 生产 (server.py) 会显式传 beam_k=50 / top_n=50 暴露多解.
+    # K=50 使单题 ~4.7s (16.5x), 对教学多解有价值, 但不适合作为库默认值.
     beam_k: int = 3,
     top_n: int = 1,
     key_changes: "list[KeyChange | tuple[int, str]] | None" = None,
@@ -2692,6 +3097,9 @@ def solve_melody(
     # P21.4: phrase-plan hint layer.  Optional; default None
     # reproduces P0-P7.7 behaviour exactly.
     phrase_plan: "PhrasePlanSet | None" = None,
+    # B1: grid subdivision (1=四分拍, 2=八分, 4=十六分).  Default 1 keeps
+    # historical behaviour exactly; the converter passes the detected value.
+    subdivision: int = 1,
 ) -> SolveResult:
     """Solve a 4-part harmonization for a given melody (or bass line).
 
@@ -2743,9 +3151,32 @@ def solve_melody(
         A bass beat of ``None`` means "rest" and falls back to the
         default chord pool (same as no bass given for that beat).
     """
+    if not isinstance(melody_pitches, list):
+        raise ValueError("旋律数据必须是按小节组织的列表。")
+    if not isinstance(subdivision, int) or isinstance(subdivision, bool) or subdivision <= 0:
+        raise ValueError("网格细分 subdivision 必须是正整数。")
+    _num_beats, _den_beats = _parse_time_signature(time_signature)
     key = Key.from_name(key_name)
     if measure_count is None:
         measure_count = len(melody_pitches)
+    if not isinstance(measure_count, int) or isinstance(measure_count, bool) or measure_count < 0:
+        raise ValueError("measure_count 必须是非负整数。")
+    if measure_count != len(melody_pitches):
+        raise ValueError(
+            f"measure_count={measure_count} 与旋律小节数 {len(melody_pitches)} 不一致。"
+        )
+    if any(not isinstance(measure, list) for measure in melody_pitches):
+        raise ValueError("每个旋律小节都必须是音符列表。")
+    if bass_pitches is not None:
+        if not isinstance(bass_pitches, list) or len(bass_pitches) != measure_count:
+            raise ValueError("低音小节数必须与旋律小节数一致。")
+        for m_idx, (melody_measure, bass_measure) in enumerate(
+                zip(melody_pitches, bass_pitches), start=1):
+            if not isinstance(bass_measure, list) or len(bass_measure) != len(melody_measure):
+                raise ValueError(f"第 {m_idx} 小节的低音网格数必须与旋律网格数一致。")
+
+    # B1: 解析拍号, 得到拍长 (四分单位) 与每小节拍数, 供强/弱拍与终止式槽位判断.
+    beat_dur_quarters = 4.0 / _den_beats
 
     # P8.1: resolve chord pool profile.  When set, the chapter's allowed
     # chord pool replaces the full P0-P7.7 pool everywhere the solver
@@ -2835,7 +3266,15 @@ def solve_melody(
     flat_melody: list[Note | None] = []   # for prev/next lookups (P4)
     flat_bass: list[Note | None] = []     # for P8 (bass-given mode)
     for m_idx, measure in enumerate(melody_pitches):
-        durs = _default_beat_durations(time_signature, 1)[0]
+        durs = _default_beat_durations(time_signature, 1, subdivision)[0]
+        # Guard: a measure must not exceed `num × subdivision` cells.
+        # Catches over-expanded input with a clear message instead of an
+        # IndexError below.  Under-filled measures are tolerated.
+        if len(measure) > len(durs):
+            raise ValueError(
+                f"第 {m_idx + 1} 小节有 {len(measure)} 个网格格，超过 {time_signature} 的 "
+                f"{len(durs)} 个网格格。请检查该小节的时值是否超拍。"
+            )
         beats_per_measure.append(len(measure))
         for b_idx, mel in enumerate(measure):
             offset = sum(durs[:b_idx])
@@ -2857,25 +3296,25 @@ def solve_melody(
     prev_prev_mels: list[Note | None] = [None, None] + flat_melody[:-2]
     # P4 fix: which beat number (1-indexed) within the measure each
     # global b_idx falls on, so we can identify the secondary metric
-    # accent (beat 3 in 4/4).  beats_per_measure_in_beat[b_idx] = N
-    # means b_idx is the Nth beat of its measure (1-indexed).
+    # accent (beat 3 in 4/4).  B1: with subdivision S, cells k..k+S-1 all
+    # map to the same beat number (k // S + 1).
     beats_per_measure_in_beat: list[int] = []
     for n in beats_per_measure:
         for k in range(n):
-            beats_per_measure_in_beat.append(k + 1)
+            beats_per_measure_in_beat.append(k // subdivision + 1)
 
     # Where should V land for a proper "V → I" cadence?
     # The standard pattern: last beat of the penultimate measure = V,
-    # final measure = I.  So the "V beat" is at the last beat of measure M-1
-    # (or M if M==1 — but we always have at least 2 measures here).
+    # final measure = I.  B1: with subdivision S, the slot is the START cell
+    # of that beat (scaled by S), so the whole beat is forced consistently.
     if measure_count >= 2:
-        v_beat_idx = sum(beats_per_measure[:-1]) - 1
+        v_beat_idx = sum(beats_per_measure[:-1]) - subdivision
     else:
         v_beat_idx = -1
     # Cadential 6/4 (Sposobin §46): the beat just before V should hold I6/4
     # as preparation.  This is a soft preference, not a hard requirement.
     if measure_count >= 2:
-        c64_beat_idx = v_beat_idx - 1
+        c64_beat_idx = v_beat_idx - subdivision
     else:
         c64_beat_idx = -1
 
@@ -2900,12 +3339,14 @@ def solve_melody(
     effective_k = max(beam_k, top_n)
 
     warnings: list[str] = []
+    degraded_measures: set[int] = set()  # P2: 被降级合成的小节 (0-indexed)
     chosen: list[tuple[Voicing, Chord, float]] = []
 
     for b_idx, beat in enumerate(beats):
-        is_cadence_beat = (b_idx == len(beats) - 1)
-        is_v_beat = (b_idx == v_beat_idx)
-        is_c64_beat = (b_idx == c64_beat_idx)
+        # B1: cadence / V / c64 槽位覆盖整个拍 (subdivision 个格).
+        is_cadence_beat = (b_idx >= len(beats) - subdivision)
+        is_v_beat = (v_beat_idx >= 0 and v_beat_idx <= b_idx < v_beat_idx + subdivision)
+        is_c64_beat = (c64_beat_idx >= 0 and c64_beat_idx <= b_idx < c64_beat_idx + subdivision)
         is_strong = (beat.offset == 0.0)
         # P7.5: local key for this beat (may differ from home key if a
         # modulation was declared via key_changes).
@@ -3110,7 +3551,10 @@ def solve_melody(
         # soprano via the NCT classifier (P4: passing / neighbor /
         # suspension).
         beat_in_m = beats_per_measure_in_beat[b_idx]
-        is_secondary_strong = (beat_in_m == 3 and beat.duration == 1.0)
+        # B1: 次级强拍 (4/4 第 3 拍) 只作用于该拍的起始格, 不作用于拍内细分.
+        is_beat_start = (abs(beat.offset % beat_dur_quarters) < 1e-9)
+        is_secondary_strong = (beat_in_m == 3 and beat_dur_quarters == 1.0
+                               and is_beat_start)
         require_ct = (is_strong or is_secondary_strong or is_cadence_beat
                       or is_v_beat or is_c64_beat)
 
@@ -3130,6 +3574,7 @@ def solve_melody(
                     is_strong_beat=is_strong,
                     is_cadence_beat=is_cadence_beat,
                     is_c64_beat=is_c64_beat,
+                    is_v_beat=is_v_beat,
                     require_chord_tones=require_ct,
                     max_results=40,
                     phrase_plan=phrase_plan,
@@ -3166,55 +3611,28 @@ def solve_melody(
             # matching diatonic chord).
             if beat.bass is not None and not is_cadence_beat:
                 fallback_pool = _pool(local_key)
-                fallback_voicings: list[tuple[Voicing, float, list[str]]] = []
+                fallback_voicings: list[tuple[Voicing, Chord, float]] = []
                 for chord in fallback_pool:
-                    fallback_voicings.extend(
-                        enumerate_voicings(
-                            chord, local_key,
-                            melody=beat.soprano,
-                            prev=beam[0][0] if beam else None,
-                            prev_chord=beam[0][1] if beam else None,
-                            prev_melody=prev_mels[b_idx],
-                            next_melody=next_mels[b_idx],
-                            is_strong_beat=is_strong,
-                            is_cadence_beat=is_cadence_beat,
-                            is_c64_beat=is_c64_beat,
-                            require_chord_tones=require_ct,
-                            max_results=40,
-                            phrase_plan=phrase_plan,
-                            beat_idx=b_idx,
-                        )
+                    vs = enumerate_voicings(
+                        chord, local_key,
+                        fixed_bass=beat.bass,
+                        prev=beam[0][0] if beam else None,
+                        prev_chord=beam[0][1] if beam else None,
+                        prev_melody=prev_mels[b_idx],
+                        next_melody=next_mels[b_idx],
+                        is_strong_beat=is_strong,
+                        is_cadence_beat=is_cadence_beat,
+                        is_c64_beat=is_c64_beat,
+                        is_v_beat=is_v_beat,
+                        require_chord_tones=require_ct,
+                        max_results=40,
+                        phrase_plan=phrase_plan,
+                        beat_idx=b_idx,
                     )
+                    fallback_voicings.extend((v, chord, sc) for v, sc, _ in vs)
                 if fallback_voicings:
-                    fallback_voicings.sort(key=lambda r: r[1], reverse=True)
-                    best_v_f, best_sc_f, _ = fallback_voicings[0]
-                    best_c_f = fallback_pool[0]  # paired by index not guaranteed
-                    # Use the chord that produced the best voicing
-                    # (fallback_voicings and fallback_pool are in same
-                    # order from enumerate_voicings, but we'll re-derive)
-                    # Simpler: take the first valid (v, c) pair by
-                    # re-running enumerate for the first chord that
-                    # produced a valid voicing.
-                    for chord in fallback_pool:
-                        vs = enumerate_voicings(
-                            chord, local_key,
-                            melody=beat.soprano,
-                            prev=beam[0][0] if beam else None,
-                            prev_chord=beam[0][1] if beam else None,
-                            prev_melody=prev_mels[b_idx],
-                            next_melody=next_mels[b_idx],
-                            is_strong_beat=is_strong,
-                            is_cadence_beat=is_cadence_beat,
-                            is_c64_beat=is_c64_beat,
-                            require_chord_tones=require_ct,
-                            max_results=1,
-                            phrase_plan=phrase_plan,
-                            beat_idx=b_idx,
-                        )
-                        if vs:
-                            best_v_f, best_sc_f, _ = vs[0]
-                            best_c_f = chord
-                            break
+                    fallback_voicings.sort(key=lambda r: r[2], reverse=True)
+                    best_v_f, best_c_f, best_sc_f = fallback_voicings[0]
                     # P8 review fix: PRESERVE the v_list / c_list from
                     # the current beam — rebuilding from [best_v_f] would
                     # discard the path accumulated so far, and the
@@ -3223,18 +3641,26 @@ def solve_melody(
                     # v_path is shorter than the expected beat count.
                     cur_v_list = beam[0][3] if beam else []
                     cur_c_list = beam[0][4] if beam else []
+                    cumulative_score = (beam[0][2] if beam else 0.0) + best_sc_f
                     new_beam_fb: list[tuple] = [(
-                        best_v_f, best_c_f, best_sc_f,
+                        best_v_f, best_c_f, cumulative_score,
                         cur_v_list + [best_v_f],
                         cur_c_list + [best_c_f],
                     )]
                     beam = new_beam_fb
-                    chosen.append((best_v_f, best_c_f, best_sc_f))
+                    chosen.append((best_v_f, best_c_f, cumulative_score))
                     continue
             # Standard fallback: carry forward the best state and grow
             # the path by one (re-using the last voicing).  We do NOT
             # fall back to prev=None here — that bypasses parallel-5/8
             # and produces forbidden voicings (see P1 review).
+            degraded_measure = beat_to_measure_idx[b_idx]
+            if degraded_measure not in degraded_measures:
+                warnings.append(
+                    f"第 {degraded_measure + 1} 小节无合规和弦，"
+                    "已降级合成（锚定音保留）。"
+                )
+            degraded_measures.add(degraded_measure)
             new_beam = []
             for (pv, pc, ps, pvl, pcl) in beam:
                 # P8: if pc is None (first beat, prev_c was None) and we
@@ -3255,19 +3681,8 @@ def solve_melody(
                 # voicing so the rest of the pipeline doesn't crash on
                 # `voicing.notes()`.
                 if pv is None:
-                    sop_note = beat.soprano or Note.from_name("C4")
-                    if local_key.mode == "major":
-                        alt_note = Note.from_name("E4")
-                        ten_note = Note.from_name("G3")
-                    else:
-                        alt_note = Note.from_name("Eb4")
-                        ten_note = Note.from_name("G3")
-                    if beat.bass is not None:
-                        bas_note = beat.bass
-                    else:
-                        bas_note = Note.from_name("C3")
-                    pv = Voicing(soprano=sop_note, alto=alt_note,
-                                 tenor=ten_note, bass=bas_note)
+                    pv = _synthesize_fallback_voicing(
+                        pc, local_key, melody=beat.soprano, bass=beat.bass)
                 # P18.5 fix: if the user's melody is NOT a chord tone of
                 # the carried-forward chord, the carry-forward will
                 # silently drop the melody (soprano stays at prev_v's
@@ -3301,6 +3716,7 @@ def solve_melody(
                             is_strong_beat=is_strong,
                             is_cadence_beat=is_cadence_beat,
                             is_c64_beat=is_c64_beat,
+                            is_v_beat=is_v_beat,
                             require_chord_tones=require_ct,
                             max_results=4,
                             phrase_plan=phrase_plan,
@@ -3322,11 +3738,24 @@ def solve_melody(
                     if best_pick is not None:
                         c2, v2 = best_pick
                         new_beam.append((
-                            v2, c2, ps - 5.0,  # small penalty for forced fallback
+                            v2, c2, ps - 10.0,
                             pvl + [v2], pcl + [c2],
                         ))
                         continue
-                new_beam.append((pv, pc, ps, pvl + [pv], pcl + [pc]))
+                # P0-1: 兜底也绝不许改锚定音 (旋律/低音). 找不到含旋律音
+                # 的和弦时, 合成一个 voicing 保证锚定音原样, 而不是复制上
+                # 一个错误音 (那会悄悄改掉旋律/低音). 降级 + 大罚 + warning.
+                anchor_changed = (
+                    (beat.soprano is not None and pv.soprano.midi != beat.soprano.midi)
+                    or (beat.bass is not None and pv.bass.midi != beat.bass.midi)
+                )
+                if anchor_changed:
+                    synth = _synthesize_fallback_voicing(
+                        pc, local_key, melody=beat.soprano, bass=beat.bass)
+                    degraded = ps - 10.0
+                    new_beam.append((synth, pc, degraded, pvl + [synth], pcl + [pc]))
+                    continue
+                new_beam.append((pv, pc, ps - 10.0, pvl + [pv], pcl + [pc]))
             beam = new_beam
             chosen.append((beam[0][0], beam[0][1], beam[0][2]))
             continue
@@ -3348,10 +3777,10 @@ def solve_melody(
         measures_out: list[dict] = []
         cadence_per_measure: list[str | None] = [None] * measure_count
         cum_beats = 0
-        prev_last_c: Chord | None = None
-        prev_last_v: Voicing | None = None
+        previous_measure_had_beats = False
         for m_idx in range(measure_count):
             n_beats = len(melody_pitches[m_idx])
+            durs_m = _default_beat_durations(time_signature, 1, subdivision)[0]
             m_beats_out = []
             for k in range(n_beats):
                 v = v_path[cum_beats + k]
@@ -3410,14 +3839,15 @@ def solve_melody(
                 )
                 beat_dict = {
                     "beat": k + 1,
-                    "offset": float(k),
-                    "duration": 1.0,
-                    "soprano": v.soprano.name,
-                    "alto": v.alto.name,
-                    "tenor": v.tenor.name,
-                    "bass": v.bass.name,
-                    "roman": c.roman_label(key),
-                    "figure": c.figure(key),
+                    "offset": sum(durs_m[:k]),
+                    "duration": durs_m[k],
+                    # P0-2b: 按调号正确拼写 (升号调不再显示 Db/Ab/Gb).
+                    "soprano": _spell_note(v.soprano, lk, c),
+                    "alto": _spell_note(v.alto, lk, c),
+                    "tenor": _spell_note(v.tenor, lk, c),
+                    "bass": _spell_note(v.bass, lk, c),
+                    "roman": c.roman_label(lk),
+                    "figure": c.figure(lk),
                     "inversion": c.inversion,
                     "doubled": dbl or "none",
                     "function": func,
@@ -3430,18 +3860,25 @@ def solve_melody(
                 m_beats_out.append(beat_dict)
             # Cadence detection per measure
             cadence = None
-            if m_idx > 0 and prev_last_c is not None:
-                curr_c = c_path[cum_beats + n_beats - 1]
-                curr_v = v_path[cum_beats + n_beats - 1]
-                lk_for_cadence = beat_to_local_key[cum_beats + n_beats - 1]
-                cadence = detect_cadence(prev_last_c, curr_c, curr_v, lk_for_cadence)
-                prev_lk = beat_to_local_key[cum_beats - 1] if cum_beats > 0 else key
-                curr_lk = lk_for_cadence
-                if prev_lk != curr_lk and cadence is not None and not cadence.startswith("modulation_"):
-                    cadence = f"modulation_{cadence}"
-            prev_last_c = c_path[cum_beats + n_beats - 1]
-            prev_last_v = v_path[cum_beats + n_beats - 1]
+            if n_beats > 0:
+                final_idx = cum_beats + n_beats - 1
+                previous_idx = final_idx - 1
+                has_adjacent_chord = (
+                    previous_idx >= 0
+                    and (n_beats >= 2 or previous_measure_had_beats)
+                )
+                if has_adjacent_chord:
+                    prev_c = c_path[previous_idx]
+                    curr_c = c_path[final_idx]
+                    curr_v = v_path[final_idx]
+                    lk_for_cadence = beat_to_local_key[final_idx]
+                    cadence = detect_cadence(prev_c, curr_c, curr_v, lk_for_cadence)
+                    prev_lk = beat_to_local_key[previous_idx]
+                    curr_lk = lk_for_cadence
+                    if prev_lk != curr_lk and cadence is not None and not cadence.startswith("modulation_"):
+                        cadence = f"modulation_{cadence}"
             cum_beats += n_beats
+            previous_measure_had_beats = n_beats > 0
             m_dict = {
                 "number": m_idx + 1,
                 "beats": m_beats_out,
@@ -3471,13 +3908,11 @@ def solve_melody(
             # (6+ accidentals apart, requires enharmonic pivot).
             "modulationRelationships": _modulation_relationships(
                 key, parsed_changes),
-            # P18.5: confidence score 0-100 with evidence list, so the
-            # frontend can show "置信度 87% — 3 个依据" instead of just
-            # raw float score.  Computed per-path; not yet attached here
-            # (this is in the warning-free primary path).  See below.
+            # P2: 被降级合成的小节 (1-indexed 列表), 前端据此标 ⚠.
+            "degradedMeasures": sorted(m + 1 for m in degraded_measures),
         }
         summary["confidence"], summary["confidenceEvidence"] = _compute_confidence(
-            score, cadence_per_measure, warnings
+            score, cadence_per_measure, warnings, degraded_measures
         )
 
         # P21.4 — phrase-plan attached to output for the frontend.
@@ -3653,7 +4088,12 @@ def _dummy_voicing_for_cadence():
         return None
 
 
-def _compute_confidence(score: float, cadence_per_measure: list, warnings: list) -> tuple[int, list[str]]:
+def _compute_confidence(
+    score: float,
+    cadence_per_measure: list,
+    warnings: list,
+    degraded_measures: set | None = None,
+) -> tuple[int, list[str]]:
     """P18.5: compute a 0-100 confidence percentage + evidence list.
 
     Heuristic (transparent and Sposobin-rule-based — no LLM):
@@ -3662,11 +4102,14 @@ def _compute_confidence(score: float, cadence_per_measure: list, warnings: list)
         Each measure's cadence is counted once.
       - Fallback warning penalty: -4 per warning (the solver couldn't
         satisfy hard constraints at that beat — major issue).
+      - P2: 降级合成小节 penalty: -15 per degraded measure (比普通 warning
+        更重, 因为该小节的和弦可能不正确).
       - Clamp to [0, 100].
 
     Returns (percent, evidence) where evidence is a list of human-readable
     reasons so the user knows why confidence is what it is.
     """
+    degraded_measures = degraded_measures or set()
     baseline = max(0.0, min(30.0, (score - 90.0) * 0.75))  # 90→0, 130→30
     bonus = 0.0
     evidence: list[str] = []
@@ -3697,6 +4140,12 @@ def _compute_confidence(score: float, cadence_per_measure: list, warnings: list)
     penalty = 4.0 * len(warnings)
     if warnings:
         evidence.append(f"{len(warnings)} 个 fallback 警告（-{penalty:.0f}）")
+    if degraded_measures:
+        deg_penalty = 15.0 * len(degraded_measures)
+        penalty += deg_penalty
+        evidence.append(
+            f"{len(degraded_measures)} 个小节降级合成（-{deg_penalty:.0f}, 和弦可能不正确）"
+        )
     if not evidence:
         evidence.append("无可用依据 — 答案可能不可靠")
     confidence = max(0, min(100, int(round(baseline + bonus - penalty))))

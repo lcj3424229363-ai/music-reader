@@ -24,6 +24,7 @@ yarn-error.log*
 
 # ===== Backups =====
 *.bak
+*.bak*
 *~
 .DS_Store
 Thumbs.db
@@ -83,8 +84,25 @@ __trash_/
 # 根目录 pytest dump 文件 (没下划线)
 pytest_*.txt
 
+# ===== tests/ ad-hoc dumps / debug helpers =====
+tests/_*.py
+tests/_*.js
+tests/_*.json
+tests/_*.md
+tests/_*.html
+tests/_*.xml
+tests/*_response.json
+tests/last_response.json
+tests/solve_from_xml.json
+tests/solve_via_reader.json
+tests/full_roundtrip_*.json
+
 # ===== Env / secrets =====
 .env
+.env.*
+.env*
 .env.local
 *.pem
 *.key
+
+tests/read_score_resp.json

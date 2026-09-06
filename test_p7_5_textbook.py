@@ -19,7 +19,8 @@ P7.5 — Sposobin ch31 调性关系类型 (PDF p216-219 / 课本 p208-211) 对�
 课本 ch35 到一级关系调的转调: 最常见的 5-6 个 close-related keys.
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import Key
 

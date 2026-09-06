@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+import re
 import shutil
 import sys
 import tempfile
@@ -10,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Register woff2 mime (Python <3.13 不自带). StaticFiles 用 mimetypes 推断 Content-Type.
 mimetypes.add_type("font/woff2", ".woff2")
@@ -27,39 +28,54 @@ from omr import SUPPORTED_OMR_EXTENSIONS, OmrError, transcribe_with_audiveris
 from manual_chords import analyze_manual_chords
 from manual_notes import locate_manual_notes
 # P8 (Level 2 integration, 2026-08-09): four_part.py has been removed.
-# The Sposobin solver (solver.py, P0-P7 + bass-given) now handles ALL
-# four-part problems — both melody-given and bass-given.  See git log
-# for the removal commit.
+# The Sposobin solver (solver.py) now handles ALL four-part problems —
+# both melody-given and bass-given.
 #
-# P2.6-C3 (2026-08-15): server defaults to v1.6 (beam K=50, 50 alternatives)
-# to expose multi-solution paths.  Set SOLVER_VERSION=v1.5 to revert to
-# the previous P0-P7 frozen solver (K=3, top_n=1).
+# 阶段0 (架构清理): solver.py 是唯一求解器 (v1.6, beam K=50 / top_n=50),
+# frozen_v1_6/ 已合并进来.  SOLVER_VERSION=v1.5 只是把 beam 收紧到
+# K=3 / top_n=1 (历史回退), 不再切换代码文件.
 import os
-if os.environ.get("SOLVER_VERSION") == "v1.5":
-    import solver as sposobin_solver  # legacy P0-P7 frozen (K=3, top_n=1)
-else:
-    import importlib.util
-    _V16_PATH = CURRENT_DIR / "frozen_v1_6" / "solver.py"
-    _v16_spec = importlib.util.spec_from_file_location(
-        "solver_v16", str(_V16_PATH))
-    sposobin_solver = importlib.util.module_from_spec(_v16_spec)
-    sys.modules["solver_v16"] = sposobin_solver
-    _v16_spec.loader.exec_module(sposobin_solver)
+
+import solver as sposobin_solver
+
+# 历史回退: SOLVER_VERSION=v1.5 → K=3 / top_n=1 (否则默认 v1.6 K=50).
+_SOLVER_BEAM_K = 3 if os.environ.get("SOLVER_VERSION") == "v1.5" else 50
+_SOLVER_TOP_N = 1 if os.environ.get("SOLVER_VERSION") == "v1.5" else 50
 
 from editor_to_solver import (
     _APPJS_ACCIDENTAL_TO_SOLVER,
     _APPJS_DURATION_TO_QUARTER,
     appjs_entry_to_soprano_note,
-    appjs_entry_to_solver_beats,
+    appjs_measures_subdivision,
     appjs_measures_to_solver_bass,
     appjs_measures_to_solver_melody,
+    appjs_measures_rhythm_template,
 )
 
 # Back-compat aliases (P22 第一刀: 函数搬家, server 内部仍按 _appjs_* 名字调用).
 _appjs_entry_to_soprano_note = appjs_entry_to_soprano_note
-_appjs_entry_to_solver_beats = appjs_entry_to_solver_beats
+_appjs_measures_subdivision = appjs_measures_subdivision
 _appjs_measures_to_solver_melody = appjs_measures_to_solver_melody
 _appjs_measures_to_solver_bass = appjs_measures_to_solver_bass
+_appjs_measures_rhythm_template = appjs_measures_rhythm_template
+
+# 修饰音 / 演奏记号字段: 前端 entry → 答案 entry 必须原样透传, 否则在
+# solve-melody 往返里会丢失. solver 只理解音高 + 时值, 不理解这些符号,
+# 所以锚定声部 (旋律/低音) 的答案把这些字段从输入模板原样带回.
+_ENTRY_PASSTHROUGH_FIELDS = (
+    "tieStart", "tieStop", "slurStart", "slurStop", "fermata", "dynamic",
+    "chordSymbol", "articulation", "ornament", "grace", "pedal", "hairpin",
+    "fingering", "arpeggiate", "phraseStart", "phraseStop", "textMark",
+    "breath", "tupletType", "tupletGroup", "tupletPosition",
+    "rehearsalMark", "volta",
+)
+
+
+def _read_source_musicxml(path: Path) -> str | None:
+    """Read canonical XML text for an unpacked MusicXML source."""
+    if path.suffix.lower() not in {".xml", ".musicxml"}:
+        return None
+    return path.read_text(encoding="utf-8-sig")
 
 # P19: LLM 增强层 (教师式中文讲解)
 try:
@@ -109,14 +125,14 @@ class ManualNoteRequest(BaseModel):
 class FourPartRequest(BaseModel):
     key: str
     timeSignature: str = "4/4"
-    melodyEntries: list[dict] = []
+    melodyEntries: list[dict] = Field(default_factory=list)
     melodyMeasures: list[list[dict]] | None = None
     questionType: str = "melody"
     # P8: bass-given mode.  Populated when questionType='bass'; the
     # solver anchors the chord via the bass line and fills in the
     # upper three voices.  Same shape as melodyEntries/melodyMeasures
     # but the notes are bass pitches (in bass range E2..D4).
-    bassEntries: list[dict] = []
+    bassEntries: list[dict] = Field(default_factory=list)
     bassMeasures: list[list[dict]] | None = None
     # P7.5: optional list of [measure_index, target_key_name] pairs for
     # modulation.  Defaults to [] (no modulation, single home key).
@@ -129,6 +145,20 @@ class FourPartRequest(BaseModel):
     # 'ch8-20_v7', 'ch21-22_d7_ii7_vii7', 'ch23_v9', 'ch24-26_dd',
     # 'full_p0-p7', 'full_p0-p9'.
     chordPoolProfile: str | None = None
+
+
+def _safe_upload_name(filename: str | None, suffix: str) -> str:
+    """Drop client-supplied directory components before writing a temp file."""
+    name = Path(filename or f"upload{suffix}").name
+    return name if name not in ("", ".", "..") else f"upload{suffix}"
+
+
+def _remove_source_path(payload: dict) -> dict:
+    """Uploaded temp paths are internal and cease to exist after the request."""
+    source = payload.get("source")
+    if isinstance(source, dict):
+        source.pop("path", None)
+    return payload
 
 
 @app.get("/health")
@@ -147,6 +177,7 @@ async def _safe_exception_handler(_request: _FastAPIRequest, exc: Exception) -> 
     return _JSONResponse(
         status_code=200,
         content={
+            "errorCode": "SOLVER_ERROR",
             "source": {"engine": "sposobin-solver", "version": "P0-P2.6 v1.6", "fallback": False},
             "summary": {
                 "status": "error",
@@ -204,7 +235,7 @@ async def read_score_upload(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
 
     with tempfile.TemporaryDirectory(prefix="music-reader-") as temp_dir:
-        target = Path(temp_dir) / (file.filename or f"upload{suffix}")
+        target = Path(temp_dir) / _safe_upload_name(file.filename, suffix)
         with target.open("wb") as handle:
             shutil.copyfileobj(file.file, handle)
 
@@ -212,7 +243,7 @@ async def read_score_upload(file: UploadFile = File(...)) -> dict:
             if suffix in SUPPORTED_OMR_EXTENSIONS:
                 omr_dir = Path(temp_dir) / "omr-output"
                 omr_result = transcribe_with_audiveris(target, omr_dir)
-                result = read_score(omr_result["exportedPath"])
+                result = _remove_source_path(read_score(omr_result["exportedPath"]))
                 result["omr"] = {
                     "engine": omr_result["engine"],
                     "exportedFileName": Path(omr_result["exportedPath"]).name,
@@ -225,7 +256,7 @@ async def read_score_upload(file: UploadFile = File(...)) -> dict:
                 result["summary"]["status"] = "readable_with_warnings"
                 return result
 
-            return read_score(target)
+            return _remove_source_path(read_score(target))
         except OmrError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -254,17 +285,19 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
 
     with tempfile.TemporaryDirectory(prefix="music-reader-parse-") as temp_dir:
-        target = Path(temp_dir) / (file.filename or f"upload{suffix}")
+        target = Path(temp_dir) / _safe_upload_name(file.filename, suffix)
         with target.open("wb") as handle:
             shutil.copyfileobj(file.file, handle)
+
+        source_musicxml = _read_source_musicxml(target)
 
         try:
             if suffix in SUPPORTED_OMR_EXTENSIONS:
                 omr_dir = Path(temp_dir) / "omr-output"
                 omr_result = transcribe_with_audiveris(target, omr_dir)
-                raw_payload = read_score(omr_result["exportedPath"])
+                raw_payload = _remove_source_path(read_score(omr_result["exportedPath"]))
             else:
-                raw_payload = read_score(target)
+                raw_payload = _remove_source_path(read_score(target))
         except OmrError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -274,6 +307,8 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
     editor_payload = reader_payload_to_editor(raw_payload)
     # 附上原始 summary 给前端 (keyPerMeasure, cadences, etc.)
     editor_payload["rawSummary"] = raw_payload.get("summary", {})
+    if source_musicxml is not None:
+        editor_payload["sourceMusicXml"] = source_musicxml
     return editor_payload
 
 
@@ -321,7 +356,7 @@ async def list_xml_files(query: str = "", limit: int = 1) -> dict:
 
     Returns:
       {
-        "files": [{"id": "ch4-01_a minor", "name": "ch4-01_a minor.xml", "path": "...", "chapter": "ch4"}],
+        "files": [{"id": "ch4-01_a minor", "name": "ch4-01_a minor.xml", "chapter": "ch4"}],
         "total": 388,
         "filtered": 1,
         "limit": 1
@@ -347,7 +382,6 @@ async def list_xml_files(query: str = "", limit: int = 1) -> dict:
         items.append({
             "id": fid,
             "name": path.name,
-            "path": str(path),
             "chapter": chapter,
         })
     return {"files": items, "total": total, "filtered": filtered, "limit": limit}
@@ -384,6 +418,9 @@ async def parse_score_by_id(request: Request) -> dict:
 
     editor_payload = reader_payload_to_editor(raw_payload)
     editor_payload["rawSummary"] = raw_payload.get("summary", {})
+    source_musicxml = _read_source_musicxml(target)
+    if source_musicxml is not None:
+        editor_payload["sourceMusicXml"] = source_musicxml
     return editor_payload
 
 
@@ -439,10 +476,21 @@ def _solver_cadence_per_measure(solver_result_dict: dict) -> list[str | None]:
     return [m.get("cadence") for m in solver_result_dict.get("measures", [])]
 
 
-def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartRequest) -> dict:
+def _solver_to_four_part_response(
+    solver_result_dict: dict,
+    request: FourPartRequest,
+    melody_rhythm: list | None = None,
+    bass_rhythm: list | None = None,
+) -> dict:
     """Convert solver.to_dict() output into the response schema the
     frontend renders.  Single source of truth — the legacy
     four_part.generate_four_part_answer was removed in P8 (2026-08-09).
+
+    ``melody_rhythm`` / ``bass_rhythm`` are the raw per-measure input
+    entries (the rhythm template).  When present, the anchored voice
+    (soprano in melody mode, bass in bass mode) is rebuilt from them so
+    the original durations (whole/half/quarter) survive the beat-level
+    solver round-trip instead of being flattened into repeated quarters.
     """
     measures_data = solver_result_dict.get("measures", [])
     flat_beats: list[dict] = []
@@ -523,15 +571,104 @@ def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartReq
             "units": units,
         }
 
-    def voice_track(voice_name: str) -> dict:
-        entries = [_beat_to_entry_dict(voice_name, b) for b in flat_beats]
-        per_measure = []
+    def _rest_entry_from_template(entry: dict) -> dict:
+        """Rest entry reconstructed from an input rhythm-template entry."""
+        out = {
+            "kind": "rest",
+            "duration": str(entry.get("duration") or "4"),
+            "dotted": entry.get("dotted", False),
+            "units": entry.get("units"),
+        }
+        for _f in _ENTRY_PASSTHROUGH_FIELDS:
+            if _f in entry:
+                out[_f] = entry[_f]
+        return out
+
+    def _template_entries(voice_name: str, template: list) -> tuple[list[dict], list[dict]]:
+        """Rebuild one voice's entries from the input rhythm template so the
+        original note durations survive the beat-level solver round-trip.
+
+        The solver works at one note per beat, so a whole note in the input
+        becomes 4 identical quarter beats in ``measures_data``.  This walks
+        the template (per-measure ``(entry, beat_count)``) and merges those
+        beats back into a single entry with the original duration/dotted/units.
+        Pitches come from the solver output (authoritative for the anchored
+        voice); only the rhythm is restored from the template.
+        """
+        try:
+            tmpl_rows = _appjs_measures_rhythm_template(template, request.timeSignature)
+        except ValueError:
+            # Off-grid input already rejected upstream; degrade to per-beat.
+            tmpl_rows = []
+        flat_entries: list[dict] = []
+        per_measure: list[dict] = []
         for mi, m in enumerate(measures_data):
             beats_in_measure = m.get("beats", [])
-            per_measure.append({
-                "number": mi + 1,
-                "entries": [_beat_to_entry_dict(voice_name, b) for b in beats_in_measure],
-            })
+            row = tmpl_rows[mi] if mi < len(tmpl_rows) else []
+            entries: list[dict] = []
+            cursor = 0
+            for entry, n_beats in row:
+                seg = beats_in_measure[cursor:cursor + n_beats]
+                cursor += n_beats
+                if entry.get("kind") == "rest":
+                    entries.append(_rest_entry_from_template(entry))
+                    continue
+                # P0-2: 锚定声部直接用输入模板的音高拼写 (输入拼写就是对的),
+                # 不用 solver 的 flat-first 重拼写 (否则升号调里 C# 会变 Db).
+                # 只有输入没给音高时才退回 solver 输出的音.
+                src_pitch = (entry.get("pitches") or [{}])[0] if entry.get("pitches") else None
+                if src_pitch and src_pitch.get("step"):
+                    step = src_pitch.get("step")
+                    oct_ = src_pitch.get("octave")
+                    acc = src_pitch.get("accidental", "")
+                    display = src_pitch.get("display") or f"{step}{acc}{oct_}"
+                else:
+                    pitches = [b.get(voice_name) for b in seg if b.get(voice_name)]
+                    if not pitches:
+                        entries.append(_rest_entry_from_template(entry))
+                        continue
+                    step, acc, oct_ = _parse_note_name(pitches[0])
+                    display = pitches[0]
+                note_entry = {
+                    "kind": "note",
+                    "pitches": [{
+                        "step": step,
+                        "octave": oct_,
+                        "accidental": acc,
+                        "display": display,
+                    }],
+                    "duration": str(entry.get("duration") or "4"),
+                    "dotted": entry.get("dotted", False),
+                    "units": entry.get("units"),
+                }
+                # 透传修饰音/演奏记号 (grace/ornament/articulation/fermata/...)
+                for _f in _ENTRY_PASSTHROUGH_FIELDS:
+                    if _f in entry:
+                        note_entry[_f] = entry[_f]
+                entries.append(note_entry)
+            # Defensive: if the template under-covered the measure, pad the
+            # remaining beats with plain quarter-note entries.
+            if cursor < len(beats_in_measure):
+                entries.extend(
+                    _beat_to_entry_dict(voice_name, b)
+                    for b in beats_in_measure[cursor:]
+                )
+            per_measure.append({"number": mi + 1, "entries": entries})
+            flat_entries.extend(entries)
+        return flat_entries, per_measure
+
+    def voice_track(voice_name: str, template: list | None = None) -> dict:
+        if template is not None:
+            entries, per_measure = _template_entries(voice_name, template)
+        else:
+            entries = [_beat_to_entry_dict(voice_name, b) for b in flat_beats]
+            per_measure = []
+            for mi, m in enumerate(measures_data):
+                beats_in_measure = m.get("beats", [])
+                per_measure.append({
+                    "number": mi + 1,
+                    "entries": [_beat_to_entry_dict(voice_name, b) for b in beats_in_measure],
+                })
         return {
             "id": voice_name,
             "name": voice_name.capitalize(),
@@ -596,11 +733,17 @@ def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartReq
             # P18.5: 置信度 0-100% + 依据列表 — 这是用户要的"百分比依据".
             "confidence": summary.get("confidence"),
             "confidenceEvidence": summary.get("confidenceEvidence", []),
+            # P2: 被降级合成的小节 (1-indexed), 前端据此标 ⚠.
+            "degradedMeasures": summary.get("degradedMeasures", []),
         },
         "fourPart": {
             "timeSignature": request.timeSignature,
-            "voices": [voice_track("soprano"), voice_track("alto"),
-                       voice_track("tenor"), voice_track("bass")],
+            "voices": [
+                voice_track("soprano", melody_rhythm if request.questionType != "bass" else None),
+                voice_track("alto"),
+                voice_track("tenor"),
+                voice_track("bass", bass_rhythm if request.questionType == "bass" else None),
+            ],
             "qualityStatus": "pass" if summary.get("qualify") else "warn",
             "harmonies": harmonies_per_measure,
             # P18.7: explanation 必须传 array, 前端 (answer.explanation || []).map(...)
@@ -625,12 +768,21 @@ def _solver_to_four_part_response(solver_result_dict: dict, request: FourPartReq
     }
 
 
-def _safe_four_part_error_response(request: FourPartRequest, user_message: str, internal: str | None = None) -> dict:
+def _safe_four_part_error_response(
+    request: FourPartRequest,
+    user_message: str,
+    internal: str | None = None,
+    error_code: str = "SOLVER_ERROR",
+) -> dict:
     """P18.6: build a graceful 200 response when the solver fails.
 
     Returns a fourPart block with empty voices + the user-facing message
     in `warnings`.  The frontend renders this as a clean red error box,
     never a raw Python exception.
+
+    P5-3: ``error_code`` 是稳定的机器可读错误码 (EMPTY_MELODY / EMPTY_BASS /
+    OUT_OF_RANGE / BAD_DURATION / SOLVER_ERROR), 前端据此映射文案和动作,
+    不再靠解析中文字符串.
 
     The `internal` arg is for server-side logs only — it must not leak
     to the user.
@@ -641,6 +793,7 @@ def _safe_four_part_error_response(request: FourPartRequest, user_message: str, 
     key_name = key.split()[0] if key else "C"
     key_mode = key.split()[1] if len(key.split()) > 1 else "major"
     return {
+        "errorCode": error_code,
         "source": {
             "engine": "sposobin-solver",
             # P2.6-C3 (2026-08-15): mirror the success-path version
@@ -678,6 +831,37 @@ def _safe_four_part_error_response(request: FourPartRequest, user_message: str, 
     }
 
 
+def _classify_value_error(msg: str, question_type: str) -> str:
+    """P5-3: 把 ValueError 文案归类为稳定的 errorCode."""
+    if "拍号" in msg or "time signature" in msg.lower():
+        return "BAD_TIME_SIGNATURE"
+    if "empty" in msg.lower() or "没有" in msg:
+        return "EMPTY_BASS" if question_type == "bass" else "EMPTY_MELODY"
+    if "range" in msg.lower() or "音域" in msg or "范围" in msg:
+        return "OUT_OF_RANGE"
+    if ("网格" in msg or "时值" in msg or "超拍" in msg
+            or "无法落到" in msg or "落格" in msg):
+        return "BAD_DURATION"
+    return "SOLVER_ERROR"
+
+
+def _public_value_error_message(error_code: str, question_type: str) -> str:
+    range_message = (
+        "输入低音超出低音声部的可用音域范围，请调整后重试。"
+        if question_type == "bass"
+        else "输入旋律超出女高音声部的可用音域范围，请调整后重试。"
+    )
+    messages = {
+        "EMPTY_MELODY": "旋律为空，请先输入至少一个音符。",
+        "EMPTY_BASS": "低音为空，请先输入至少一个低音。",
+        "OUT_OF_RANGE": range_message,
+        "BAD_DURATION": "小节时值或网格数量不正确，请检查拍号与音符时值。",
+        "BAD_TIME_SIGNATURE": "拍号格式无效，请使用如 4/4、3/4 的格式。",
+        "SOLVER_ERROR": "输入数据无法用于和声求解，请检查调号、拍号和音符。",
+    }
+    return messages[error_code]
+
+
 @app.post("/solve-melody")
 def solve_melody_endpoint(request: FourPartRequest) -> dict:
     """Level 1 endpoint: use the Sposobin solver (P0-P7 + P8) to harmonize
@@ -693,6 +877,11 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     # P8: bass-given mode.  Pull the bass line from the request, pass
     # it to the solver.  Melody can still be present (used as soft
     # context for NCT classification) but is not enforced.
+    if request.questionType not in ("melody", "bass"):
+        return _safe_four_part_error_response(
+            request, "题型必须是 melody 或 bass。", error_code="BAD_QUESTION_TYPE"
+        )
+
     bass_for_solver: list[list] | None = None
     if request.questionType == "bass":
         bass_for_solver = request.bassMeasures
@@ -701,7 +890,8 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         if not bass_for_solver:
             # P18.6: 用友好 message + 200, 不要让前端看到 "HTTP 400" 错误.
             return _safe_four_part_error_response(
-                request, "低音题需要在「3 五线谱制谱」区下方低音谱表 (声部 2) 输入低音序列, 再生成四部和声参考答案."
+                request, "低音题需要在「3 五线谱制谱」区下方低音谱表 (声部 2) 输入低音序列, 再生成四部和声参考答案.",
+                error_code="EMPTY_BASS",
             )
 
     # Convert app.js format → solver format
@@ -720,7 +910,8 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     if not measures_for_solver and bass_for_solver is None:
         # P18.6: 用友好 message + 200, 不要让前端看到 "HTTP 400" 错误.
         return _safe_four_part_error_response(
-            request, "旋律题需要在「3 五线谱制谱」区用鼠标点输入旋律, 或在下方文本框填好后点「填入到五线谱」按钮, 再生成四部和声参考答案."
+            request, "旋律题需要在「3 五线谱制谱」区用鼠标点输入旋律, 或在下方文本框填好后点「填入到五线谱」按钮, 再生成四部和声参考答案.",
+            error_code="EMPTY_MELODY",
         )
     if bass_for_solver is not None:
         # P8 review: regardless of whether the user passed melodyMeasures,
@@ -737,15 +928,29 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         ]
 
     try:
-        melody_pitches = _appjs_measures_to_solver_melody(measures_for_solver)
-        kwargs: dict = {}
+        # B1: 网格细分因子由"活跃输入"的最细时值决定 (旋律题看旋律, 低音题看低音).
+        subdiv_source = bass_for_solver if bass_for_solver is not None else measures_for_solver
+        kwargs: dict = {
+            "subdivision": _appjs_measures_subdivision(subdiv_source, request.timeSignature),
+        }
+        if bass_for_solver is not None:
+            converted_bass = _appjs_measures_to_solver_bass(
+                bass_for_solver, request.timeSignature
+            )
+            # Durations expand entries into solver cells. Build the placeholder
+            # soprano after that expansion so held bass notes cannot make the
+            # two per-measure grids diverge.
+            melody_pitches = [[None] * len(measure) for measure in converted_bass]
+            kwargs["bass_pitches"] = converted_bass
+        else:
+            melody_pitches = _appjs_measures_to_solver_melody(
+                measures_for_solver, request.timeSignature
+            )
         if request.keyChanges:
             # P7.5: pass modulation points as [(measure_idx, key_name), ...]
             kwargs["key_changes"] = [
                 (int(kc[0]), kc[1]) for kc in request.keyChanges
             ]
-        if bass_for_solver is not None:
-            kwargs["bass_pitches"] = _appjs_measures_to_solver_bass(bass_for_solver)
         # P17: chord pool profile.  'auto' or None → server picks based on
         # the key signature accidentals.  Otherwise the user picked one
         # explicitly in the UI (see app.js chordPoolProfile select).
@@ -753,27 +958,42 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         if profile == "auto":
             profile = _auto_pick_profile(request.key)
         kwargs["chord_pool_profile"] = profile
+        # 阶段0: beam 参数由 SOLVER_VERSION 决定 (默认 v1.6 K=50 / v1.5 K=3).
+        kwargs.setdefault("beam_k", _SOLVER_BEAM_K)
+        kwargs.setdefault("top_n", _SOLVER_TOP_N)
         result = sposobin_solver.solve_melody(
             request.key, request.timeSignature, melody_pitches,
             **kwargs,
         )
         solver_dict = result.to_dict()
-        return _solver_to_four_part_response(solver_dict, request)
+        # Pass the raw input entries through as the rhythm template so the
+        # anchored voice's original durations survive the round-trip.
+        return _solver_to_four_part_response(
+            solver_dict, request,
+            melody_rhythm=measures_for_solver,
+            bass_rhythm=bass_for_solver,
+        )
     except ValueError as exc:
         # Common case: melody / bass note out of range, or empty input.
         # P18.6: return 200 + safe empty fourPart + warning, never 422/500
-        # with raw Python internals.  Frontend already shows a clean error.
+        # with raw Python internals.  P5-3: 归类为稳定 errorCode.
         msg = str(exc)
         if not isinstance(msg, str):
             msg = repr(exc)
-        return _safe_four_part_error_response(request, msg)
+        error_code = _classify_value_error(msg, request.questionType)
+        return _safe_four_part_error_response(
+            request, _public_value_error_message(error_code, request.questionType),
+            internal=f"{type(exc).__name__}: {msg}",
+            error_code=error_code,
+        )
     except Exception as exc:
         # P18.6: catch ALL exceptions.  Never let a Python internal error
         # like "list index out of range" leak to the user as the response
         # detail.  The frontend should never see a raw traceback or
         # Python exception message — only a friendly Chinese message.
         msg = f"和声生成遇到内部错误（{type(exc).__name__}），请重试或换一道题试试。"
-        return _safe_four_part_error_response(request, msg, internal=msg)
+        return _safe_four_part_error_response(request, msg, internal=msg,
+                                              error_code="SOLVER_ERROR")
 
 
 def _auto_pick_profile(key: str) -> str:
@@ -791,9 +1011,8 @@ def _auto_pick_profile(key: str) -> str:
         k = sposobin_solver.Key.from_name(key)
     except Exception:
         return "full_p0-p7"
-    # Local sharps table — solver.MAJOR_TO_SHARPS has incorrect values
-    # for F/Bb/Eb/Ab (encodes them as Db/C# instead of flat counts), so
-    # we maintain our own correct circle-of-fifths mapping here.
+    # 本地五度圈表 (solver.MAJOR_TO_SHARPS 的降号值已修正, 这里保留一份
+    # 独立映射以防将来回退; 两者现在一致).
     MAJOR_SHARPS = {
         0: 0,    # C
         7: 1,    # G
@@ -912,10 +1131,6 @@ def explain_harmony(request: ExplainRequest) -> dict:
         }
 
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8765)
-
-
 # ---------------------------------------------------------------------------
 # P21.6: Music Theory Agent Runtime Layer
 # ---------------------------------------------------------------------------
@@ -925,6 +1140,17 @@ from typing import Any
 
 # P21.6: trace 落盘目录
 AGENT_TRACES_DIR = CURRENT_DIR / "data" / "agent_traces"
+_TRACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _trace_path(trace_id: str) -> Path:
+    if not _TRACE_ID_RE.fullmatch(trace_id):
+        raise ValueError("invalid trace id")
+    root = AGENT_TRACES_DIR.resolve()
+    path = (root / f"{trace_id}.json").resolve()
+    if path.parent != root:
+        raise ValueError("invalid trace path")
+    return path
 
 
 def _save_trace(trace_id: str, payload: dict[str, Any]) -> bool:
@@ -936,7 +1162,7 @@ def _save_trace(trace_id: str, payload: dict[str, Any]) -> bool:
     """
     try:
         AGENT_TRACES_DIR.mkdir(parents=True, exist_ok=True)
-        path = AGENT_TRACES_DIR / f"{trace_id}.json"
+        path = _trace_path(trace_id)
         if path.exists():
             return False
         # atomic write: 写 .tmp 再 rename 防中断半成品
@@ -952,7 +1178,7 @@ def _save_trace(trace_id: str, payload: dict[str, Any]) -> bool:
 def _load_trace(trace_id: str) -> dict[str, Any] | None:
     """读 trace JSON。返回 None=不存在 / IO 失败。"""
     try:
-        path = AGENT_TRACES_DIR / f"{trace_id}.json"
+        path = _trace_path(trace_id)
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
@@ -967,8 +1193,8 @@ class AgentExplainRequest(BaseModel):
     输入: score + melody + key + style_id + time_signature。
     输出: trace_id + AgentResult.to_dict()。
     """
-    score: dict[str, Any] = {}
-    melody: list[dict[str, Any]] = []
+    score: dict[str, Any] = Field(default_factory=dict)
+    melody: list[dict[str, Any]] = Field(default_factory=list)
     key: str = "C major"
     styleId: str = "sposobin"
     timeSignature: str = "4/4"
@@ -1007,6 +1233,16 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
     # P21.6 行为: 强制 styleId = sposobin（V1 默认，未来 multi-style 扩展）
     style_id = request.styleId or "sposobin"
     trace_id = request.traceId or str(uuid.uuid4())
+    if not _TRACE_ID_RE.fullmatch(trace_id):
+        return {
+            "traceId": None,
+            "agentAvailable": True,
+            "explanation": "",
+            "trace": {"steps": [], "toolCallCount": 0, "style": style_id},
+            "rulesUsed": [],
+            "casesCited": [],
+            "errors": ["traceId 只能包含字母、数字、下划线和连字符，且最长 128 字符。"],
+        }
 
     try:
         agent = MusicTheoryAgent()
@@ -1068,6 +1304,12 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
 @app.get("/agent/trace/{trace_id}")
 def agent_get_trace(trace_id: str) -> dict[str, Any]:
     """P21.6: 读 trace JSON。404 友好（trace 不存在）。"""
+    if not _TRACE_ID_RE.fullmatch(trace_id):
+        return {
+            "traceId": trace_id,
+            "found": False,
+            "error": "traceId 格式无效",
+        }
     data = _load_trace(trace_id)
     if data is None:
         return {
@@ -1076,3 +1318,7 @@ def agent_get_trace(trace_id: str) -> dict[str, Any]:
             "error": "trace 不存在或 IO 失败",
         }
     return {"found": True, **data}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8765)

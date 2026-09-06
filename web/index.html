@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>乐谱分析工具</title>
-    <link rel="stylesheet" href="styles.css?v=99" />
+    <link rel="stylesheet" href="styles.css?v=100" />
   </head>
   <body>
     <main class="app">
@@ -34,6 +34,15 @@
         </header>
 
         <section class="upload-panel view-panel" data-view="upload" id="dropZone">
+          <div class="xml-file-list-panel">
+            <div class="xml-file-list-header">
+              <span class="xml-file-list-title">📚 XML 例题库</span>
+              <input id="xmlFileSearch" type="text" placeholder="搜索例题：ch4-01 / f minor" />
+              <button id="xmlFileSearchButton" type="button">搜索</button>
+              <span id="xmlFileListMeta" class="xml-file-list-meta"></span>
+            </div>
+            <div id="xmlFileList" class="xml-file-list"></div>
+          </div>
           <input id="fileInput" type="file" accept=".musicxml,.xml,.mxl,.mid,.midi,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.pdf" />
           <div class="upload-icon" aria-hidden="true">♩</div>
           <h2>上传乐谱文件</h2>
@@ -927,9 +936,9 @@
     </main>
     <script src="vendor/vexflow/vexflow.js"></script>
     <!-- P22.4-B.2: CoordinateSystem v1 (统一坐标层) — 必须在 app.js 前加载 -->
-    <script src="coordinate-system.js?v=99"></script>
+    <script src="coordinate-system.js?v=100"></script>
     <!-- P22.5-B.1: Score Model (数据契约层) — 必须在 app.js 前加载 -->
-    <script src="score-model.js?v=99"></script>
-    <script src="app.js?v=99"></script>
+    <script src="score-model.js?v=100"></script>
+    <script src="app.js?v=102"></script>
   </body>
 </html>

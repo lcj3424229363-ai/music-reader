@@ -1,27 +1,23 @@
-"""test_editor_to_solver.py — P22 第一刀验收测试
-
-验证从 server.py 抽出的 editor_to_solver 模块行为与原版完全一致.
+"""test_editor_to_solver.py — 转换层验收测试 (含 B1 细分网格).
 
 覆盖:
-  1. P0 课本例题 (C 大调 I-IV-V-I): 4 measures × 4 beats, 音高序列正确
-  2. 全音符 / 二分音符 / 四分音符各自在 4/4 的 beat 数
-  3. 8 个八分音符 -> 8 beats (确认 Bug #1 仍存在, 留给第二刀)
-  4. 4 个不同 pitch 四分音符 -> 4 beats 顺序正确
-  5. rest entry -> None beat
-  6. bass 转换 = melody 转换 (P8 行为)
+  1. P0 课本例题: 4 measures × 4 beats, 音高序列正确 (S=1 向后兼容)
+  2. 全音符 / 二分音符 / 四分音符各自在 4/4 的格数
+  3. 8 个八分音符 -> S=2, 8 cells (B1 支持八分)
+  4. 4 个不同 pitch 四分音符 -> 4 cells 顺序正确
+  5. rest entry -> None cell
+  6. bass 转换 = melody 转换
   7. 和弦 -> 选 topmost pitch (soprano)
-  8. 升降号 (# / b / natural) - solver flat-first 约定 (F# 存为 Gb)
+  8. 升降号 (# / b / natural) - solver flat-first 约定
   9. rest entry -> None note
- 10. 附点四分音符 -> 2 beats (1.5 round)
-
-总: 10 个测试, 验收 editor_to_solver 抽出行为不变.
+ 10. 附点四分 + 八分 -> S=2, 4 cells (附点节奏支持)
 """
 import pytest
 
 import solver as sposobin_solver
 from editor_to_solver import (
     appjs_entry_to_soprano_note,
-    appjs_entry_to_solver_beats,
+    appjs_measures_subdivision,
     appjs_measures_to_solver_bass,
     appjs_measures_to_solver_melody,
 )
@@ -135,18 +131,14 @@ def test_four_quarters_different_pitch_4_beats_in_order():
     assert [n.name for n in m[0]] == ["C4", "D4", "E4", "F4"]
 
 
-def test_eight_eighths_overcount_known_bug():
-    """Bug #1 验收: 8 eighth notes (4/4) -> 8 beats (应 4 beats).
-
-    抽出后行为与原 server.py 一致. 第二刀将修此 bug.
-    """
+def test_eight_eighths_expand_to_eight_cells():
+    """B1: 8 eighth notes (4/4) → S=2, 8 cells (八分现已支持)."""
     m = appjs_measures_to_solver_melody([
         [make_note_entry("C", 4, "8")] * 8
     ])
-    # 当前: 8 beats (overcount, _appjs_entry_to_solver_beats 把 0.5 round 到 1)
-    # 第二刀: 期望 4 beats
-    assert len(m[0]) == 8, \
-        f"Test pins known bug: 8 eighths -> 8 beats. P22 第二刀将改为 4 beats."
+    assert appjs_measures_subdivision([[make_note_entry("C", 4, "8")] * 8], "4/4") == 2
+    assert len(m[0]) == 8
+    assert all(n.name == "C4" for n in m[0])
 
 
 def test_rest_entry_is_none_beat():
@@ -215,17 +207,22 @@ def test_rest_entry_returns_none_note():
     assert appjs_entry_to_soprano_note(rest) is None
 
 
-def test_dotted_quarter_rounds_to_2_beats():
-    """附点四分音符 (1.5 quarter) -> 2 beats (round)."""
-    entry = make_note_entry("C", 4, "4")
-    entry["dotted"] = 1
-    beats = appjs_entry_to_solver_beats(entry)
-    assert beats == 2, f"dotted quarter should round 1.5 to 2 beats, got {beats}"
+def test_dotted_quarter_plus_eighth_supported():
+    """附点四分 (12 单位) + 八分 (4 单位) → S=2, 4 cells (3+1), B1 支持附点."""
+    dotted_q = make_note_entry("C", 4, "4")
+    dotted_q["dotted"] = 1
+    dotted_q["units"] = 12  # 前端 unitsForDuration 会正确填 12
+    eighth = make_note_entry("D", 4, "8")
+    m = appjs_measures_to_solver_melody([[dotted_q, eighth]])
+    assert appjs_measures_subdivision([[dotted_q, eighth]], "4/4") == 2
+    assert len(m[0]) == 4
+    assert [n.name for n in m[0]] == ["C4", "C4", "C4", "D4"]
 
 
-def test_double_dotted_quarter_rounds_to_2_beats():
-    """双附点四分音符 (1.75 quarter) -> 2 beats (round)."""
+def test_double_dotted_quarter_alone_off_grid():
+    """双附点四分 (14 单位) 单独无法对齐拍点 -> ValueError (仍明确拒绝)."""
     entry = make_note_entry("C", 4, "4")
     entry["dotted"] = 2
-    beats = appjs_entry_to_solver_beats(entry)
-    assert beats == 2, f"double-dotted quarter should round 1.75 to 2 beats, got {beats}"
+    entry["units"] = 14
+    with pytest.raises(ValueError):
+        appjs_measures_to_solver_melody([[entry]])

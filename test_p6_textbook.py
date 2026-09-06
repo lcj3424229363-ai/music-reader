@@ -10,7 +10,8 @@ P6 polish — 剩余终止式 (Sposobin §46, §58) 对照测试
   - Lydian cadence (II → I in major) Sposobin §58
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import (solve_melody, detect_cadence, Key, Chord, Voicing, Note)
 
@@ -33,6 +34,10 @@ def test_detect_cadence(label: str, key_name: str,
     flag = '[OK]  ' if ok else '[MISS]'
     print(f'  {flag} {label:<60} → {got!r:<15} (expected {expected!r})')
     return ok
+
+
+# Script helper, not a parametrized pytest test case.
+test_detect_cadence.__test__ = False
 
 
 TEXTBOOK_CASES: list[dict] = [
@@ -119,4 +124,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

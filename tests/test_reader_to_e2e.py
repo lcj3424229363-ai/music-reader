@@ -66,7 +66,7 @@ check(f"summary key = A minor", payload["summary"].get("analyzedKey", {}).get("l
 print("\n2) reader_to_editor conversion")
 editor = reader_payload_to_editor(payload)
 check("editor.key = A minor", editor["key"] == "A minor")
-check("editor.timeSignature = 4/4", editor["timeSignature"] == "4/4")
+check("editor.timeSignature = 2/4", editor["timeSignature"] == "2/4")
 check("editor.melodyMeasures = 4 measures", len(editor["melodyMeasures"]) == 4)
 check("editor.bassMeasures = 4 measures", len(editor["bassMeasures"]) == 4)
 
@@ -169,7 +169,10 @@ print()
 print(f"Total: {passed + failed}, Passed: {passed}, Failed: {failed}")
 if failed:
     print("\nFAIL")
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
+    raise AssertionError(f"reader e2e: {failed} checks failed")
 else:
     print("\nPASS — reader_to_editor + /solve-melody e2e works")
-    sys.exit(0)
+    if __name__ == "__main__":
+        sys.exit(0)

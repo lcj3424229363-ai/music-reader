@@ -271,9 +271,9 @@ class TestSignatureStability(unittest.TestCase):
             "renderFourPartScore function should still exist",
         )
         # 内部调用 createVexNote 不变
-        self.assertIn(
-            "entries.map((entry) => createVexNote(",
+        self.assertRegex(
             content,
+            r"entries\.map\(\((\w+)\)\s*=>\s*createVexNote\(\1,",
             "renderFourPartScore should still call createVexNote per entry",
         )
 

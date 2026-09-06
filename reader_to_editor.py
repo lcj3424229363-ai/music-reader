@@ -75,14 +75,22 @@ def _pitch_to_pc_oct(pitch_name: str) -> tuple[int, int]:
 
 
 def _events_to_step_oct_acc(pitch: str) -> tuple[str, str, int]:
-    """E5 -> ('E', '', 5).  F#4 -> ('F', '#', 4).  Bb3 -> ('B', 'b', 3)."""
+    """E5 -> ('E', '', 5).  F#4 -> ('F', '#', 4).  Bb3 -> ('B', 'b', 3).
+
+    P22.5 supervise v3 (2026-08-17): music21 uses ASCII '-' for flat
+    (e.g. 'D-5' = Db5) instead of the typographic 'b' that musicXML uses.
+    Without the '-' branch, 'D-5' parses as step='D' + octave=int('-5')=-5,
+    which then trips solver's range check ("D-5 is out of soprano range
+    [A3..D6]").  Verified reproduction: ch23-06_F major m1 (XML has
+    D5 + Db5 quarter notes in voice 1; the Db5 round-tripped to octave=-5).
+    """
     if not pitch:
         return ("C", "", 4)
     step = pitch[0].upper()
     acc = ""
     idx = 1
-    if idx < len(pitch) and pitch[idx] in ("#", "b"):
-        acc = pitch[idx]
+    if idx < len(pitch) and pitch[idx] in ("#", "b", "-"):
+        acc = "b" if pitch[idx] == "-" else pitch[idx]
         idx += 1
     try:
         oct_ = int(pitch[idx:])
@@ -197,7 +205,18 @@ def _split_chord_to_voices(events_at_offset: list[dict]) -> tuple[str | None, fl
         notes.append((pc + oct_ * 12, pitch, float(dur_ql)))
     if not notes:
         return (None, None, None, None)
-    notes.sort()  # ascending by pitch
+    # P22.5 supervise v2 (2026-08-17): MUST sort only by pc+oct*12, NOT whole tuple.
+    # Old code did `notes.sort()` which silently included `dur_ql` as third
+    # sort key — when two notes share pitch (e.g. quarter + 16th at the same
+    # offset), the 16th (dur=0.332) would land *after* the quarter (dur=1.0)
+    # in ascending order, so `notes[-1]` picked the 16th dur as `top_dur`.
+    # Caller then used `top_dur` as `beat_dur` to advance cursor, which was
+    # too short → next offset 16ths (off=0.332, 0.664, 1.0) were silently
+    # dropped because they fell at or before the under-advanced cursor.
+    # Verified reproduction: ch23-06_F major m1 (XML 10 events) lost 5 to
+    # `_collect_per_part_voice_notes`, surfacing as BAD_DURATION in
+    # /solve-melody.
+    notes.sort(key=lambda n: n[0])  # ascending by pc+oct*12 only
     top_dur = notes[-1][2]
     top = notes[-1][1]
     if len(notes) > 1:
@@ -209,22 +228,89 @@ def _split_chord_to_voices(events_at_offset: list[dict]) -> tuple[str | None, fl
     return (top, top_dur, bot, bot_dur)
 
 
-def _collect_per_part_voice_notes(
+def _events_to_voice_entries(
+    events: list[dict],
+    capacity_ql: float,
+) -> list[tuple[str | None, float]]:
+    """Convert one voice's events (already filtered by voice id, assumed
+    in offset order or unsorted — we re-sort) into (pitch, dur_ql) tuples.
+
+    Pitch is None for a rest.  Rest is auto-inserted at the start, between
+    gaps, and to fill the tail of the measure.
+
+    P22.5 supervise v2 (2026-08-17): per-voice linearisation.  Replaces
+    the chord-top/bot model that wrongly merged a piano SATB main-melody
+    half note with its 16th-note grace ornaments (ch23-06_F major m1
+    was losing 5 of 8 events because the chord model short-circuited on
+    the shortest duration at each offset).
+    """
+    entries: list[tuple[str | None, float]] = []
+    cursor_ql = 0.0
+    sorted_events = sorted(
+        events,
+        key=lambda e: (float(e.get("offset", 0.0) or 0.0), -float(e.get("duration", 0.0) or 0.0)),
+    )
+    for e in sorted_events:
+        off = float(e.get("offset", 0.0) or 0.0)
+        if e.get("type") == "rest":
+            dur = float(e.get("duration", 1.0) or 1.0)
+            if off > cursor_ql:
+                entries.append((None, off - cursor_ql))
+            # rest 自身不产生 entry, 只 advance cursor
+                cursor_ql = off
+            rest_end = off + dur
+            if rest_end > cursor_ql:
+                entries.append((None, rest_end - cursor_ql))
+                cursor_ql = rest_end
+            continue
+        if e.get("type") == "note":
+            pitch = e.get("pitch")
+            if not pitch:
+                continue
+        elif e.get("type") == "chord":
+            # chord inside one voice: take top-most pitch as the voice's note
+            pitches = e.get("pitches") or []
+            if not pitches:
+                continue
+            pitch = max(pitches, key=_pitch_sort_key)
+        else:
+            continue
+        dur = float(e.get("duration", 1.0) or 1.0)
+        if off > cursor_ql:
+            entries.append((None, off - cursor_ql))
+        entries.append((pitch, dur))
+        cursor_ql = max(cursor_ql, off + dur)
+    if cursor_ql < capacity_ql:
+        entries.append((None, capacity_ql - cursor_ql))
+    return entries
+
+
+def _pitch_sort_key(pitch: str) -> tuple[int, int]:
+    """Sort key for pitch strings like 'C4', 'F#3', 'B-2' → (pc, oct*12).
+    Mirrors _pitch_to_pc_oct so chords inside a voice pick the highest
+    pitch deterministically.
+    """
+    pc, oct_ = _pitch_to_pc_oct(pitch)
+    if pc < 0 or oct_ < 0:
+        return (0, -1)
+    return (pc, oct_ * 12)
+
+
+def _has_voice_field(part: dict) -> bool:
+    """True if any event in this part has a non-None `voice` field."""
+    for m in part.get("measures", []):
+        for e in m.get("events", []):
+            if e.get("voice") is not None:
+                return True
+    return False
+
+
+def _collect_per_part_voice_notes_v1(
     part: dict,
 ) -> tuple[list[list[tuple[str | None, float]]], list[list[tuple[str | None, float]]]]:
-    """For one part, return (top_entries, bot_entries) per measure.
-
-    Each entries list contains (pitch, duration_ql) tuples.
-      - pitch is None for a rest (kind: "rest" in _make_entry).
-      - duration_ql is quarter fractions (1.0 = quarter, 2.0 = half, ...).
-
-    Rests are inserted automatically:
-      1. Between two notes with a gap (e.g. quarter note at offset 0 then next
-         note at offset 1.5 in a 4/4 measure → 0.5 quarter rest at offset 1.0).
-      2. At the end of an under-filled measure (e.g. 1 quarter note in a 4/4
-         measure → 3 quarter rest at the end to fill the bar).
-
-    P2.7.1: 之前只返 pitch 字符串, dur 全用 default quarter, rest 完全没生成.
+    """LEGACY: chord-top/bot model.  Kept as a fallback for tests / hand-crafted
+    payloads that don't carry a `voice` field.  See `_collect_per_part_voice_notes_v2`
+    for the SATB-correct per-voice path.
     """
     top_per_m: list[list[tuple[str | None, float]]] = []
     bot_per_m: list[list[tuple[str | None, float]]] = []
@@ -247,8 +333,12 @@ def _collect_per_part_voice_notes(
                 top_entries.append((None, gap_ql))
                 bot_entries.append((None, gap_ql))
             # 拍点上: top (S/T) + bot (A/B)
-            # 同 offset 多 voice dur 应该相同 (chord), 用 top_dur 作为本拍 dur
-            beat_dur = top_dur if top_dur is not None else (bot_dur if bot_dur is not None else 1.0)
+            # P22.5 supervise v2 (2026-08-17): beat_dur 必须用 max(top_dur, bot_dur)
+            # 当同 offset 多 voice dur 不同时 (如 quarter + 16th),
+            # 用 top_dur 单独推 cursor 会漏掉 bot 那个长 dur 的延续部分.
+            # 用 max 保证 cursor 至少覆盖到最长 note 的尾部.
+            candidates = [d for d in (top_dur, bot_dur) if d is not None]
+            beat_dur = max(candidates) if candidates else 1.0
             if top:
                 top_entries.append((top, beat_dur))
             if bot:
@@ -271,6 +361,61 @@ def _collect_per_part_voice_notes(
         top_per_m.append(top_entries)
         bot_per_m.append(bot_entries)
     return top_per_m, bot_per_m
+
+
+def _collect_per_part_voice_notes_v2(
+    part: dict,
+) -> tuple[list[list[tuple[str | None, float]]], list[list[tuple[str | None, float]]]]:
+    """P22.5 supervise v2 (2026-08-17): per-voice split for piano SATB.
+
+    Returns (top_entries, bot_entries) per measure, where:
+      - top = events from the lowest-numbered voice in this part
+              (e.g. voice '1' = the primary / upper-line voice in a piano
+              SATB treble staff)
+      - bot = events from the second-lowest voice in this part
+              (e.g. voice '2' = the secondary / lower-line voice)
+
+    This replaces the chord-top/bot model that incorrectly merged a
+    half-note main melody with 16th-note ornaments at the same offset
+    (ch23-06_F major m1 went from 3 entries to 8).  See
+    tests/_supervise_reader_bug.md for the full root-cause writeup.
+    """
+    top_per_m: list[list[tuple[str | None, float]]] = []
+    bot_per_m: list[list[tuple[str | None, float]]] = []
+    for m in part.get("measures", []):
+        capacity_ql = _measure_capacity_ql(m.get("timeSignature"))
+
+        by_voice: dict[str, list[dict]] = defaultdict(list)
+        for e in m.get("events", []):
+            v = e.get("voice")
+            # events without voice id go to a sentinel bucket so they're
+            # not lost (still surfaced through top)
+            by_voice[v if v is not None else "_no_voice"].append(e)
+
+        voice_ids_sorted = sorted(
+            by_voice.keys(),
+            key=lambda v: (v == "_no_voice", v),
+        )
+        top_voice = voice_ids_sorted[0] if voice_ids_sorted else None
+        bot_voice = voice_ids_sorted[1] if len(voice_ids_sorted) > 1 else None
+
+        top_events = by_voice.get(top_voice, []) if top_voice else []
+        bot_events = by_voice.get(bot_voice, []) if bot_voice else []
+
+        top_per_m.append(_events_to_voice_entries(top_events, capacity_ql))
+        bot_per_m.append(_events_to_voice_entries(bot_events, capacity_ql))
+    return top_per_m, bot_per_m
+
+
+def _collect_per_part_voice_notes(
+    part: dict,
+) -> tuple[list[list[tuple[str | None, float]]], list[list[tuple[str | None, float]]]]:
+    """Dispatch entry-point: per-voice split when events have `voice` field,
+    legacy chord-top/bot otherwise.
+    """
+    if _has_voice_field(part):
+        return _collect_per_part_voice_notes_v2(part)
+    return _collect_per_part_voice_notes_v1(part)
 
 
 def reader_payload_to_editor(payload: dict) -> dict:
@@ -302,13 +447,22 @@ def reader_payload_to_editor(payload: dict) -> dict:
     """
     summary = payload.get("summary", {}) or {}
     analyzed = summary.get("analyzedKey", {}) or {}
-    key = analyzed.get("label", "C major")
+    parts = payload.get("parts", [])
+    declared_key = None
+    if parts and parts[0].get("measures"):
+        first_key = parts[0]["measures"][0].get("keySignature") or {}
+        declared_key = first_key.get("declaredLabel")
+    analyzed_key = analyzed.get("label")
+    is_frontend_export = bool(parts and parts[0].get("name") == "Manual Score")
+    if declared_key and (is_frontend_export or not analyzed_key):
+        key = declared_key
+    else:
+        key = analyzed_key or declared_key or "C major"
 
     # P2.7.1 fix: time signature 从 parts[0].measures[0].timeSignature 取,
     # 不要从 summary.timeSignature fallback "4/4" — reader.py 不填这个字段,
     # 之前 ch4-01 真实 2/4 被默认成 4/4, 八分音符/十六分音符都错位.
     # 注意: reader.py 存的是 dict {"ratio": "2/4", "barDurationQuarterLength": 2.0}
-    parts = payload.get("parts", [])
     n_parts = len(parts)
     ts = None
     if n_parts and parts[0].get("measures"):

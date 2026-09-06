@@ -20,7 +20,8 @@ PDF p304 (课本 296)  ch44  延留音的各种形式
   - 课本: ch37 例 37-554 (♭D 大调 双重延留)
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import (
     solve_melody, Note, Chord, Key, Voicing,

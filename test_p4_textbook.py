@@ -12,7 +12,8 @@ P4 非和弦音 (Sposobin §17-22) 对照测试套件
   - (anticipation §21 暂未实现)
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import solve_melody, Note
 

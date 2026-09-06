@@ -11,7 +11,8 @@ P4.5 (Sposobin §21, §22, §57-58) 对照测试
   - Phrygian appoggiatura (Sposobin §57-58) — b2 在 V 拍是装饰音
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import solve_melody, Note
 

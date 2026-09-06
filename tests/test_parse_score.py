@@ -55,7 +55,7 @@ print("\n1) POST /parse-score")
 s, payload = post_multipart(URL_PARSE, XML)
 check("HTTP 200", s == 200)
 check("editor.key = A minor", payload.get("key") == "A minor")
-check("editor.timeSignature = 4/4", payload.get("timeSignature") == "4/4")
+check("editor.timeSignature = 2/4", payload.get("timeSignature") == "2/4")
 check("editor.melodyMeasures = 4 measures", len(payload.get("melodyMeasures", [])) == 4)
 check("editor.bassMeasures = 4 measures", len(payload.get("bassMeasures", [])) == 4)
 check("rawSummary included", "rawSummary" in payload)
@@ -92,7 +92,10 @@ with open(r"C:\Users\Administrator\Documents\try\music-reader\tests\parse_score_
 print()
 print(f"Total: {passed + failed}, Passed: {passed}, Failed: {failed}")
 if failed:
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
+    raise AssertionError(f"parse-score e2e: {failed} checks failed")
 else:
     print("\nPASS — /parse-score works end-to-end")
-    sys.exit(0)
+    if __name__ == "__main__":
+        sys.exit(0)

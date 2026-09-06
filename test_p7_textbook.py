@@ -24,7 +24,8 @@ P7 — Sposobin ch21-23, ch28-29, ch43 (PDF p127/135/143/194/201/298) 对照测�
   P7.6 — 跳进的辅助音 (no resolution 跳进离去) — ch43 p298
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import (solve_melody, Key, Chord, Voicing, Note,
                     candidate_chords, is_chord_tone, is_escape_tone,

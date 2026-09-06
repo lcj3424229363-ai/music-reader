@@ -153,20 +153,17 @@ npm install
 
 ## OMR 配置
 
-图片/PDF 会通过 Audiveris 转成 MusicXML，然后再进入 `reader.py`。
+图片会通过 homr 转成 MusicXML，然后再进入 `reader.py`。PDF 会先以
+300 DPI 逐页渲染，再交给 homr；多页识别结果会合并成一个 MusicXML。
 
-默认会查找：
-
-```text
-C:\Program Files\Audiveris\Audiveris.exe
-C:\Program Files (x86)\Audiveris\Audiveris.exe
-```
-
-也可以通过环境变量指定：
+默认从 `PATH` 和常见的用户安装目录查找 `homr`。也可以通过环境变量指定：
 
 ```powershell
-$env:AUDIVERIS_EXE='C:\Program Files\Audiveris\Audiveris.exe'
+$env:HOMR_EXE='C:\path\to\homr.exe'
 ```
+
+PDF 渲染优先使用 `pdftoppm`（Poppler）；未安装时自动回退到 PyMuPDF
+的 `fitz` 模块。两者都不可用时，接口会返回明确的 OMR 配置错误。
 
 OMR 只适合清晰印刷谱。识别结果会被标记为需要确认，后续应增加识别结果修正界面。
 

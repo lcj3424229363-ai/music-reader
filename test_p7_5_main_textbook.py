@@ -17,7 +17,8 @@ PDF p236 (课本 228)  ch34 §3-4 调性功能联系 + 一级关系调
   - 集成: solve_melody 边界 m 是 pivot, m_per_measure 切换, cadence 加 modulation_ 前缀
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import (
     solve_melody, Note, Chord, Key, KeyChange,

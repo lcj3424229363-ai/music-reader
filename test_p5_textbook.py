@@ -11,7 +11,8 @@ P5 (Sposobin §31-33, §55-58) 对照测试套件
   P5c — Mixolydian ♭VII (modal_b7) 借用
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import solve_melody, Note
 

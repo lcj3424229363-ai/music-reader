@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from editor_to_solver import (
     appjs_entry_to_soprano_note,
-    appjs_entry_to_solver_beats,
+    appjs_measures_subdivision,
     appjs_measures_to_solver_melody,
     appjs_measures_to_solver_bass,
     _APPJS_DURATION_TO_QUARTER,
@@ -105,19 +105,15 @@ solver_m = appjs_measures_to_solver_melody([m])
 check("1 measure × 4 entries → [[Note × 4]]", len(solver_m) == 1 and len(solver_m[0]) == 4)
 check("solver pc sequence C-D-E-F (0,2,4,5)", [n.pc for n in solver_m[0]] == [0, 2, 4, 5])
 
-# ---- Test 5: dotted quarter + 8th → 2 Note (duration in beat) ----
-print("\nTest 5: dotted quarter (1.5) + 8th (0.5) → 2 Note with right beats")
+# ---- Test 5: 附点四分 + 八分 → S=2, 4 cells (B1 支持附点节奏) ----
+print("\nTest 5: dotted quarter (12u) + 8th (4u) → S=2, 4 cells")
 m = [make_note_entry("C", 4, duration="4", dotted=1, units=12),  # dotted quarter
      make_note_entry("D", 4, duration="8", units=4)]             # eighth
-beats = appjs_entry_to_solver_beats(m[0]), appjs_entry_to_solver_beats(m[1])
-check("dotted quarter = 2 beats (rounded up)", beats[0] == 2, f"got {beats[0]}")
-check("eighth = 1 beat (rounded)", beats[1] == 1, f"got {beats[1]}")
+check("subdivision = 2", appjs_measures_subdivision([m], "4/4") == 2)
 solver_m = appjs_measures_to_solver_melody([m])
-check("2 entries → 3 beats (2+1) — but solver stores 1 Note per beat",
-      len(solver_m[0]) == 3, f"got {len(solver_m[0])} beats")
-# first 2 beats should be C (held), last beat should be D
-check("beats 0,1 = C (dotted quarter held)", solver_m[0][0].pc == 0 and solver_m[0][1].pc == 0)
-check("beat 2 = D (8th)", solver_m[0][2].pc == 2)
+check("2 entries → 4 cells (3+1)", len(solver_m[0]) == 4, f"got {len(solver_m[0])}")
+check("cells 0,1,2 = C (dotted quarter)", solver_m[0][0].pc == 0 and solver_m[0][1].pc == 0 and solver_m[0][2].pc == 0)
+check("cell 3 = D (eighth)", solver_m[0][3].pc == 2)
 
 # ---- Test 6: voice="1" vs voice="2" 转换结果相同 ----
 print("\nTest 6: voice='1' vs voice='2' 转换结果相同 (voice 字段被忽略)")
@@ -134,14 +130,14 @@ n_flat = appjs_entry_to_soprano_note(make_note_entry("B", 4, accidental="b"))
 check("F#4 has pc=6 (F is 5, +1 = 6)", n_sharp is not None and n_sharp.pc == 6, f"got {n_sharp}")
 check("Bb4 has pc=10 (B is 11, -1 = 10)", n_flat is not None and n_flat.pc == 10, f"got {n_flat}")
 
-# ---- Test 8: duration / units 一致性 ----
-print("\nTest 8: duration / units 转换表一致")
-for dur, expected_quarter in _APPJS_DURATION_TO_QUARTER.items():
-    expected_units = int(expected_quarter * 8)  # 1 quarter = 8 units
-    entry = make_note_entry("C", 4, duration=dur, units=expected_units)
-    beats = appjs_entry_to_solver_beats(entry)
-    check(f"duration='{dur}' ({expected_quarter}q) → {beats} beats, {expected_units} units",
-          beats >= 1)
+# ---- Test 8: 细分因子检测 (单一时值 → S) ----
+print("\nTest 8: 细分因子检测")
+for dur, q in [("1", 4.0), ("2", 2.0), ("4", 1.0), ("8", 0.5), ("16", 0.25)]:
+    units = int(q * 8)
+    entry = make_note_entry("C", 4, duration=dur, units=units)
+    s = appjs_measures_subdivision([[entry]], "4/4")
+    expected_s = 1 if q >= 1.0 else (2 if q >= 0.5 else 4)
+    check(f"duration='{dur}' ({q}q) → S={s}", s == expected_s, f"got S={s}")
 
 # ---- Test 9: bass path (appjs_measures_to_solver_bass) ----
 print("\nTest 9: bass path 跟 melody path 同 (P8 mode)")
@@ -172,7 +168,10 @@ print()
 print(f"Total: {passed + failed}, Passed: {passed}, Failed: {failed}")
 if failed:
     print("\nFAIL: editor_to_solver.py has issues — see failures above")
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
+    raise AssertionError(f"editor_to_solver roundtrip: {failed} checks failed")
 else:
     print("\nPASS: editor_to_solver.py roundtrip matches ENTRY_SCHEMA.md invariants")
-    sys.exit(0)
+    if __name__ == "__main__":
+        sys.exit(0)

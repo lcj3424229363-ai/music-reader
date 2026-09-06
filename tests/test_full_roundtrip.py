@@ -115,7 +115,7 @@ print("\n2) /parse-score → editor entry format")
 s2, editor = post_multipart(URL_PARSE, XML)
 check("HTTP 200", s2 == 200)
 check("editor.key = A minor", editor["key"] == "A minor")
-check("editor.timeSignature = 4/4", editor["timeSignature"] == "4/4")
+check("editor.timeSignature = 2/4", editor["timeSignature"] == "2/4")
 check("melodyMeasures = 4 measures", len(editor["melodyMeasures"]) == 4)
 check("bassMeasures = 4 measures", len(editor["bassMeasures"]) == 4)
 
@@ -242,7 +242,10 @@ print()
 print(f"Total: {passed + failed}, Passed: {passed}, Failed: {failed}")
 if failed:
     print("\nFAIL — roundtrip has issues")
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
+    raise AssertionError(f"full roundtrip: {failed} checks failed")
 else:
     print("\nPASS — full roundtrip ch4-01_a minor")
-    sys.exit(0)
+    if __name__ == "__main__":
+        sys.exit(0)

@@ -9,7 +9,8 @@ P7.5.1 — Key context per measure (骨架测试)
   4. 转调边界的 cadence 用新调 key 检测
 """
 import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from solver import (
     solve_melody, Note, Key, KeyChange,
