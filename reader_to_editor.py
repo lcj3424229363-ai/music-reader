@@ -47,6 +47,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from score_ir import analyze_editor_projection, score_ir_to_reader_parts, validate_score_ir
+
 
 def _pitch_to_pc_oct(pitch_name: str) -> tuple[int, int]:
     """E5 -> (4, 5).  F#4 -> (6, 4).  Bb3 -> (10, 3).
@@ -193,16 +195,20 @@ def _split_chord_to_voices(events_at_offset: list[dict]) -> tuple[str | None, fl
     """
     notes = []
     for e in events_at_offset:
-        if e.get("type") != "note":
+        if e.get("type") == "note":
+            pitches = [e.get("pitch")]
+        elif e.get("type") == "chord":
+            pitches = e.get("pitches") or []
+        else:
             continue
-        pitch = e.get("pitch", "")
-        if not pitch:
-            continue
-        pc, oct_ = _pitch_to_pc_oct(pitch)
-        if pc < 0 or oct_ < 0:
-            continue
-        dur_ql = e.get("duration", 1.0) or 1.0
-        notes.append((pc + oct_ * 12, pitch, float(dur_ql)))
+        dur_ql = float(e.get("duration", 1.0) or 1.0)
+        for pitch in pitches:
+            if not pitch:
+                continue
+            pc, oct_ = _pitch_to_pc_oct(pitch)
+            if pc < 0 or oct_ < 0:
+                continue
+            notes.append((pc + oct_ * 12, pitch, dur_ql))
     if not notes:
         return (None, None, None, None)
     # P22.5 supervise v2 (2026-08-17): MUST sort only by pc+oct*12, NOT whole tuple.
@@ -251,6 +257,10 @@ def _events_to_voice_entries(
         key=lambda e: (float(e.get("offset", 0.0) or 0.0), -float(e.get("duration", 0.0) or 0.0)),
     )
     for e in sorted_events:
+        # Grace notes do not consume solver time. ScoreIR retains them and the
+        # projection diagnostics disclose that the teaching editor omits them.
+        if e.get("grace"):
+            continue
         off = float(e.get("offset", 0.0) or 0.0)
         if e.get("type") == "rest":
             dur = float(e.get("duration", 1.0) or 1.0)
@@ -285,15 +295,24 @@ def _events_to_voice_entries(
     return entries
 
 
-def _pitch_sort_key(pitch: str) -> tuple[int, int]:
+def _pitch_sort_key(pitch: str) -> int:
     """Sort key for pitch strings like 'C4', 'F#3', 'B-2' → (pc, oct*12).
     Mirrors _pitch_to_pc_oct so chords inside a voice pick the highest
     pitch deterministically.
     """
     pc, oct_ = _pitch_to_pc_oct(pitch)
     if pc < 0 or oct_ < 0:
-        return (0, -1)
-    return (pc, oct_ * 12)
+        return -1
+    return oct_ * 12 + pc
+
+
+def _voice_sort_key(voice_id: str) -> tuple[int, int | str]:
+    if voice_id == "_no_voice":
+        return (2, voice_id)
+    try:
+        return (0, int(voice_id))
+    except (TypeError, ValueError):
+        return (1, str(voice_id))
 
 
 def _has_voice_field(part: dict) -> bool:
@@ -303,6 +322,23 @@ def _has_voice_field(part: dict) -> bool:
             if e.get("voice") is not None:
                 return True
     return False
+
+
+def _measure_voice_count(part: dict, measure_index: int) -> int:
+    measures = part.get("measures", []) or []
+    if measure_index >= len(measures):
+        return 0
+    return len({
+        str(event.get("voice") or "_no_voice")
+        for event in measures[measure_index].get("events", []) or []
+    })
+
+
+def _part_max_voice_count(part: dict) -> int:
+    return max(
+        (_measure_voice_count(part, index) for index, _ in enumerate(part.get("measures", []) or [])),
+        default=0,
+    )
 
 
 def _collect_per_part_voice_notes_v1(
@@ -382,6 +418,22 @@ def _collect_per_part_voice_notes_v2(
     """
     top_per_m: list[list[tuple[str | None, float]]] = []
     bot_per_m: list[list[tuple[str | None, float]]] = []
+    all_voice_ids = {
+        str(event.get("voice"))
+        for measure in part.get("measures", []) or []
+        for event in measure.get("events", []) or []
+        if event.get("voice") is not None
+    }
+    has_unvoiced = any(
+        event.get("voice") is None
+        for measure in part.get("measures", []) or []
+        for event in measure.get("events", []) or []
+    )
+    if has_unvoiced:
+        all_voice_ids.add("_no_voice")
+    stable_voice_ids = sorted(all_voice_ids, key=_voice_sort_key)
+    top_voice = stable_voice_ids[0] if stable_voice_ids else None
+    bot_voice = stable_voice_ids[1] if len(stable_voice_ids) > 1 else None
     for m in part.get("measures", []):
         capacity_ql = _measure_capacity_ql(m.get("timeSignature"))
 
@@ -390,14 +442,7 @@ def _collect_per_part_voice_notes_v2(
             v = e.get("voice")
             # events without voice id go to a sentinel bucket so they're
             # not lost (still surfaced through top)
-            by_voice[v if v is not None else "_no_voice"].append(e)
-
-        voice_ids_sorted = sorted(
-            by_voice.keys(),
-            key=lambda v: (v == "_no_voice", v),
-        )
-        top_voice = voice_ids_sorted[0] if voice_ids_sorted else None
-        bot_voice = voice_ids_sorted[1] if len(voice_ids_sorted) > 1 else None
+            by_voice[str(v) if v is not None else "_no_voice"].append(e)
 
         top_events = by_voice.get(top_voice, []) if top_voice else []
         bot_events = by_voice.get(bot_voice, []) if bot_voice else []
@@ -413,9 +458,139 @@ def _collect_per_part_voice_notes(
     """Dispatch entry-point: per-voice split when events have `voice` field,
     legacy chord-top/bot otherwise.
     """
-    if _has_voice_field(part):
+    distinct_voices = {
+        str(event.get("voice"))
+        for measure in part.get("measures", []) or []
+        for event in measure.get("events", []) or []
+        if event.get("voice") is not None
+    }
+    has_multitone_chord = any(
+        event.get("type") == "chord" and len(event.get("pitches") or []) > 1
+        for measure in part.get("measures", []) or []
+        for event in measure.get("events", []) or []
+    )
+    if _has_voice_field(part) and not (len(distinct_voices) <= 1 and has_multitone_chord):
         return _collect_per_part_voice_notes_v2(part)
     return _collect_per_part_voice_notes_v1(part)
+
+
+_ROLE_ORDER = ("soprano", "alto", "tenor", "bass")
+
+
+def _stream_pitch_midis(measures: list[list[tuple[str | None, float]]]) -> list[int]:
+    values = []
+    for measure in measures:
+        for pitch, _duration in measure:
+            if pitch is None:
+                continue
+            pc, octave = _pitch_to_pc_oct(pitch)
+            if pc >= 0 and octave >= 0:
+                values.append(pc + octave * 12)
+    return values
+
+
+def _stream_has_pitches(measures: list[list[tuple[str | None, float]]]) -> bool:
+    return bool(_stream_pitch_midis(measures))
+
+
+def _stream_median_midi(measures: list[list[tuple[str | None, float]]]) -> float:
+    values = sorted(_stream_pitch_midis(measures))
+    if not values:
+        return float("-inf")
+    middle = len(values) // 2
+    if len(values) % 2:
+        return float(values[middle])
+    return (values[middle - 1] + values[middle]) / 2.0
+
+
+def _part_role_hint(part: dict) -> str | None:
+    text = f"{part.get('name', '')} {part.get('id', '')}".lower()
+    aliases = {
+        "soprano": ("soprano", "sop", "女高音"),
+        "alto": ("alto", "contralto", "女低音"),
+        "tenor": ("tenor", "男高音"),
+        "bass": ("bass", "basso", "男低音"),
+    }
+    for role, names in aliases.items():
+        if any(name in text for name in names):
+            return role
+    return None
+
+
+def _single_part_role(part: dict, measures: list[list[tuple[str | None, float]]]) -> tuple[str | None, str, str]:
+    hinted = _part_role_hint(part)
+    if hinted:
+        return hinted, "high", "part-label"
+    first_measure = next((m for m in part.get("measures", []) or [] if m.get("clef")), None)
+    active_clef = (first_measure or {}).get("clef") or {}
+    sign = str(active_clef.get("sign") or "").upper()
+    line = active_clef.get("line")
+    if sign == "G":
+        return "soprano", "high", "treble-clef"
+    if sign == "F":
+        return "bass", "high", "bass-clef"
+    if sign == "C" and line == 3:
+        return "alto", "high", "alto-clef"
+    if sign == "C" and line == 4:
+        return "tenor", "high", "tenor-clef"
+
+    median = _stream_median_midi(measures)
+    if median == float("-inf"):
+        return None, "low", "no-pitched-events"
+    if median >= 60:
+        return "soprano", "low", "pitch-range"
+    if median <= 48:
+        return "bass", "low", "pitch-range"
+    return None, "low", "overlapping-inner-voice-range"
+
+
+def _entries_for_role(
+    measures: list[list[tuple[str | None, float]]], role: str
+) -> list[list[dict]]:
+    return [[_make_entry(pitch, role, duration) for pitch, duration in measure] for measure in measures]
+
+
+def _assess_key(parts: list[dict], analyzed: dict) -> dict[str, Any]:
+    first_key = None
+    if parts and parts[0].get("measures"):
+        first_key = parts[0]["measures"][0].get("keySignature") or None
+    analyzed_label = analyzed.get("label")
+    correlation = float(analyzed.get("correlation") or 0.0)
+    declared_label = first_key.get("declaredLabel") if first_key else None
+    canonical_export = bool(parts and parts[0].get("name") == "Manual Score")
+    if declared_label and (canonical_export or analyzed_label == declared_label):
+        return {
+            "key": declared_label,
+            "confidence": "high",
+            "source": "explicit-key",
+            "correlation": correlation,
+            "candidates": [declared_label],
+        }
+    candidates = []
+    if first_key:
+        candidates = [
+            value for value in (first_key.get("majorName"), first_key.get("minorName"))
+            if value
+        ]
+    if declared_label and analyzed_label in candidates and analyzed_label != declared_label:
+        confidence = "medium" if correlation >= 0.75 else "low"
+        source = "explicit-mode-conflict"
+    elif candidates and analyzed_label in candidates:
+        confidence = "medium" if correlation >= 0.75 else "low"
+        source = "key-signature-plus-analysis"
+    elif candidates:
+        confidence = "low"
+        source = "key-signature-conflict"
+    else:
+        confidence = "medium" if correlation >= 0.8 else "low"
+        source = "pitch-analysis-only"
+    return {
+        "key": analyzed_label or (candidates[0] if candidates else None),
+        "confidence": confidence,
+        "source": source,
+        "correlation": correlation,
+        "candidates": candidates,
+    }
 
 
 def reader_payload_to_editor(payload: dict) -> dict:
@@ -447,12 +622,21 @@ def reader_payload_to_editor(payload: dict) -> dict:
     """
     summary = payload.get("summary", {}) or {}
     analyzed = summary.get("analyzedKey", {}) or {}
-    parts = payload.get("parts", [])
+    score_ir = payload.get("scoreIr")
+    if isinstance(score_ir, dict):
+        parts = score_ir_to_reader_parts(score_ir)
+        score_ir_validation = validate_score_ir(score_ir)
+        projection = analyze_editor_projection(score_ir)
+    else:
+        parts = payload.get("parts", [])
+        score_ir_validation = None
+        projection = None
     declared_key = None
     if parts and parts[0].get("measures"):
         first_key = parts[0]["measures"][0].get("keySignature") or {}
         declared_key = first_key.get("declaredLabel")
     analyzed_key = analyzed.get("label")
+    key_assessment = _assess_key(parts, analyzed)
     is_frontend_export = bool(parts and parts[0].get("name") == "Manual Score")
     if declared_key and (is_frontend_export or not analyzed_key):
         key = declared_key
@@ -479,32 +663,135 @@ def reader_payload_to_editor(payload: dict) -> dict:
     alto_measures:    list[list[dict]] = []
     tenor_measures:   list[list[dict]] = []
     bass_measures:    list[list[dict]] = []
+    unassigned_voices: list[dict[str, Any]] = []
+    voice_assignment: dict[str, Any] = {
+        "version": "satb-assignment-v1",
+        "method": "none",
+        "confidence": "low",
+        "roles": [],
+        "issues": [],
+    }
 
     if n_parts == 0:
         pass  # 全空
     elif n_parts == 1:
         # 单 part: 没法拆 alto/tenor, 只 S + B
         top_per, bot_per = _collect_per_part_voice_notes(parts[0])
-        soprano_measures = [[_make_entry(p, "soprano", d) for p, d in m] for m in top_per]
-        bass_measures    = [[_make_entry(p, "bass",    d) for p, d in m] for m in bot_per]
+        if _stream_has_pitches(bot_per):
+            soprano_measures = _entries_for_role(top_per, "soprano")
+            bass_measures = _entries_for_role(bot_per, "bass")
+            voice_assignment.update({
+                "method": "single-part-extremes",
+                "confidence": "medium",
+                "roles": [
+                    {"role": "soprano", "partIndex": 1, "source": "upper-stream"},
+                    {"role": "bass", "partIndex": 1, "source": "lower-stream"},
+                ],
+                "issues": ["A single part with multiple streams cannot prove inner SATB identity."],
+            })
+        else:
+            role, confidence, evidence = _single_part_role(parts[0], top_per)
+            if role == "soprano":
+                soprano_measures = _entries_for_role(top_per, role)
+            elif role == "alto":
+                alto_measures = _entries_for_role(top_per, role)
+            elif role == "tenor":
+                tenor_measures = _entries_for_role(top_per, role)
+            elif role == "bass":
+                bass_measures = _entries_for_role(top_per, role)
+            else:
+                unassigned_voices.append({
+                    "partIndex": 1,
+                    "reason": evidence,
+                    "measures": _entries_for_role(top_per, "unassigned"),
+                })
+            voice_assignment.update({
+                "method": "single-stream-classification",
+                "confidence": confidence,
+                "roles": ([{"role": role, "partIndex": 1, "source": evidence}] if role else []),
+                "issues": ([] if role else ["The single stream lies in an overlapping SATB range."]),
+            })
+    elif n_parts == 4 and all(_part_max_voice_count(part) <= 1 for part in parts):
+        # Choral MusicXML commonly stores S/A/T/B as four independent parts.
+        role_sources = []
+        for part in parts:
+            primary, _secondary = _collect_per_part_voice_notes(part)
+            role_sources.append(primary)
+        assigned: dict[str, int] = {}
+        labelled_parts: set[int] = set()
+        for part_index, part in enumerate(parts):
+            hint = _part_role_hint(part)
+            if hint and hint not in assigned:
+                assigned[hint] = part_index
+                labelled_parts.add(part_index)
+        remaining_parts = sorted(
+            (index for index in range(4) if index not in labelled_parts),
+            key=lambda index: _stream_median_midi(role_sources[index]),
+            reverse=True,
+        )
+        remaining_roles = [role for role in _ROLE_ORDER if role not in assigned]
+        for role, part_index in zip(remaining_roles, remaining_parts):
+            assigned[role] = part_index
+
+        soprano_measures = _entries_for_role(role_sources[assigned["soprano"]], "soprano")
+        alto_measures = _entries_for_role(role_sources[assigned["alto"]], "alto")
+        tenor_measures = _entries_for_role(role_sources[assigned["tenor"]], "tenor")
+        bass_measures = _entries_for_role(role_sources[assigned["bass"]], "bass")
+        voice_assignment.update({
+            "method": "labels-and-pitch-order",
+            "confidence": "high" if len(labelled_parts) == 4 else "medium",
+            "roles": [
+                {
+                    "role": role,
+                    "partIndex": assigned[role] + 1,
+                    "partId": parts[assigned[role]].get("id"),
+                    "medianMidi": _stream_median_midi(role_sources[assigned[role]]),
+                    "source": "part-label" if assigned[role] in labelled_parts else "pitch-order",
+                }
+                for role in _ROLE_ORDER
+            ],
+            "issues": ([] if len(labelled_parts) == 4 else ["Unlabelled parts were ordered by median pitch."]),
+        })
     else:
         # 2+ parts: part[0] 拆 S + A, part[-1] 拆 T + B
         s_per, a_per = _collect_per_part_voice_notes(parts[0])
-        t_per, b_per = _collect_per_part_voice_notes(parts[-1])
+        bass_part = parts[-1]
+        t_per, b_per = _collect_per_part_voice_notes(bass_part)
         soprano_measures = [[_make_entry(p, "soprano", d) for p, d in m] for m in s_per]
         alto_measures    = [[_make_entry(p, "alto",    d) for p, d in m] for m in a_per]
-        tenor_measures   = [[_make_entry(p, "tenor",   d) for p, d in m] for m in t_per]
-        bass_measures    = [[_make_entry(p, "bass",    d) for p, d in m] for m in b_per]
+        for measure_index, (top_measure, bottom_measure) in enumerate(zip(t_per, b_per)):
+            # A lone line on the lower staff is the bass anchor. If a second
+            # voice appears, the upper/lower pair maps to tenor/bass.
+            if not _stream_has_pitches([bottom_measure]):
+                tenor_source, bass_source = bottom_measure, top_measure
+            else:
+                tenor_source, bass_source = top_measure, bottom_measure
+            tenor_measures.append([_make_entry(p, "tenor", d) for p, d in tenor_source])
+            bass_measures.append([_make_entry(p, "bass", d) for p, d in bass_source])
+        voice_assignment.update({
+            "method": "upper-lower-staff-pairs",
+            "confidence": "medium",
+            "roles": [
+                {"role": "soprano", "partIndex": 1, "source": "upper-staff-primary"},
+                {"role": "alto", "partIndex": 1, "source": "upper-staff-secondary"},
+                {"role": "tenor", "partIndex": n_parts, "source": "lower-staff-primary"},
+                {"role": "bass", "partIndex": n_parts, "source": "lower-staff-secondary-or-only"},
+            ],
+            "issues": ([] if n_parts == 2 else ["Middle parts are not represented by the teaching editor."]),
+        })
 
     warnings = list(payload.get("warnings", []) or [])
 
-    return {
+    result = {
         "key": key,
+        "keyAssessment": key_assessment,
         "timeSignature": ts,
         "sopranoMeasures": soprano_measures,
         "altoMeasures":    alto_measures,
         "tenorMeasures":   tenor_measures,
         "bassMeasures":    bass_measures,
+        "voiceAssignment": voice_assignment,
+        "unassignedVoices": unassigned_voices,
         # Backward compat alias (老 client / 测试还在用 melodyMeasures)
         "melodyMeasures":  soprano_measures,
         "source": {
@@ -515,6 +802,11 @@ def reader_payload_to_editor(payload: dict) -> dict:
         },
         "warnings": warnings,
     }
+    if isinstance(score_ir, dict):
+        result["scoreIr"] = score_ir
+        result["scoreIrValidation"] = score_ir_validation
+        result["editorProjection"] = projection
+    return result
 
 
 if __name__ == "__main__":

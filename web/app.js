@@ -9,10 +9,20 @@ const readStatus = findEl("readStatus");
 const fileInput = findEl("fileInput");
 const pickButton = findEl("pickButton");
 const dropZone = findEl("dropZone");
+const autoSolveInput = findEl("autoSolveInput");
+const endToEndWorkflow = findEl("endToEndWorkflow");
+const workflowOverallStatus = findEl("workflowOverallStatus");
 const summaryList = findEl("summaryList");
 const measurePreview = findEl("measurePreview");
 const harmonyPreview = findEl("harmonyPreview");
 const warningList = findEl("warningList");
+const omrReviewPanel = findEl("omrReviewPanel");
+const omrReviewList = findEl("omrReviewList");
+const omrReviewStatus = findEl("omrReviewStatus");
+const applyOmrCorrectionsButton = findEl("applyOmrCorrectionsButton");
+const omrFinalMusicXmlInput = findEl("omrFinalMusicXmlInput");
+const submitOmrFinalButton = findEl("submitOmrFinalButton");
+const omrFinalStatus = findEl("omrFinalStatus");
 const manualButton = findEl("manualButton");
 const manualKey = findEl("manualKey");
 const manualTime = findEl("manualTime");
@@ -107,6 +117,8 @@ const scoreDataOutput = findEl("scoreDataOutput");
 const fourPartButton = findEl("fourPartButton");
 const questionTypeSelect = findEl("questionTypeSelect");
 const applyFourPartButton = findEl("applyFourPartButton");
+const downloadAnswerMusicXmlButton = findEl("downloadAnswerMusicXmlButton");
+const downloadAnswerSvgButton = findEl("downloadAnswerSvgButton");
 // P19: AI 教师讲解按钮
 const aiExplainButton = findEl("aiExplainButton");
 const aiExplanationPanel = findEl("aiExplanationPanel");
@@ -213,6 +225,12 @@ let measureRects = [];
 let previousTimeSignature = editorTime.value;
 let resizeTimer = null;
 let lastFourPartResult = null;
+let activeSourceProjection = null;
+let activeScoreIr = null;
+let activeOmrReview = null;
+let activeOmrRunId = null;
+let editorRevision = 0;
+let activeScoreIrRevision = null;
 
 // =====================================================================
 // P22.3 — editorState（输入态集中管理层）
@@ -443,6 +461,140 @@ function setError(message) {
   warningList.innerHTML = `<div class="warning-row">${escapeHtml(message)}</div>`;
 }
 
+const WORKFLOW_STEPS = ["recognition", "validation", "solver", "notation"];
+
+function setWorkflowStep(step, state, label) {
+  if (!endToEndWorkflow) return;
+  const index = WORKFLOW_STEPS.indexOf(step);
+  WORKFLOW_STEPS.forEach((name, stepIndex) => {
+    const row = endToEndWorkflow.querySelector(`[data-workflow-step="${name}"]`);
+    if (!row) return;
+    row.classList.remove("is-active", "is-complete", "is-blocked", "is-failed");
+    const status = row.querySelector("small");
+    if (stepIndex < index) {
+      row.classList.add("is-complete");
+      if (status) status.textContent = "完成";
+    } else if (stepIndex === index) {
+      if (state) row.classList.add(`is-${state}`);
+      if (status) status.textContent = label || "处理中";
+    } else if (status) {
+      status.textContent = "等待";
+    }
+  });
+  if (workflowOverallStatus) workflowOverallStatus.textContent = label || "处理中";
+}
+
+function resetWorkflowStatus() {
+  if (!endToEndWorkflow) return;
+  WORKFLOW_STEPS.forEach((name) => {
+    const row = endToEndWorkflow.querySelector(`[data-workflow-step="${name}"]`);
+    row?.classList.remove("is-active", "is-complete", "is-blocked", "is-failed");
+    const status = row?.querySelector("small");
+    if (status) status.textContent = "等待";
+  });
+  if (workflowOverallStatus) workflowOverallStatus.textContent = "等待文件";
+}
+
+function showWorkspaceView(view) {
+  const tab = document.querySelector(`.sidebar-link[data-view="${view}"]`);
+  if (tab) tab.click();
+}
+
+function workflowIssueMessage(workflow) {
+  return workflow?.issues?.[0]?.message || "当前输入需要人工确认。";
+}
+
+async function presentImportedWorkflow(editorPayload, { omr = false } = {}) {
+  const extraction = editorPayload?.exerciseExtraction || {};
+  const recommended = extraction.recommendedQuestionType;
+  if (questionTypeSelect && ["melody", "alto", "tenor", "bass"].includes(recommended)) {
+    questionTypeSelect.value = recommended;
+  }
+  const automatic = autoSolveInput?.checked !== false;
+  const workflow = editorPayload?.endToEnd;
+
+  if (omr && workflow) {
+    if (workflow.status === "ready") {
+      setWorkflowStep("validation", "complete", "识谱已就绪");
+      showWorkspaceView("editor");
+      return false;
+    }
+    if (workflow.status === "complete" && workflow.solution) {
+      setWorkflowStep("notation", "active", "正在生成答案谱");
+      showWorkspaceView("answer");
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const success = showFourPartResult(workflow.solution);
+      setWorkflowStep("notation", success ? "complete" : "failed", success ? "答案已生成" : "答案渲染失败");
+      return success;
+    }
+    if (workflow.status === "failed" && workflow.solution) {
+      setWorkflowStep("solver", "failed", "求解失败");
+      showWorkspaceView("answer");
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      showFourPartResult(workflow.solution);
+      return false;
+    }
+    const blockedStage = workflow.stage === "recognition" ? "validation" : "solver";
+    setWorkflowStep(blockedStage, "blocked", workflow.status === "selection-required" ? "需确认题型" : "需要人工复核");
+    showEditorMessage(workflowIssueMessage(workflow), "warning");
+    showWorkspaceView(workflow.stage === "recognition" ? "analysis" : "editor");
+    return false;
+  }
+
+  setWorkflowStep("validation", "complete", "谱面已校验");
+  if (!automatic) {
+    showWorkspaceView("editor");
+    return false;
+  }
+  if (!["melody", "alto", "tenor", "bass"].includes(recommended)) {
+    setWorkflowStep("solver", "blocked", "需确认题型");
+    showEditorMessage("已读入谱面，但无法无歧义判断是旋律题还是低音题。", "warning");
+    showWorkspaceView("editor");
+    return false;
+  }
+  const eligibility = editorPayload?.solverEligibility?.[recommended];
+  if (!eligibility?.eligible) {
+    setWorkflowStep("solver", "blocked", "输入需校正");
+    showEditorMessage(eligibility?.issues?.[0]?.message || "给定声部尚不能求解。", "warning");
+    showWorkspaceView("editor");
+    return false;
+  }
+  setWorkflowStep("solver", "active", "正在求解");
+  showWorkspaceView("answer");
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  const success = await submitFourPartAnswer();
+  setWorkflowStep(success ? "notation" : "solver", success ? "complete" : "failed", success ? "答案已生成" : "求解失败");
+  return success;
+}
+
+function showFourPartResult(result) {
+  lastFourPartResult = result;
+  renderFourPartAnswer(result);
+  const voices = result?.fourPart?.voices || [];
+  const isError = result?.summary?.status === "error" || voices.length === 0;
+  if (isError) {
+    if (fourPartStatus) {
+      fourPartStatus.classList.remove("status-ok");
+      fourPartStatus.classList.add("status-failed");
+      fourPartStatus.textContent = "失败";
+    }
+    if (applyFourPartButton) applyFourPartButton.disabled = true;
+    if (downloadAnswerMusicXmlButton) downloadAnswerMusicXmlButton.disabled = true;
+    if (downloadAnswerSvgButton) downloadAnswerSvgButton.disabled = true;
+    return false;
+  }
+  if (fourPartStatus) {
+    fourPartStatus.classList.remove("status-failed");
+    fourPartStatus.classList.add("status-ok");
+    const engine = result?.source?.engine || "sposobin-solver";
+    fourPartStatus.textContent = `已生成规则草案 (${engine})`;
+    fourPartStatus.title = "基础和声规则检查已完成；这不是严格批改结果。";
+  }
+  if (downloadAnswerMusicXmlButton) downloadAnswerMusicXmlButton.disabled = false;
+  if (downloadAnswerSvgButton) downloadAnswerSvgButton.disabled = !fourPartCanvas?.querySelector("svg");
+  return true;
+}
+
 async function uploadScore(file) {
   const extension = extensionOf(file.name);
   if (!supportedExtensions.includes(extension)) {
@@ -451,6 +603,37 @@ async function uploadScore(file) {
   }
 
   setBusy(file.name);
+  resetWorkflowStatus();
+  setWorkflowStep("recognition", "active", "正在识谱");
+
+  const enhancedImageExtensions = [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".pdf"];
+  if (enhancedImageExtensions.includes(extension)) {
+    try {
+      const enhancedData = new FormData();
+      enhancedData.append("file", file);
+      enhancedData.append("useVision", "true");
+      enhancedData.append("maxRegions", "3");
+      enhancedData.append("autoSolve", autoSolveInput?.checked === false ? "false" : "true");
+      const response = await fetch("/api/omr/enhanced-parse", { method: "POST", body: enhancedData });
+      const editorPayload = await response.json();
+      if (!response.ok) throw new Error(editorPayload.detail || "Enhanced OMR failed");
+      renderResult({ ...(editorPayload.readerResult || {}), omr: editorPayload.omr });
+      const hasContent = ["treble", "bass"].some((staffKey) =>
+        (staffScores[staffKey]?.measures || []).some((measure) => (measure || []).length > 0)
+      );
+      if (hasContent && !window.confirm("The score editor already has content. Replace it with the reviewed OMR result?")) {
+        return;
+      }
+      loadParsedPayloadToEditor(editorPayload);
+      await presentImportedWorkflow(editorPayload, { omr: true });
+      return;
+    } catch (error) {
+      setError(error.message || "Enhanced OMR failed");
+      setWorkflowStep("recognition", "failed", "识谱失败");
+      return;
+    }
+  }
+
   const data = new FormData();
   data.append("file", file);
 
@@ -459,6 +642,7 @@ async function uploadScore(file) {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || "读取失败");
     renderResult(payload);
+    setWorkflowStep("recognition", "complete", "文件已读取");
   } catch (error) {
     setError(error.message || "读取失败");
     return;
@@ -487,9 +671,11 @@ async function uploadScore(file) {
       if (!ok) return;
     }
     loadParsedPayloadToEditor(editorPayload);
+    await presentImportedWorkflow(editorPayload);
   } catch (error) {
     // /parse-score failure is non-fatal: /read-score already succeeded.
     setError(`解析为编辑器格式失败: ${error.message || "未知错误"}`);
+    setWorkflowStep("validation", "failed", "解析失败");
   }
 }
 
@@ -621,12 +807,23 @@ function serializeMelodyMeasuresToText(measures) {
 }
 
 function loadParsedPayloadToEditor(editorPayload) {
-  // Plain MusicXML is the lossless editor source. The reader/solver payload is
-  // intentionally only a computational projection and omits engraving fields.
-  if (editorPayload?.sourceMusicXml) {
-    loadParsedMusicXml(parseMusicXmlText(editorPayload.sourceMusicXml));
+  // Only XML written by this editor carries our explicit schema marker. External
+  // MusicXML must use the backend parser rather than this lightweight importer.
+  if (editorPayload?.importRoute === "frontend-canonical" && editorPayload?.sourceMusicXml) {
+    activeSourceProjection = null;
+    activeScoreIr = null;
+    activeScoreIrRevision = null;
+    loadParsedMusicXml(parseMusicXmlText(editorPayload.sourceMusicXml), "本项目 MusicXML 无损导入");
     return;
   }
+  const projection = editorPayload?.editorProjection;
+  activeOmrReview = null;
+  activeSourceProjection = projection ? {
+    schemaVersion: editorPayload?.scoreIr?.schemaVersion || null,
+    scoreIrValid: editorPayload?.scoreIrValidation?.valid !== false,
+    lossless: projection.lossless === true,
+    losses: Array.isArray(projection.losses) ? projection.losses.slice(0, 64) : []
+  } : null;
   // 普通 MusicXML 导入必须保留文件中实际存在的全部 SATB 声部。
   const sopranoMeasures = editorPayload?.sopranoMeasures || editorPayload?.melodyMeasures || [];
   const altoMeasures    = editorPayload?.altoMeasures    || [];
@@ -708,6 +905,8 @@ function loadParsedPayloadToEditor(editorPayload) {
     // 9 个调用点中只有这里需要"选第一", 其他 (新输入/撤销) 仍要选最后.
     selectFirstEntryInActiveVoice();
   });
+  activeScoreIr = editorPayload?.scoreIr ? JSON.parse(JSON.stringify(editorPayload.scoreIr)) : null;
+  activeScoreIrRevision = activeScoreIr ? editorRevision : null;
 
   // P22.5 监督 v2 (2026-08-17): 同步批量文本框 (soprano 旋律按 "音高:时值 | 音高:时值 || 音高:时值 | ..." 格式)
   // 之前不写 #noteInput.value, 截图看到的是 HTML placeholder, 实际 value 是空, 跟 score 不同步
@@ -722,28 +921,55 @@ function loadParsedPayloadToEditor(editorPayload) {
     bassMeasures.length    ? "低音" : null,
   ].filter(Boolean).join(" + ") || "(空)";
   showEditorMessage(
-    `MusicXML 已载入：${filled}，共 ${nMeasures} 小节。`,
+    editorPayload?.importRoute === "reader-projection"
+      ? `外部 MusicXML 已由后端兼容解析：${filled}，共 ${nMeasures} 小节。未知版式与未建模符号不会写回编辑器。`
+      : `MusicXML 已载入：${filled}，共 ${nMeasures} 小节。`,
     "success"
   );
+  if (readStatus) readStatus.textContent = editorPayload?.importRoute === "reader-projection"
+    ? "已导入（后端兼容解析）"
+    : "已导入";
+  // Imported material may be readable without being a valid SATB exercise.
+  // Keep it editable, but surface the server-side gate before asking the
+  // solver to harmonize a complex or damaged OMR result.
+  const selectedMode = questionTypeSelect?.value || "melody";
+  const importMode = ["melody", "alto", "tenor", "bass"].includes(selectedMode)
+    ? selectedMode
+    : "melody";
+  const importEligibility = editorPayload?.solverEligibility?.[importMode];
+  if (importEligibility && !importEligibility.eligible) {
+    const firstIssue = importEligibility.issues?.[0]?.message || "导入谱还不能直接用于四部和声求解。";
+    showEditorMessage(`已导入，但请先校正：${firstIssue}`, "warning");
+    if (readStatus) readStatus.textContent = "需校正";
+  }
+  renderOmrCorrectionReview(editorPayload?.omr || null);
 }
 
 async function submitFourPartAnswer() {
   fourPartStatus.classList.remove("status-failed", "status-ok");
   fourPartStatus.textContent = "生成中";
   if (applyFourPartButton) applyFourPartButton.disabled = true;
+  if (downloadAnswerMusicXmlButton) downloadAnswerMusicXmlButton.disabled = true;
+  if (downloadAnswerSvgButton) downloadAnswerSvgButton.disabled = true;
   fourPartDetails.className = "answer-details empty";
   fourPartDetails.textContent = "正在生成参考答案...";
 
   const questionType = questionTypeSelect?.value || "melody";
-  let melodyMeasures;
+  let melodyMeasures = [];
+  let altoMeasures = [];
+  let tenorMeasures = [];
   let bassMeasures = [];
   try {
-    melodyMeasures = collectMelodyMeasuresForAnswer(questionType);
-    if (questionType === "bass") {
-      bassMeasures = collectBassMeasuresForAnswer();
-      if (!bassMeasures.some((m) => m && m.length)) {
-        throw new Error("低音题请先在下方低音谱表（声部 2）输入低音序列，再生成四部和声参考答案。");
+    if (questionType === "melody") {
+      melodyMeasures = collectMelodyMeasuresForAnswer(questionType);
+    } else {
+      const anchored = collectSatbVoiceMeasuresForAnswer(questionType);
+      if (!anchored.some((m) => m && m.length)) {
+        throw new Error(`${questionType} 声部为空，请先输入该声部。`);
       }
+      if (questionType === "alto") altoMeasures = anchored;
+      if (questionType === "tenor") tenorMeasures = anchored;
+      if (questionType === "bass") bassMeasures = anchored;
     }
   } catch (error) {
     lastFourPartResult = null;
@@ -755,7 +981,7 @@ async function submitFourPartAnswer() {
     fourPartDetails.innerHTML =
       `<div class="warning-row">${escapeHtml(error.message || "四部和声生成失败")}</div>` +
       `<div class="warning-row">${escapeHtml(hint)}</div>`;
-    return;
+    return false;
   }
 
   const payload = {
@@ -765,11 +991,22 @@ async function submitFourPartAnswer() {
     melodyMeasures,
     questionType
   };
+  if (activeSourceProjection) {
+    payload.sourceProjection = activeSourceProjection;
+  }
   if (questionType === "bass" && bassMeasures.length) {
     // P8: bass-given problems carry the bass line in a separate field
     // so the server can route to bass-given solver mode.
     payload.bassMeasures = bassMeasures;
     payload.bassEntries = bassMeasures[0] || [];
+  }
+  if (questionType === "alto" && altoMeasures.length) {
+    payload.altoMeasures = altoMeasures;
+    payload.altoEntries = altoMeasures[0] || [];
+  }
+  if (questionType === "tenor" && tenorMeasures.length) {
+    payload.tenorMeasures = tenorMeasures;
+    payload.tenorEntries = tenorMeasures[0] || [];
   }
 
   // P17: chord_pool_profile 透传给 solver. 用户在 UI 选了章节范围,
@@ -870,7 +1107,7 @@ async function submitFourPartAnswer() {
     fourPartDetails.innerHTML =
       `<div class="warning-row">${escapeHtml(safeMsg)}</div>` +
       `<div class="warning-row">${escapeHtml(hint)}</div>`;
-    return;
+    return false;
   }
 
   if (!result) {
@@ -880,31 +1117,10 @@ async function submitFourPartAnswer() {
     if (applyFourPartButton) applyFourPartButton.disabled = true;
     fourPartDetails.className = "answer-details";
     fourPartDetails.innerHTML = `<div class="warning-row">四部和声生成失败（后端无返回）</div>`;
-    return;
+    return false;
   }
 
-  lastFourPartResult = result;
-  renderFourPartAnswer(result);
-
-  // P18.6: server 端在内部错时也会返 200 + summary.status=error.  这种 case
-  // 不要显示 "已生成", 而要显示 "失败" + 友好 message.
-  const isError = result?.summary?.status === "error"
-    || (result?.fourPart?.voices || []).length === 0;
-  if (isError) {
-    if (fourPartStatus) {
-      fourPartStatus.classList.add("status-failed");
-      fourPartStatus.textContent = "失败";
-    }
-    if (applyFourPartButton) applyFourPartButton.disabled = true;
-    return;
-  }
-
-  if (fourPartStatus) {
-    fourPartStatus.classList.add("status-ok");
-    const engine = result?.source?.engine || "sposobin-solver";
-    fourPartStatus.textContent = `已生成 (${engine})`;
-    fourPartStatus.title = engine;
-  }
+  return showFourPartResult(result);
 }
 
 function collectMelodyMeasuresForAnswer(questionType = "melody") {
@@ -1225,13 +1441,46 @@ function renderResult(result) {
     summaryItem("声部", String(summary.partCount ?? "-")),
     summaryItem("小节", String(summary.measureCount ?? "-")),
     summaryItem("来源", sourceLabel(result)),
-    summaryItem("导出", result.omr?.exportedFileName || "-")
+    summaryItem("导出", result.omr?.exportedFileName || "-"),
+    summaryItem("OMR QA", result.omr?.quality ? `${result.omr.quality.score}/100` : "-"),
+    summaryItem("OMR readiness", result.omr?.transcriptionReadiness?.status || "-")
   ].join("");
 
   renderMeasures(result.parts || []);
   renderHarmony(result.harmonyTimeline || [], summary.theory?.cadences || []);
   renderTheoryAnalysis(summary.theory || {});
-  renderWarnings(result.warnings || []);
+  const omrWarnings = [];
+  if (result.omr?.quality?.reviewRequired) {
+    omrWarnings.push(`OMR quality review required (${result.omr.quality.score}/100).`);
+  }
+  if (result.omr?.transcriptionReadiness?.status === "needs-review") {
+    const codes = result.omr.transcriptionReadiness.blockingCodes || [];
+    omrWarnings.push(`OMR must be reviewed before solving${codes.length ? `: ${codes.join(", ")}` : "."}`);
+  }
+  const visionRegions = result.omr?.vision?.reviewedRegions || [];
+  visionRegions.forEach((region) => {
+    const final = region.review?.final;
+    if (final?.decision === "uncertain") {
+      omrWarnings.push(`VLM is uncertain about measure ${region.measure}; manual confirmation is required.`);
+    } else if (final?.decision === "replace_candidate") {
+      omrWarnings.push(`VLM proposes ${final.corrections?.length || 0} correction(s) in measure ${region.measure}; review before applying.`);
+    }
+  });
+  renderWarnings([...(result.warnings || []), ...omrWarnings]);
+}
+
+function collectSatbVoiceMeasuresForAnswer(role) {
+  const slots = {
+    alto: ["treble", "2"],
+    tenor: ["bass", "1"],
+    bass: ["bass", "2"],
+  };
+  const slot = slots[role];
+  if (!slot) return [];
+  const [staffKey, voiceId] = slot;
+  const state = staffScores[staffKey];
+  const perMeasure = state.measures.map((measure) => entriesForVoice(measure, voiceId));
+  return normalizeCollectedMeasures(perMeasure, voiceId) || [];
 }
 
 function renderTheoryAnalysis(theory) {
@@ -1669,194 +1918,137 @@ function parseKeyChanges(text) {
 
 function renderFourPartScore(voices, timeSignature, harmonies = [], cadence = "", warningMeasures = []) {
   try {
-  fourPartCanvas.replaceChildren();
+    fourPartCanvas.replaceChildren();
+    if (!VF) {
+      fourPartCanvas.textContent = "制谱引擎未加载。";
+      fourPartCanvas.classList.add("notation-error");
+      return;
+    }
 
-  if (!VF) {
-    fourPartCanvas.textContent = "制谱引擎未加载。";
-    fourPartCanvas.classList.add("notation-error");
-    return;
-  }
+    fourPartCanvas.classList.remove("notation-error");
+    const width = Math.max(720, Math.floor(fourPartCanvas.parentElement.clientWidth - 2));
+    const orderedVoices = ["soprano", "alto", "tenor", "bass"]
+      .map((id) => voices.find((voice) => voice.id === id))
+      .filter(Boolean);
+    if (!orderedVoices.length) {
+      fourPartCanvas.textContent = "没有可渲染的声部数据。";
+      return;
+    }
+    const measureCount = Math.max(1, ...orderedVoices.map((voice) => (voice.measures || []).length));
+    const systemTopY = 44;
+    const systemHeight = 184;
+    const bassOffset = 72;
+    const xStart = 62;
+    const usableWidth = Math.max(400, width - xStart - 18);
+    const height = Math.max(220, systemTopY + measureCount * systemHeight + 12);
+    fourPartCanvas.style.width = `${width}px`;
+    fourPartCanvas.style.height = `${height}px`;
 
-  fourPartCanvas.classList.remove("notation-error");
-  const width = Math.max(720, Math.floor(fourPartCanvas.parentElement.clientWidth - 2));
-  const measureCount = Math.max(1, ...voices.map((voice) => (voice.measures || []).length));
+    const renderer = new VF.Renderer(fourPartCanvas, VF.Renderer.Backends.SVG);
+    renderer.resize(width, height);
+    const context = renderer.getContext();
+    const meter = meterForTimeSignature(timeSignature);
+    const keySpec = keySpecFromLabel(manualKey.value);
+    const systemSopranoXs = [];
 
-  // P22.5-SATB-render: 标准合唱谱排版
-  // 1 system = 1 measure + 4 voice 紧密垂直 (S/A/T/B)
-  // 4 measure 4 system 垂直堆叠. brace 连 S+A + T+B, bracket 包 4 stave
-  const systemTopY = 36;
-  const staveHeight = 40;       // 4 voice 紧密 (合唱谱标准)
-  const systemHeight = staveHeight * 4 + 18;
-  const xStart = 56;            // 给 voice label + brace/bracket 留位
-  const usableWidth = Math.max(360, width - xStart - 16);
-  const height = Math.max(180, measureCount * systemHeight + 60);
-  fourPartCanvas.style.width = `${width}px`;
-  fourPartCanvas.style.height = `${height}px`;
-
-  const renderer = new VF.Renderer(fourPartCanvas, VF.Renderer.Backends.SVG);
-  renderer.resize(width, height);
-  const context = renderer.getContext();
-  const meter = meterForTimeSignature(timeSignature);
-  const keySpec = keySpecFromLabel(manualKey.value);
-
-  // 4 voice 顺序固定: soprano, alto, tenor, bass
-  const orderedVoices = ["soprano", "alto", "tenor", "bass"]
-    .map((id) => voices.find((v) => v.id === id))
-    .filter(Boolean);
-  if (orderedVoices.length === 0) {
-    fourPartCanvas.textContent = "没有可渲染的声部数据。";
-    return;
-  }
-
-  // 收集每个 system soprano note X 位置 (用于罗马数字标注)
-  const systemSopranoXs = [];
-
-  for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
-    const systemY = systemTopY + measureIndex * systemHeight;
-    const staves = [];
-    const vexVoices = [];   // VexFlow Voice (nullable for empty voice)
-    const voiceNoteLists = [];  // raw StaveNote[] for each voice (for X lookup)
-
-    // 1) 4 voice 各建 1 stave, 第 1 个 system 加 clef/key/time, 其后复用
-    for (let v = 0; v < 4; v += 1) {
-      const vData = orderedVoices[v];
-      if (!vData) {
-        staves.push(null);
-        vexVoices.push(null);
-        voiceNoteLists.push([]);
-        continue;
-      }
-      const stave = new VF.Stave(xStart, systemY + v * staveHeight, usableWidth);
-      const clef = vData.clef || "treble";
+    for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
+      const systemY = systemTopY + measureIndex * systemHeight;
+      const trebleStave = new VF.Stave(xStart, systemY, usableWidth);
+      const bassStave = new VF.Stave(xStart, systemY + bassOffset, usableWidth);
       if (measureIndex === 0) {
-        stave.addClef(clef);
-        if (v === 0 && keySpec) stave.addKeySignature(keySpec);
-        if (v === 0) stave.addTimeSignature(timeSignature);
+        trebleStave.addClef("treble");
+        bassStave.addClef("bass");
+        if (keySpec) {
+          trebleStave.addKeySignature(keySpec);
+          bassStave.addKeySignature(keySpec);
+        }
+        trebleStave.addTimeSignature(timeSignature);
+        bassStave.addTimeSignature(timeSignature);
       }
-      stave.setContext(context).draw();
-      staves.push(stave);
+      trebleStave.setContext(context).draw();
+      bassStave.setContext(context).draw();
+      new VF.StaveConnector(trebleStave, bassStave)
+        .setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
+      new VF.StaveConnector(trebleStave, bassStave)
+        .setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(context).draw();
+      new VF.StaveConnector(trebleStave, bassStave)
+        .setType(VF.StaveConnector.type.SINGLE_RIGHT).setContext(context).draw();
 
-      // 2) 这个 voice 的当前 measure entries → VexFlow notes
-      const entries = (vData.measures && vData.measures[measureIndex]?.entries) || [];
-      const voiceId = vData.id;
-      const notes = entries.map((e) => createVexNote(e, clef, timeSignature, undefined, voiceId));
-      voiceNoteLists.push(notes);
-
-      if (!notes.length) {
-        vexVoices.push(null);
-        continue;
-      }
-      const voice = new VF.Voice({ numBeats: meter.numerator, beatValue: meter.denominator });
-      voice.setMode(VF.Voice.Mode.SOFT);
-      voice.addTickables(notes);
-      vexVoices.push(voice);
-    }
-
-    // 3) Brace + Bracket (S+A 一组, T+B 一组, 整 4 stave 包 bracket)
-    if (staves[0] && staves[1]) {
-      new VF.StaveConnector(staves[0], staves[1]).setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
-    }
-    if (staves[2] && staves[3]) {
-      new VF.StaveConnector(staves[2], staves[3]).setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
-    }
-    if (staves[0] && staves[3]) {
-      new VF.StaveConnector(staves[0], staves[3]).setType(VF.StaveConnector.type.BRACKET).setContext(context).draw();
-    }
-
-    // 4) 4 voice 共享 Formatter — X 坐标对齐到同一 beat
-    const nonEmpty = vexVoices.filter((v) => v !== null);
-    if (nonEmpty.length > 0) {
-      VF.Accidental.applyAccidentals(nonEmpty, "C");
-      new VF.Formatter().joinVoices(nonEmpty).format(nonEmpty, usableWidth - 60);
-      vexVoices.forEach((v, i) => {
-        if (v && staves[i]) v.draw(context, staves[i]);
+      const vexVoices = [];
+      const voiceNotes = [];
+      const voiceStaves = [];
+      orderedVoices.forEach((voiceData, voiceIndex) => {
+        const upperStaff = voiceIndex < 2;
+        const stave = upperStaff ? trebleStave : bassStave;
+        const clef = upperStaff ? "treble" : "bass";
+        const upperVoice = voiceIndex % 2 === 0;
+        const entries = voiceData.measures?.[measureIndex]?.entries || [];
+        const notes = entries.map((entry) => createVexNote(entry, clef, timeSignature, upperVoice ? 1 : -1, upperVoice ? "1" : "2"));
+        voiceNotes.push(notes);
+        voiceStaves.push(stave);
+        if (!notes.length) {
+          vexVoices.push(null);
+          return;
+        }
+        const voice = new VF.Voice({ numBeats: meter.numerator, beatValue: meter.denominator });
+        voice.setMode(VF.Voice.Mode.SOFT);
+        voice.addTickables(notes);
+        vexVoices.push(voice);
       });
-    }
 
-    // 5) 连梁 (beams) — 用所有 voice 的 tickables 一起算
-    const allTickables = vexVoices.filter((v) => v).flatMap((v) => v.getTickables());
-    if (allTickables.length > 0) {
-      try {
-        const beams = VF.Beam.generateBeams(allTickables, {
-          groups: VF.Beam.getDefaultBeamGroups(timeSignature)
+      const nonEmpty = vexVoices.filter(Boolean);
+      if (nonEmpty.length) {
+        VF.Accidental.applyAccidentals(nonEmpty, keySpec || "C");
+        new VF.Formatter().joinVoices(nonEmpty).format(nonEmpty, usableWidth - 74);
+        vexVoices.forEach((voice, index) => {
+          if (voice) voice.draw(context, voiceStaves[index]);
         });
-        beams.forEach((b) => b.setContext(context).draw());
-      } catch (_) { /* beam 算失败不影响音符 */ }
+      }
+      voiceNotes.forEach((notes) => {
+        if (!notes.length) return;
+        try {
+          VF.Beam.generateBeams(notes, { groups: VF.Beam.getDefaultBeamGroups(timeSignature) })
+            .forEach((beam) => beam.setContext(context).draw());
+        } catch (_) { /* beam failure must not hide the score */ }
+      });
+      systemSopranoXs.push((voiceNotes[0] || []).map((note) => note.getAbsoluteX()));
     }
 
-    // 6) 记录 soprano X 位置给罗马数字标注
-    const sopranoNotes = voiceNoteLists[0] || [];
-    systemSopranoXs.push(sopranoNotes.map((n) => n.getAbsoluteX()));
-  }
+    const svg = fourPartCanvas.querySelector("svg");
+    for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
+      const systemY = systemTopY + measureIndex * systemHeight;
+      const addLabel = (text, x, y, color = "#607065", size = "11", weight = "700") => {
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("x", String(x));
+        label.setAttribute("y", String(y));
+        label.setAttribute("fill", color);
+        label.setAttribute("font-size", size);
+        label.setAttribute("font-weight", weight);
+        label.textContent = text;
+        svg?.append(label);
+        return label;
+      };
+      addLabel("S/A", 16, systemY + 26, "#24332c");
+      addLabel("T/B", 16, systemY + bassOffset + 26, "#24332c");
+      addLabel(String(measureIndex + 1), 42, systemY - 10);
 
-  // 7) SVG 文字标注
-  const svg = fourPartCanvas.querySelector("svg");
-  for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
-    const systemY = systemTopY + measureIndex * systemHeight;
-
-    // voice label (S/A/T/B) 在每个 system 左侧
-    for (let v = 0; v < 4; v += 1) {
-      const vData = orderedVoices[v];
-      if (!vData) continue;
-      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      label.setAttribute("x", "12");
-      label.setAttribute("y", String(systemY + v * staveHeight + 24));
-      label.setAttribute("fill", "#24332c");
-      label.setAttribute("font-size", "11");
-      label.setAttribute("font-weight", "700");
-      label.textContent = vData.id[0].toUpperCase();
-      svg?.append(label);
+      const measureHarmonies = harmonies.filter((item) => item.measure === measureIndex + 1);
+      const xs = systemSopranoXs[measureIndex] || [];
+      measureHarmonies.forEach((item) => {
+        const x = xs[item.beat - 1] ?? (112 + (item.beat - 1) * 52);
+        const label = addLabel(
+          item.romanNumeral || item.root || "", x, systemY + bassOffset + 92,
+          "#b4452a", "12", "800"
+        );
+        label.setAttribute("text-anchor", "middle");
+      });
+      if (cadence && measureIndex === measureCount - 1) {
+        addLabel(`终止: ${cadence}`, 42, systemY - 26, "#1f7a56", "12", "800");
+      }
+      if (warningMeasures.has(measureIndex + 1)) {
+        addLabel("!", width - 32, systemY - 10, "#c0392b", "14", "800");
+      }
     }
-
-    // 小节号
-    const measureLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    measureLabel.setAttribute("x", "34");
-    measureLabel.setAttribute("y", String(systemY - 10));
-    measureLabel.setAttribute("fill", "#607065");
-    measureLabel.setAttribute("font-size", "11");
-    measureLabel.textContent = `${measureIndex + 1}`;
-    svg?.append(measureLabel);
-
-    // 罗马数字标注
-    const measureHarmonies = harmonies.filter((h) => h.measure === measureIndex + 1);
-    const xs = systemSopranoXs[measureIndex] || [];
-    measureHarmonies.forEach((item) => {
-      const x = xs[item.beat - 1] ?? (100 + (item.beat - 1) * 42);
-      const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      el.setAttribute("x", String(x));
-      el.setAttribute("y", String(systemY - 10));
-      el.setAttribute("text-anchor", "middle");
-      el.setAttribute("fill", "#b4452a");
-      el.setAttribute("font-size", "12");
-      el.setAttribute("font-weight", "800");
-      el.textContent = item.romanNumeral || item.root || "";
-      svg?.append(el);
-    });
-
-    // 终止式 (最末 system)
-    if (cadence && measureIndex === measureCount - 1) {
-      const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      el.setAttribute("x", "34");
-      el.setAttribute("y", String(systemY - 26));
-      el.setAttribute("fill", "#1f7a56");
-      el.setAttribute("font-size", "12");
-      el.setAttribute("font-weight", "800");
-      el.textContent = `终止: ${cadence}`;
-      svg?.append(el);
-    }
-
-    // 警告 (右上角红点)
-    if (warningMeasures.has(measureIndex + 1)) {
-      const el = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      el.setAttribute("x", String(width - 32));
-      el.setAttribute("y", String(systemY - 10));
-      el.setAttribute("fill", "#c0392b");
-      el.setAttribute("font-size", "14");
-      el.setAttribute("font-weight", "800");
-      el.textContent = "⚠";
-      svg?.append(el);
-    }
-  }
   } catch (err) {
     // P18.6: 制谱失败也不让用户看到内部错误, 给一个友好提示.
     console.error("[renderFourPartScore] crashed", err);
@@ -1874,6 +2066,11 @@ function applyFourPartAnswerToEditor() {
     return;
   }
 
+  activeSourceProjection = null;
+  activeScoreIr = null;
+  activeScoreIrRevision = null;
+  activeOmrReview = null;
+  renderOmrCorrectionReview(null);
   const roleTargets = {
     soprano: { staff: "treble", voice: "1" },
     alto: { staff: "treble", voice: "2" },
@@ -1951,6 +2148,100 @@ function normalizeAnswerEntryForEditor(entry, voiceId) {
       display: pitch.display || `${pitch.step}${displayAccidental(pitch.accidental || "")}${pitch.octave}`
     })))
   };
+}
+
+function buildAnswerScoreDocument(result) {
+  const answer = result?.fourPart || {};
+  const byRole = new Map((answer.voices || []).map((voice) => [voice.id, voice]));
+  const measureCount = Math.max(1, ...(answer.voices || []).map((voice) => (voice.measures || []).length));
+  const meter = meterForTimeSignature(answer.timeSignature || editorTime.value);
+  const makeStaff = (staffId, staffNumber, roles) => ({
+    id: staffId,
+    staffNumber,
+    label: staffId === "treble" ? "Soprano / Alto" : "Tenor / Bass",
+    clef: staffId,
+    measures: Array.from({ length: measureCount }, (_, measureIndex) => ({
+      number: measureIndex + 1,
+      beginBarline: "single",
+      endBarline: measureIndex === measureCount - 1 ? "end" : "single",
+      voices: roles.map((role, roleIndex) => {
+        const source = byRole.get(role)?.measures?.[measureIndex]?.entries || [];
+        const normalized = source.map((entry) => normalizeAnswerEntryForEditor(entry, String(roleIndex + 1)));
+        return {
+          id: String(roleIndex + 1),
+          role,
+          usedUnits: sumEntryUnits(normalized),
+          entries: exportVoiceEntries(normalized, meter.capacity)
+        };
+      })
+    }))
+  });
+  const analyzedKey = result?.summary?.analyzedKey?.label || editorKey.value;
+  return {
+    schemaVersion: "manual-score-v1",
+    title: `${scoreDocumentTitle || "Four-part harmony"} - Answer`,
+    timeSignature: answer.timeSignature || editorTime.value,
+    keySignature: normalizeKeyForSelect(analyzedKey) || editorKey.value,
+    tempo: 0,
+    anacrusis: false,
+    staffMode: "piano",
+    voiceRoleMap: [
+      { staff: "treble", voice: "1", role: "soprano" },
+      { staff: "treble", voice: "2", role: "alto" },
+      { staff: "bass", voice: "1", role: "tenor" },
+      { staff: "bass", voice: "2", role: "bass" }
+    ],
+    activeStaff: "treble",
+    activeVoice: "1",
+    measureCount,
+    staves: [
+      makeStaff("treble", 1, ["soprano", "alto"]),
+      makeStaff("bass", 2, ["tenor", "bass"])
+    ]
+  };
+}
+
+function downloadTextArtifact(filename, text, mimeType) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function answerFileStem() {
+  return `${scoreDocumentTitle || "four-part-harmony"}-answer`
+    .replace(/[<>:"/\\|?*]+/g, "_")
+    .trim() || "four-part-harmony-answer";
+}
+
+function buildAnswerMusicXml(result = lastFourPartResult) {
+  if (!result?.fourPart?.voices?.length) return "";
+  return buildMusicXml(buildAnswerScoreDocument(result));
+}
+
+function buildAnswerSvgText() {
+  const svg = fourPartCanvas?.querySelector("svg");
+  if (!svg) return "";
+  const clone = svg.cloneNode(true);
+  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n${new XMLSerializer().serializeToString(clone)}`;
+}
+
+function downloadAnswerMusicXml() {
+  const xml = buildAnswerMusicXml();
+  if (!xml) return;
+  downloadTextArtifact(`${answerFileStem()}.musicxml`, xml, "application/vnd.recordare.musicxml+xml;charset=utf-8");
+}
+
+function downloadAnswerSvg() {
+  const source = buildAnswerSvgText();
+  if (!source) return;
+  downloadTextArtifact(`${answerFileStem()}.svg`, source, "image/svg+xml;charset=utf-8");
 }
 
 function readableStatus(status) {
@@ -4382,6 +4673,11 @@ function commitEdit(callback) {
     callback();
     repairTupletGroups();
     normalizeSelection();
+    editorRevision += 1;
+    if (activeOmrReview && activeScoreIrRevision !== editorRevision) {
+      if (omrReviewStatus) omrReviewStatus.textContent = "谱面已编辑，建议已失效";
+      if (applyOmrCorrectionsButton) applyOmrCorrectionsButton.disabled = true;
+    }
     renderNotation();
   } catch (error) {
     // 任何 commit 路径上的异常都不能让 UI 卡死
@@ -4955,8 +5251,12 @@ function importMusicXmlFile(file) {
     setBusy(file.name);
     file.text()
       .then((xmlText) => {
-        loadParsedMusicXml(parseMusicXmlText(xmlText));
-        readStatus.textContent = "已导入";
+        if (isMusicReaderCanonicalXml(xmlText)) {
+          loadParsedMusicXml(parseMusicXmlText(xmlText), "本项目 MusicXML 无损导入");
+          readStatus.textContent = "已导入（无损）";
+          return;
+        }
+        importMusicXmlViaServer(file);
       })
       .catch((error) => {
         setError(error.message || "MusicXML 导入失败");
@@ -4965,6 +5265,170 @@ function importMusicXmlFile(file) {
     return;
   }
   importMusicXmlViaServer(file);
+}
+
+function formatOmrCorrection(correction) {
+  const pitches = (correction.pitches || []).map((pitch) => {
+    const accidental = pitch.alter > 0 ? "#".repeat(pitch.alter) : "b".repeat(Math.abs(pitch.alter || 0));
+    return `${pitch.step}${accidental}${pitch.octave}`;
+  }).join("+");
+  const target = correction.kind === "rest" ? "休止" : pitches;
+  return `第 ${correction.measure} 小节 · ${correction.voice} · ${correction.onset} → ${target} (${correction.duration})`;
+}
+
+function omrCorrectionIdentity(correction) {
+  return JSON.stringify({
+    measure: correction?.measure,
+    voice: correction?.voice,
+    onset: correction?.onset,
+    duration: correction?.duration,
+    kind: correction?.kind,
+    pitches: correction?.pitches || []
+  });
+}
+
+function renderOmrCorrectionReview(omr) {
+  if (!omrReviewPanel || !omrReviewList || !applyOmrCorrectionsButton) return;
+  const previousRunId = activeOmrRunId;
+  const runId = /^[a-f0-9]{32}$/.test(omr?.datasetRunId || "") ? omr.datasetRunId : null;
+  const corrections = [];
+  const confirmed = new Set(
+    (omr?.vision?.confirmedCorrections || []).map(omrCorrectionIdentity)
+  );
+  (omr?.vision?.reviewedRegions || []).forEach((region) => {
+    const final = region?.review?.final;
+    if (final?.decision !== "replace_candidate") return;
+    (final.corrections || []).forEach((correction) => {
+      if (confirmed.has(omrCorrectionIdentity(correction))) return;
+      corrections.push({
+        correction,
+        confidence: Number(final.confidence || 0),
+        model: final.model || region?.review?.attempts?.at(-1)?.model || "VLM"
+      });
+    });
+  });
+  activeOmrRunId = runId;
+  activeOmrReview = corrections.length ? {
+    runId,
+    corrections
+  } : null;
+  omrReviewPanel.hidden = !runId && !corrections.length;
+  if (omrReviewPanel.hidden) {
+    omrReviewList.replaceChildren();
+    if (omrReviewStatus) omrReviewStatus.textContent = "";
+    if (omrFinalStatus) omrFinalStatus.textContent = "";
+    return;
+  }
+  omrReviewList.innerHTML = corrections.length
+    ? corrections.map((item, index) => {
+        const correction = item.correction;
+        const locatable = ["soprano", "alto", "tenor", "bass"].includes(correction.voice);
+        return `<label class="omr-review-row">
+          <input type="checkbox" data-correction-index="${index}" ${locatable ? "" : "disabled"}>
+          <span><strong>${escapeHtml(formatOmrCorrection(correction))}</strong><small>${escapeHtml(item.model)} · ${(item.confidence * 100).toFixed(0)}%</small></span>
+        </label>`;
+      }).join("")
+    : '<p class="omr-review-empty">本次没有可直接应用的 VLM 修正。</p>';
+  if (omrReviewStatus) {
+    omrReviewStatus.textContent = corrections.length ? `${corrections.length} 条建议` : "待人工确认";
+  }
+  applyOmrCorrectionsButton.hidden = !corrections.length;
+  applyOmrCorrectionsButton.disabled = !corrections.some((item) =>
+    ["soprano", "alto", "tenor", "bass"].includes(item.correction.voice)
+  );
+  if (submitOmrFinalButton) submitOmrFinalButton.disabled = !runId;
+  if (omrFinalStatus && previousRunId !== runId) omrFinalStatus.textContent = "";
+}
+
+async function applySelectedOmrCorrections() {
+  if (!activeScoreIr || !activeOmrReview || !omrReviewList) return;
+  if (activeScoreIrRevision !== editorRevision) {
+    if (omrReviewStatus) omrReviewStatus.textContent = "谱面已编辑，请重新导入后复核";
+    applyOmrCorrectionsButton.disabled = true;
+    return;
+  }
+  const selected = Array.from(omrReviewList.querySelectorAll("input[data-correction-index]:checked"))
+    .map((input) => activeOmrReview.corrections[Number(input.dataset.correctionIndex)]?.correction)
+    .filter(Boolean);
+  if (!selected.length) {
+    if (omrReviewStatus) omrReviewStatus.textContent = "请先勾选修正";
+    return;
+  }
+  if (!window.confirm(`确认把选中的 ${selected.length} 条 VLM 修正应用到当前谱面？`)) return;
+  applyOmrCorrectionsButton.disabled = true;
+  if (omrReviewStatus) omrReviewStatus.textContent = "校验并应用中";
+  try {
+    const reviewRunId = activeOmrReview.runId;
+    const response = await fetch("/api/score-ir/apply-corrections", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        scoreIr: activeScoreIr,
+        corrections: selected,
+        confirmed: true,
+        source: "vlm",
+        reviewId: activeOmrReview.runId
+      })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+    activeOmrReview = null;
+    loadParsedPayloadToEditor(result.editorPayload);
+    if (result.editorPayload?.omr) {
+      await presentImportedWorkflow(result.editorPayload, { omr: true });
+    } else if (reviewRunId) {
+      renderOmrCorrectionReview({ datasetRunId: reviewRunId, vision: { reviewedRegions: [] } });
+    }
+    showEditorMessage(`已应用并验证 ${result.applied.length} 条 VLM 修正。`, "success");
+  } catch (error) {
+    if (omrReviewStatus) omrReviewStatus.textContent = error.message || "应用失败";
+    applyOmrCorrectionsButton.disabled = false;
+  }
+}
+
+function omrUploadErrorMessage(body, status) {
+  const detail = body?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail?.message) return detail.message;
+  return body?.error || `HTTP ${status}`;
+}
+
+async function submitOmrFinalMusicXml(file) {
+  if (!activeOmrRunId || !file) return;
+  const extension = extensionOf(file.name);
+  if (![".xml", ".musicxml"].includes(extension)) {
+    if (omrFinalStatus) omrFinalStatus.textContent = "请选择 MusicXML 文件";
+    return;
+  }
+  const confirmed = window.confirm("确认将这个文件记为本次 OMR 的人工最终稿？旧稿会保留修订记录。");
+  if (!confirmed) return;
+
+  const formData = new FormData();
+  formData.append("file", file);
+  if (submitOmrFinalButton) submitOmrFinalButton.disabled = true;
+  if (omrFinalStatus) omrFinalStatus.textContent = "正在校验最终稿";
+  try {
+    const response = await fetch(`/api/omr/review-runs/${activeOmrRunId}/final-musicxml`, {
+      method: "POST",
+      body: formData
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(omrUploadErrorMessage(result, response.status));
+    const tokenRate = result.homrVsHuman?.available
+      ? Number(result.homrVsHuman.tokenEditRecognitionRate)
+      : NaN;
+    const comparison = Number.isFinite(tokenRate)
+      ? `，HOMR 与最终稿语义一致率 ${(tokenRate * 100).toFixed(1)}%`
+      : "";
+    if (omrFinalStatus) {
+      omrFinalStatus.textContent = `最终稿已保存（修订 ${result.revision}）${comparison}`;
+    }
+    showEditorMessage("人工最终稿已通过结构与内部表示校验。", "success");
+  } catch (error) {
+    if (omrFinalStatus) omrFinalStatus.textContent = error.message || "最终稿提交失败";
+  } finally {
+    if (submitOmrFinalButton) submitOmrFinalButton.disabled = !activeOmrRunId;
+  }
 }
 
 function importMusicXmlViaServer(file) {
@@ -4985,7 +5449,12 @@ function importMusicXmlViaServer(file) {
     });
 }
 
-function loadParsedMusicXml(parsed) {
+function loadParsedMusicXml(parsed, importLabel = "MusicXML 已导入") {
+  activeSourceProjection = null;
+  activeScoreIr = null;
+  activeScoreIrRevision = null;
+  activeOmrReview = null;
+  renderOmrCorrectionReview(null);
   scoreDocumentTitle = parsed.title || "Manual score";
   editorTime.value = parsed.timeSignature;
   editorKey.value = parsed.keySignature;
@@ -5026,7 +5495,13 @@ function loadParsedMusicXml(parsed) {
   selectLastEntryInActiveVoice();
   editHistory = [];
   renderNotation();
-  showEditorMessage("MusicXML 已导入", "success");
+  showEditorMessage(importLabel, "success");
+  if (readStatus) readStatus.textContent = importLabel.includes("无损") ? "已导入（无损）" : "已导入";
+}
+
+function isMusicReaderCanonicalXml(xmlText) {
+  const marker = '<miscellaneous-field name="music-reader-schema">manual-score-v1</miscellaneous-field>';
+  return String(xmlText || "").toLowerCase().includes(marker);
 }
 
 function buildMusicXml(documentData) {
@@ -5040,7 +5515,7 @@ function buildMusicXml(documentData) {
   body.push('<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">');
   body.push('<score-partwise version="4.0">');
   body.push(`  <work><work-title>${xmlEscape(documentData.title)}</work-title></work>`);
-  body.push('  <identification><encoding><software>Music Reader Frontend</software></encoding></identification>');
+  body.push('  <identification><encoding><software>Music Reader Frontend</software></encoding><miscellaneous><miscellaneous-field name="music-reader-schema">manual-score-v1</miscellaneous-field></miscellaneous></identification>');
   body.push('  <part-list>');
   body.push(`    <score-part id="${partId}"><part-name>Manual Score</part-name></score-part>`);
   body.push('  </part-list>');
@@ -5969,6 +6444,13 @@ bindEvent(fileInput, "change", () => {
 
 bindEvent(manualButton, "click", submitManualChords);
 bindEvent(noteButton, "click", submitManualNotes);
+bindEvent(applyOmrCorrectionsButton, "click", applySelectedOmrCorrections);
+bindEvent(submitOmrFinalButton, "click", () => omrFinalMusicXmlInput?.click());
+bindEvent(omrFinalMusicXmlInput, "change", () => {
+  const file = omrFinalMusicXmlInput.files?.[0];
+  if (file) submitOmrFinalMusicXml(file);
+  omrFinalMusicXmlInput.value = "";
+});
 // 自动保存输入到 localStorage (debounce 500ms)
 if (noteInput) {
   bindEvent(noteInput, "input", scheduleNoteInputSave);
@@ -6006,6 +6488,8 @@ function scheduleNoteInputSave() {
 }
 bindEvent(fourPartButton, "click", submitFourPartAnswer);
 bindEvent(applyFourPartButton, "click", applyFourPartAnswerToEditor);
+bindEvent(downloadAnswerMusicXmlButton, "click", downloadAnswerMusicXml);
+bindEvent(downloadAnswerSvgButton, "click", downloadAnswerSvg);
 bindEvent(aiExplainButton, "click", requestAIExplanation);
 bindEvent(noteCanvas, "pointerdown", addEntryFromScore);
 bindEvent(noteCanvas, "pointermove", handleNoteCanvasHover);
@@ -6368,7 +6852,9 @@ if (typeof window !== "undefined") {
     parseMusicXmlNote,
     parseMusicXmlDirection,
     parseMusicXmlHarmony,
-    noteToEntry
+    noteToEntry,
+    buildAnswerMusicXml,
+    buildAnswerSvgText
   };
 }
 

@@ -1,126 +1,53 @@
-# homr Colab Fine-tune 教程
+# HOMR fine-tuning workflow
 
-## 概览
-- **目标**：用 PRIMUS + GrandStaff + Lieder 公开数据集 fine-tune homr TrOMR 模型
-- **硬件**：Google Colab 免费 T4 16GB
-- **时间**：~5-6 小时（10k subset + 5 epoch）
-- **输出**：fine-tune 后的 ONNX 模型，回 Windows 替换
+The project does not train HOMR from full-page image/MusicXML pairs directly. HOMR's
+TrOMR recognizer expects a cropped one- or two-staff image plus a `.tokens` file. The
+dataset builder uses HOMR's own MusicXML parser and vocabulary to create that format.
 
-## 步骤
+## 1. Build and audit the dataset
 
-### Cell 1: 开 GPU
-```
-菜单 → 运行时 → 更改运行时类型 → 硬件加速器 → T4 GPU
-```
+From the project root on Windows:
 
-### Cell 2: 检查环境
-```python
-!nvidia-smi
-!python --version
-!df -h /content  # 看可用空间
+```powershell
+python scripts/build_homr_finetune_dataset.py
+python scripts/train_homr_custom.py --check-data
 ```
 
-### Cell 3: 装系统依赖
+Generated files are under `data/omr-training/homr-sposobin-native/`:
+
+- `train-index.txt`, `validation-index.txt`, and `test-index.txt` are HOMR indexes.
+- `manifest.jsonl` records source score, content group, window, and label tier.
+- `quality-report.json` must show zero `crossSplitLeakage`.
+- `rejected.json` explains every excluded source or review run.
+
+Only `human-final.musicxml` review results with `humanFinalAvailable: true` are accepted
+as gold transcriptions. Raw HOMR results and unconfirmed VLM suggestions are never used
+as ground truth. Until staff-to-token alignment is recorded, these transcriptions are
+re-rendered and are not reported as real-image training pairs.
+
+## 2. Fine-tune on a GPU machine
+
+Copy the project dataset and the matching HOMR source revision to the GPU machine.
+Install the HOMR training dependencies and initialize its pretrained checkpoint, then
+run from the project root:
+
 ```bash
-!apt-get update -qq
-!apt-get install -y -qq librsvg2-bin libfuse2 libjack-jackd2-0 fuse
+python scripts/train_homr_custom.py --check-data
+python scripts/train_homr_custom.py --epochs 12 --batch-size 4 --effective-batch 16
 ```
 
-### Cell 4: Clone homr + 装 poetry
-```bash
-!git clone https://github.com/liebharc/homr.git
-%cd homr
-!pip install -q poetry
-!poetry config virtualenvs.create false
-!poetry install --extras gpu
-```
+The custom launcher loads HOMR's pretrained TrOMR checkpoint, trains all decoder
+branches, freezes only the vision backbone for the first two epochs, and evaluates on
+the explicit validation index. This differs from HOMR's current `--fine` mode, which
+only unfreezes the lift decoder and therefore cannot adapt pitch and rhythm recognition.
 
-### Cell 5: 下预训练模型
-```bash
-!poetry run homr --init
-```
+The launcher selects bf16 on supported GPUs and fp16 otherwise. Use `--fp32` only when
+reduced precision is unsuitable. Use `--resume PATH` to resume a Trainer checkpoint.
+Do not tune against the test index.
 
-### Cell 6: 下 + 转换 PRIMUS (~30 分钟)
-```bash
-!mkdir -p datasets
-# PRIMUS 自动下
-!poetry run python training/omr_datasets/convert_primus.py
-```
+## 3. Acceptance gate
 
-### Cell 7: 下 + 转换 GrandStaff + Lieder (~1 小时)
-```bash
-!poetry run python training/omr_datasets/convert_grandstaff.py
-!poetry run python training/omr_datasets/convert_lieder.py
-```
-
-### Cell 8: 截取 10k subset
-```python
-import random
-random.seed(42)
-
-for split in ['train', 'val']:
-    idx_path = f'datasets/primus_{split}_index.txt'
-    with open(idx_path) as f:
-        lines = f.readlines()
-    n = 10000 if split == 'train' else 500
-    sampled = random.sample(lines, min(n, len(lines)))
-    with open(idx_path, 'w') as f:
-        f.writelines(sampled)
-    print(f"{split}: {len(sampled)}/{len(lines)}")
-```
-
-### Cell 9: 启动训练 (后台)
-```bash
-!poetry run python training/train.py transformer \
-    --training.max_epochs=5 \
-    --training.batch_size=18 \
-    --training.learning_rate=5e-5 \
-    > training_run.log 2>&1 &
-!echo $! > train.pid
-```
-
-### Cell 10: 监控进度
-```python
-!tail -50 training_run.log
-!nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
-```
-
-### Cell 11: 训练完后导出 ONNX
-```bash
-# 找到最新 checkpoint
-!ls training/architecture/transformer/
-!poetry run python training/onnx/convert.py \
-    --checkpoint training/architecture/transformer/pytorch_model_XXX.pth \
-    --output homr_finetuned.onnx
-```
-
-### Cell 12: 打包下载
-```python
-import shutil
-# 替换 3 个 fine-tuned 模型
-for f in ['encoder', 'decoder']:
-    src = f"training/architecture/transformer/{f}_pytorch_model_*.onnx"
-    dst = f"homr_{f}_finetuned.onnx"
-    !cp $src $dst
-
-# 打包
-shutil.make_archive('homr_finetuned_models', 'zip', '.', '.')
-from google.colab import files
-files.download('homr_finetuned_models.zip')
-```
-
-## Windows 端回装
-1. 解压 zip
-2. 复制到 `C:\Users\Administrator\AppData\Roaming\uv\tools\homr\Lib\site-packages\homr\transformer\`
-3. 改 homr/transformer/configs.py 里的 `model_name` 指向新 checkpoint hash
-4. 跑你的 Sposobin 题测准确率
-
-## 注意事项
-- Colab 12 小时限制；用 `nohup`/`&` 后台跑 + 监控
-- 如果中途 GPU 断了，checkpoint 在 `training/architecture/transformer/pytorch_model_XXX.pth`，下次 resume
-- 5 epoch 可能不够，建议至少 10 epoch（按 epoch 数据 ~30 分钟/epoch 算）
-
-## 故障
-- **MuseScore 下载失败**：训练只能用 homr 训练集自带的 converted 数据
-- **CUDA OOM**：batch_size 减到 8
-- **Poetry 装包慢**：用清华源 `poetry config repositories.pypi https://pypi.tuna.tsinghua.edu.cn/simple`
+Export or replace a production model only when it beats the current model on the held-
+out test split and on a separate set of real scans/photos. Synthetic Verovio renders
+measure clean-score adaptation; they do not demonstrate camera or degraded-scan
+accuracy. Accumulate human-confirmed review runs before claiming real-image gains.

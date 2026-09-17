@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
+import json
 import re
 import shutil
 import sys
 import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -25,6 +29,29 @@ if str(CURRENT_DIR) not in sys.path:
 
 from reader import SUPPORTED_EXTENSIONS, read_score
 from omr import SUPPORTED_OMR_EXTENSIONS, OmrError, transcribe_with_audiveris
+from musicxml_quality import audit_musicxml
+from omr_semantic_metrics import score_musicxml_semantics
+from harmony_validator import validate_four_part_solution
+from exercise_extractor import extract_exercise_constraints
+from score_ir import validate_score_ir
+from score_ir_patch import ScoreIrPatchError, apply_confirmed_corrections
+from omr_review_pipeline import (
+    assess_omr_readiness,
+    crop_measure_region,
+    extract_measure_candidate,
+    prepend_previous_system_context,
+    save_review_run,
+    select_review_measures,
+    summarize_recognition_confidence,
+)
+from vision_review import (
+    MAX_IMAGE_BYTES,
+    VisionConfigurationError,
+    VisionUpstreamError,
+    review_score_region,
+    review_score_region_with_escalation,
+    vision_status,
+)
 from manual_chords import analyze_manual_chords
 from manual_notes import locate_manual_notes
 # P8 (Level 2 integration, 2026-08-09): four_part.py has been removed.
@@ -70,12 +97,27 @@ _ENTRY_PASSTHROUGH_FIELDS = (
     "rehearsalMark", "volta",
 )
 
+_FRONTEND_MUSICXML_SCHEMA_MARKER = "music-reader-schema"
+_FRONTEND_MUSICXML_SCHEMA_VERSION = "manual-score-v1"
+
 
 def _read_source_musicxml(path: Path) -> str | None:
     """Read canonical XML text for an unpacked MusicXML source."""
     if path.suffix.lower() not in {".xml", ".musicxml"}:
         return None
     return path.read_text(encoding="utf-8-sig")
+
+
+def _musicxml_import_route(source_musicxml: str | None) -> str:
+    """Choose the editor import path without treating arbitrary XML as ours."""
+    if source_musicxml:
+        marker = (
+            rf'<miscellaneous-field\s+name=["\']{_FRONTEND_MUSICXML_SCHEMA_MARKER}["\']\s*>'
+            rf'\s*{_FRONTEND_MUSICXML_SCHEMA_VERSION}\s*</miscellaneous-field>'
+        )
+        if re.search(marker, source_musicxml, flags=re.IGNORECASE):
+            return "frontend-canonical"
+    return "reader-projection"
 
 # P19: LLM 增强层 (教师式中文讲解)
 try:
@@ -94,6 +136,22 @@ except Exception as _llm_import_err:  # noqa: BLE001
 app = FastAPI(title="Music Reader MVP", version="0.1.0")
 WEB_DIR = CURRENT_DIR / "web"
 VEXFLOW_DIR = CURRENT_DIR / "node_modules" / "vexflow" / "build" / "cjs"
+OMR_REVIEW_ROOT = CURRENT_DIR / "data" / "omr-review-runs"
+MAX_OMR_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_FINAL_MUSICXML_BYTES = 10 * 1024 * 1024
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(value, encoding="utf-8", newline="")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @app.middleware("http")
@@ -131,9 +189,13 @@ class FourPartRequest(BaseModel):
     # P8: bass-given mode.  Populated when questionType='bass'; the
     # solver anchors the chord via the bass line and fills in the
     # upper three voices.  Same shape as melodyEntries/melodyMeasures
-    # but the notes are bass pitches (in bass range E2..D4).
+    # but the notes are bass pitches (in bass range D2..D4).
     bassEntries: list[dict] = Field(default_factory=list)
     bassMeasures: list[list[dict]] | None = None
+    altoEntries: list[dict] = Field(default_factory=list)
+    altoMeasures: list[list[dict]] | None = None
+    tenorEntries: list[dict] = Field(default_factory=list)
+    tenorMeasures: list[list[dict]] | None = None
     # P7.5: optional list of [measure_index, target_key_name] pairs for
     # modulation.  Defaults to [] (no modulation, single home key).
     keyChanges: list[list] | None = None
@@ -145,6 +207,308 @@ class FourPartRequest(BaseModel):
     # 'ch8-20_v7', 'ch21-22_d7_ii7_vii7', 'ch23_v9', 'ch24-26_dd',
     # 'full_p0-p7', 'full_p0-p9'.
     chordPoolProfile: str | None = None
+    # Import provenance travels back with the editor projection so a lossy
+    # MusicXML/OMR conversion cannot be silently submitted to the solver.
+    sourceProjection: dict | None = None
+
+
+class ScoreIrCorrectionRequest(BaseModel):
+    scoreIr: dict
+    corrections: list[dict] = Field(default_factory=list)
+    confirmed: bool = False
+    source: str = "vlm"
+    reviewId: str | None = None
+
+
+_SOLVER_INPUT_MAX_MEASURES = 16
+
+
+def _entry_units_for_solver(entry: dict) -> float:
+    """Return an editor entry's duration in 1/32-note units."""
+    units = entry.get("units")
+    if isinstance(units, (int, float)) and units > 0:
+        return float(units)
+    quarter = _APPJS_DURATION_TO_QUARTER.get(str(entry.get("duration") or "4"), 1.0)
+    dotted = int(entry.get("dotted") or 0)
+    multiplier = 1.75 if dotted >= 2 else 1.5 if dotted == 1 else 1.0
+    return quarter * 8.0 * multiplier
+
+
+def _measure_units_for_time_signature(time_signature: str) -> float | None:
+    """Return one measure's capacity in editor units, or None for bad input."""
+    try:
+        beats, beat_type = (int(value) for value in str(time_signature).split("/", 1))
+    except (TypeError, ValueError):
+        return None
+    if beats <= 0 or beat_type <= 0 or 32 % beat_type:
+        return None
+    return float(beats * (32 // beat_type))
+
+
+def _solver_input_eligibility(
+    melody_measures: list[list[dict]] | None,
+    bass_measures: list[list[dict]] | None,
+    time_signature: str,
+    question_type: str,
+    alto_measures: list[list[dict]] | None = None,
+    tenor_measures: list[list[dict]] | None = None,
+) -> dict:
+    """Check whether editor data is a bounded SATB exercise input.
+
+    This deliberately validates only the voice that anchors the solver.  A
+    full piano score may still be imported and edited, but it must be reduced
+    to one unambiguous SATB voice before automatic harmonization.
+    """
+    mode = question_type if question_type in {"alto", "tenor", "bass"} else "melody"
+    measures_by_mode = {
+        "melody": melody_measures,
+        "alto": alto_measures,
+        "tenor": tenor_measures,
+        "bass": bass_measures,
+    }
+    measures = measures_by_mode[mode]
+    issues: list[dict[str, str | int | float]] = []
+    expected_units = _measure_units_for_time_signature(time_signature)
+    if expected_units is None:
+        issues.append({
+            "code": "BAD_TIME_SIGNATURE",
+            "message": "拍号无效，无法判断每小节应有的时值。",
+        })
+        expected_units = 0.0
+
+    if not measures or not any(measure for measure in measures):
+        issues.append({
+            "code": "EMPTY_INPUT",
+            "message": "没有可用于四部和声的给定声部。",
+        })
+        measures = []
+    elif len(measures) > _SOLVER_INPUT_MAX_MEASURES:
+        issues.append({
+            "code": "TOO_MANY_MEASURES",
+            "message": f"自动求解最多处理 {_SOLVER_INPUT_MAX_MEASURES} 小节；请先截取练习片段。",
+            "actual": len(measures),
+            "expected": _SOLVER_INPUT_MAX_MEASURES,
+        })
+
+    voice = "soprano" if mode == "melody" else mode
+    range_low, range_high = sposobin_solver.VOICE_RANGES[voice]
+    for index, measure in enumerate(measures, start=1):
+        if not isinstance(measure, list) or not measure:
+            issues.append({
+                "code": "EMPTY_MEASURE",
+                "message": f"第 {index} 小节为空，无法保持节奏对齐。",
+                "measure": index,
+            })
+            continue
+        actual_units = sum(_entry_units_for_solver(entry) for entry in measure if isinstance(entry, dict))
+        if expected_units and abs(actual_units - expected_units) > 1e-6:
+            issues.append({
+                "code": "MEASURE_DURATION_MISMATCH",
+                "message": f"第 {index} 小节时值为 {actual_units:g} 单位，应为 {expected_units:g} 单位。",
+                "measure": index,
+                "actual": actual_units,
+                "expected": expected_units,
+            })
+        for entry in measure:
+            if not isinstance(entry, dict) or entry.get("kind") != "note":
+                continue
+            pitches = entry.get("pitches") or []
+            if len(pitches) != 1:
+                issues.append({
+                    "code": "MULTI_PITCH_INPUT",
+                    "message": f"第 {index} 小节的给定声部含和弦；请先只保留一条独立声部线。",
+                    "measure": index,
+                })
+                continue
+            note = _appjs_entry_to_soprano_note(entry)
+            if note is None:
+                issues.append({
+                    "code": "INVALID_PITCH",
+                    "message": f"第 {index} 小节存在无法识别的音高。",
+                    "measure": index,
+                })
+            elif not range_low.midi <= note.midi <= range_high.midi:
+                issues.append({
+                    "code": "OUT_OF_RANGE",
+                    "message": f"第 {index} 小节音高 {note.name} 超出 {voice} 可用音域。",
+                    "measure": index,
+                })
+
+    return {
+        "eligible": not issues,
+        "mode": mode,
+        "measureCount": len(measures),
+        "issues": issues,
+    }
+
+
+def _editor_solver_eligibility(editor_payload: dict) -> dict:
+    """Expose readiness for each single-voice SATB exercise mode."""
+    time_signature = editor_payload.get("timeSignature", "4/4")
+    melody_measures = editor_payload.get("melodyMeasures")
+    bass_measures = editor_payload.get("bassMeasures")
+    alto_measures = editor_payload.get("altoMeasures")
+    tenor_measures = editor_payload.get("tenorMeasures")
+    result = {
+        mode: _solver_input_eligibility(
+            melody_measures, bass_measures, time_signature, mode,
+            alto_measures=alto_measures, tenor_measures=tenor_measures,
+        )
+        for mode in ("melody", "alto", "tenor", "bass")
+    }
+    projection = editor_payload.get("editorProjection") or {}
+    blocking_codes = {
+        "CHORD_REDUCED_TO_TOP_NOTE",
+        "DURATION_QUANTIZED",
+        "EXTRA_PARTS_IGNORED",
+        "EXTRA_VOICES_IGNORED",
+    }
+    blocking_losses = [
+        loss for loss in projection.get("losses", [])
+        if loss.get("code") in blocking_codes
+    ]
+    if blocking_losses:
+        issue = {
+            "code": "SOURCE_PROJECTION_LOSS",
+            "message": "The imported score cannot be projected to the teaching solver without changing musical data.",
+            "losses": blocking_losses,
+        }
+        for mode in result.values():
+            mode["issues"].append(issue)
+            mode["eligible"] = False
+    return result
+
+
+def _annotate_editor_analysis(editor_payload: dict) -> None:
+    editor_payload["solverEligibility"] = _editor_solver_eligibility(editor_payload)
+    editor_payload["exerciseExtraction"] = extract_exercise_constraints(editor_payload)
+
+
+def _editor_source_projection(editor_payload: dict) -> dict | None:
+    projection = editor_payload.get("editorProjection")
+    if not isinstance(projection, dict):
+        return None
+    return {
+        "schemaVersion": (editor_payload.get("scoreIr") or {}).get("schemaVersion"),
+        "scoreIrValid": (editor_payload.get("scoreIrValidation") or {}).get("valid") is not False,
+        "lossless": projection.get("lossless") is True,
+        "losses": list(projection.get("losses", []) or [])[:64],
+    }
+
+
+def _solve_imported_exercise(editor_payload: dict) -> dict:
+    """Run the solver only when OMR, projection, and exercise gates agree."""
+    extraction = editor_payload.get("exerciseExtraction") or {}
+    question_type = extraction.get("recommendedQuestionType")
+    omr = editor_payload.get("omr") or {}
+    readiness = omr.get("transcriptionReadiness")
+    if isinstance(readiness, dict) and not readiness.get("solverAllowed"):
+        return {
+            "status": "review-required",
+            "stage": "recognition",
+            "questionType": question_type,
+            "exerciseKind": extraction.get("kind"),
+            "issues": readiness.get("issues", []),
+        }
+
+    if question_type not in {"melody", "alto", "tenor", "bass"}:
+        exercise_kind = extraction.get("kind", "unknown")
+        if exercise_kind == "ambiguous-key":
+            assessment = extraction.get("keyAssessment") or editor_payload.get("keyAssessment") or {}
+            issue = {
+                "code": "KEY_CONFIRMATION_REQUIRED",
+                "message": "The key is based on low-confidence pitch analysis; confirm the key before solving.",
+                "key": assessment.get("key") or editor_payload.get("key"),
+                "source": assessment.get("source"),
+                "correlation": assessment.get("correlation"),
+                "candidates": assessment.get("candidates", []),
+            }
+        elif exercise_kind == "ambiguous-voice-assignment":
+            issue = {
+                "code": "VOICE_ASSIGNMENT_REQUIRED",
+                "message": "The notes were preserved, but their SATB role cannot be inferred safely from clef, label, and range.",
+                "assignment": extraction.get("voiceAssignment") or editor_payload.get("voiceAssignment"),
+            }
+        else:
+            issue = {
+                "code": "EXERCISE_TYPE_AMBIGUOUS",
+                "message": "The imported score is not an unambiguous melody-given or bass-given exercise.",
+            }
+        return {
+            "status": "selection-required",
+            "stage": "exercise",
+            "questionType": None,
+            "exerciseKind": exercise_kind,
+            "issues": [issue],
+        }
+
+    eligibility = (editor_payload.get("solverEligibility") or {}).get(question_type) or {}
+    if not eligibility.get("eligible"):
+        return {
+            "status": "review-required",
+            "stage": "exercise",
+            "questionType": question_type,
+            "exerciseKind": extraction.get("kind"),
+            "issues": eligibility.get("issues", []),
+        }
+
+    request = FourPartRequest(
+        key=str(editor_payload.get("key") or "C major"),
+        timeSignature=str(editor_payload.get("timeSignature") or "4/4"),
+        melodyMeasures=editor_payload.get("melodyMeasures") or [],
+        altoMeasures=editor_payload.get("altoMeasures") or [],
+        tenorMeasures=editor_payload.get("tenorMeasures") or [],
+        bassMeasures=editor_payload.get("bassMeasures") or [],
+        questionType=question_type,
+        chordPoolProfile="auto",
+        sourceProjection=_editor_source_projection(editor_payload),
+    )
+    solution = solve_melody_endpoint(request)
+    successful = bool((solution.get("fourPart") or {}).get("voices"))
+    return {
+        "status": "complete" if successful else "failed",
+        "stage": "answer" if successful else "solver",
+        "questionType": question_type,
+        "exerciseKind": extraction.get("kind"),
+        "issues": [] if successful else [{
+            "code": solution.get("errorCode", "SOLVER_ERROR"),
+            "message": (solution.get("warnings") or ["Four-part solving failed."])[0],
+        }],
+        "solution": solution,
+    }
+
+
+def _source_projection_blocker(value: dict | None) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("scoreIrValid") is False:
+        return {
+            "code": "INVALID_SOURCE_SCORE_IR",
+            "message": "The imported source failed ScoreIR validation and cannot be solved safely.",
+        }
+    losses = value.get("losses", [])
+    if not isinstance(losses, list) or len(losses) > 64:
+        return {
+            "code": "INVALID_SOURCE_PROJECTION",
+            "message": "The imported source projection metadata is invalid.",
+        }
+    blocking_codes = {
+        "CHORD_REDUCED_TO_TOP_NOTE",
+        "DURATION_QUANTIZED",
+        "EXTRA_PARTS_IGNORED",
+        "EXTRA_VOICES_IGNORED",
+    }
+    blocking = [
+        loss for loss in losses
+        if isinstance(loss, dict) and loss.get("code") in blocking_codes
+    ]
+    if blocking:
+        return {
+            "code": "SOURCE_PROJECTION_LOSS",
+            "message": "The imported score would change musical data before solving. Correct or simplify the source first.",
+            "losses": blocking,
+        }
+    return None
 
 
 def _safe_upload_name(filename: str | None, suffix: str) -> str:
@@ -158,12 +522,553 @@ def _remove_source_path(payload: dict) -> dict:
     source = payload.get("source")
     if isinstance(source, dict):
         source.pop("path", None)
+    score_ir_source = (payload.get("scoreIr") or {}).get("source")
+    if isinstance(score_ir_source, dict):
+        score_ir_source.pop("path", None)
     return payload
+
+
+def _annotate_score_ir_source(payload: dict, engine: str) -> None:
+    score_ir = payload.get("scoreIr")
+    if not isinstance(score_ir, dict):
+        return
+    score_ir.setdefault("source", {})["engine"] = engine
+    for part in score_ir.get("parts", []) or []:
+        for measure in part.get("measures", []) or []:
+            for event in measure.get("events", []) or []:
+                event.setdefault("provenance", {}).setdefault("engine", engine)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _multipart_json_object(raw: str, field_name: str) -> dict:
+    if len(raw) > 20_000:
+        raise HTTPException(status_code=413, detail=f"{field_name} JSON is too large.")
+    try:
+        value = json.loads(raw or "{}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be valid JSON.") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a JSON object.")
+    return value
+
+
+@app.get("/api/vision/status")
+def get_vision_status() -> dict:
+    return vision_status()
+
+
+@app.post("/api/score-ir/validate")
+def validate_score_ir_payload(score_ir: dict) -> dict:
+    """Validate the canonical score contract without converting to MusicXML."""
+    return validate_score_ir(score_ir)
+
+
+@app.post("/api/score-ir/apply-corrections")
+def apply_score_ir_corrections(request: ScoreIrCorrectionRequest) -> dict:
+    """Apply a bounded, human-confirmed VLM/human patch atomically."""
+    review_record = _review_record_for_corrections(
+        request.reviewId, request.corrections, request.source
+    )
+    try:
+        result = apply_confirmed_corrections(
+            request.scoreIr,
+            request.corrections,
+            confirmed=request.confirmed,
+            source=request.source,
+            review_id=request.reviewId,
+        )
+    except ScoreIrPatchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from reader_to_editor import reader_payload_to_editor
+
+    metadata = result["scoreIr"].get("metadata", {}) or {}
+    editor_payload = reader_payload_to_editor({
+        "scoreIr": result["scoreIr"],
+        "summary": {"analyzedKey": metadata.get("analyzedKey")},
+        "warnings": [],
+    })
+    _annotate_editor_analysis(editor_payload)
+    editor_payload["importRoute"] = "score-ir-correction"
+    if review_record is not None:
+        editor_payload["omr"] = _confirmed_omr_metadata(
+            review_record, request.reviewId or "", request.corrections
+        )
+        readiness = editor_payload["omr"]["transcriptionReadiness"]
+        if not readiness["solverAllowed"]:
+            blocker = {
+                "code": "OMR_REVIEW_REQUIRED",
+                "message": "OMR contains unresolved recognition risks.",
+                "details": readiness["issues"],
+            }
+            for mode in editor_payload.get("solverEligibility", {}).values():
+                mode["eligible"] = False
+                mode.setdefault("issues", []).append(blocker)
+        _save_confirmed_score_ir_patch(
+            request.reviewId or "", review_record, result, request.corrections
+        )
+        editor_payload["endToEnd"] = _solve_imported_exercise(editor_payload)
+        result["reviewRunUpdated"] = True
+    else:
+        result["reviewRunUpdated"] = False
+    result["editorPayload"] = editor_payload
+    return result
+
+
+def _review_record_for_corrections(
+    review_id: str | None,
+    corrections: list[dict],
+    source: str,
+) -> dict | None:
+    """Bind persisted VLM confirmations to proposals from the same run."""
+    if source != "vlm" or not review_id or not re.fullmatch(r"[a-f0-9]{32}", review_id):
+        return None
+    record_path = OMR_REVIEW_ROOT / review_id / "review.json"
+    if not record_path.is_file():
+        raise HTTPException(status_code=404, detail="OMR review run was not found.")
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="OMR review record is invalid.") from exc
+    if not isinstance(record, dict):
+        raise HTTPException(status_code=422, detail="OMR review record is invalid.")
+    proposed = []
+    for region in (record.get("vision", {}) or {}).get("reviewedRegions", []) or []:
+        final = (region.get("review", {}) or {}).get("final", {}) or {}
+        if final.get("decision") == "replace_candidate":
+            proposed.extend(final.get("corrections", []) or [])
+    proposal_keys = {_canonical_json(item) for item in proposed if isinstance(item, dict)}
+    if not corrections or any(_canonical_json(item) not in proposal_keys for item in corrections):
+        raise HTTPException(
+            status_code=422,
+            detail="Corrections must be selected from this OMR review run.",
+        )
+    return record
+
+
+def _canonical_json(value: dict) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _confirmed_omr_metadata(
+    record: dict, review_id: str, corrections: list[dict]
+) -> dict:
+    confirmed = [
+        item for item in (record.get("vlmConfirmedCorrections", []) or [])
+        if isinstance(item, dict)
+    ]
+    seen = {_canonical_json(item) for item in confirmed}
+    for correction in corrections:
+        key = _canonical_json(correction)
+        if key not in seen:
+            confirmed.append(correction)
+            seen.add(key)
+    vision = json.loads(json.dumps(record.get("vision") or {}))
+    vision["confirmedCorrections"] = confirmed
+    readiness = assess_omr_readiness(
+        record.get("quality") or {},
+        record.get("recognitionConfidence") or {},
+        vision,
+    )
+    record["vision"] = vision
+    record["vlmConfirmedCorrections"] = confirmed
+    record["transcriptionReadiness"] = readiness
+    return {
+        "datasetRunId": review_id,
+        "engine": record.get("engine"),
+        "quality": record.get("quality") or {},
+        "recognitionConfidence": record.get("recognitionConfidence") or {},
+        "vision": vision,
+        "transcriptionReadiness": readiness,
+    }
+
+
+def _save_confirmed_score_ir_patch(
+    review_id: str,
+    record: dict,
+    result: dict,
+    corrections: list[dict],
+) -> None:
+    run_dir = OMR_REVIEW_ROOT / review_id
+    score_path = run_dir / "vlm-confirmed.score-ir.json"
+    temporary_score_path = run_dir / ".vlm-confirmed.score-ir.json.tmp"
+    temporary_score_path.write_text(
+        json.dumps(result["scoreIr"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_score_path.replace(score_path)
+    record["vlmConfirmedAvailable"] = True
+    record["vlmConfirmedApplied"] = result["applied"]
+    record_path = run_dir / "review.json"
+    temporary_record_path = run_dir / ".review.json.tmp"
+    temporary_record_path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_record_path.replace(record_path)
+
+
+@app.post("/api/vision/review-region")
+async def review_vision_region(
+    image: UploadFile = File(...),
+    candidate: str = Form("{}"),
+    context: str = Form("{}"),
+) -> dict:
+    """Review one ambiguous crop; never mutate MusicXML automatically."""
+    mime_type = (image.content_type or "").lower()
+    image_bytes = await image.read(MAX_IMAGE_BYTES + 1)
+    await image.close()
+    candidate_data = _multipart_json_object(candidate, "candidate")
+    context_data = _multipart_json_object(context, "context")
+    try:
+        return review_score_region(image_bytes, mime_type, candidate_data, context_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VisionConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except VisionUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/omr/audit-musicxml")
+async def audit_musicxml_upload(file: UploadFile = File(...)) -> dict:
+    if Path(file.filename or "").suffix.lower() not in {".xml", ".musicxml"}:
+        raise HTTPException(status_code=400, detail="A MusicXML file is required.")
+    payload = await file.read(10 * 1024 * 1024 + 1)
+    await file.close()
+    if len(payload) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="MusicXML exceeds 10 MB.")
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="MusicXML must be UTF-8 encoded.") from exc
+    return audit_musicxml(text)
+
+
+@app.post("/api/omr/enhanced-parse")
+async def enhanced_omr_parse(
+    file: UploadFile = File(...),
+    useVision: bool = Form(True),
+    maxRegions: int = Form(3),
+    autoSolve: bool = Form(True),
+) -> dict:
+    """HOMR -> semantic audit -> bounded VLM review -> editor projection."""
+    from reader_to_editor import reader_payload_to_editor
+
+    source_filename = Path(file.filename or "").name
+    suffix = Path(source_filename).suffix.lower()
+    source_mime_type = file.content_type or "application/octet-stream"
+    if suffix not in SUPPORTED_OMR_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Enhanced OMR accepts score images or PDF files.")
+    maxRegions = max(0, min(int(maxRegions), 8))
+    image_bytes = await file.read(MAX_OMR_SOURCE_BYTES + 1)
+    await file.close()
+    if len(image_bytes) > MAX_OMR_SOURCE_BYTES:
+        raise HTTPException(status_code=413, detail="OMR source exceeds 32 MB.")
+
+    with tempfile.TemporaryDirectory(prefix="music-reader-enhanced-omr-") as temp_dir:
+        target = Path(temp_dir) / _safe_upload_name(source_filename, suffix)
+        target.write_bytes(image_bytes)
+        try:
+            omr_result = transcribe_with_audiveris(target, Path(temp_dir) / "homr")
+            xml_path = Path(omr_result["exportedPath"])
+            quality = audit_musicxml(xml_path)
+            raw_payload = _remove_source_path(read_score(xml_path))
+            _annotate_score_ir_source(raw_payload, omr_result["engine"])
+            editor_payload = reader_payload_to_editor(raw_payload)
+        except OmrError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        reviews = []
+        review_errors = []
+        review_artifacts: dict[str, bytes] = {}
+        if useVision and maxRegions:
+            measures = select_review_measures(quality, maxRegions, omr_result.get("pages", []))
+            for measure_number in measures:
+                try:
+                    page_info, local_measure = _omr_page_for_measure(
+                        omr_result.get("pages", []), measure_number
+                    )
+                    page_bytes = Path(page_info["imagePath"]).read_bytes()
+                    page_positions = [
+                        {**position, "page": 1}
+                        for position in page_info.get("staffPositions", [])
+                    ]
+                    crop_bytes, crop = crop_measure_region(
+                        page_bytes,
+                        "image/png" if suffix == ".pdf" else source_mime_type,
+                        page_positions,
+                        local_measure,
+                        max(1, int(page_info.get("measureCount") or 1)),
+                        quality["stats"]["partCount"],
+                    )
+                    context_page = None
+                    context_system_index = int(crop.get("systemIndex") or 0) - 1
+                    if context_system_index >= 0:
+                        context_page = page_info
+                    else:
+                        page_number = int(page_info.get("page") or 1)
+                        context_page = next((
+                            page for page in omr_result.get("pages", [])
+                            if int(page.get("page") or 1) == page_number - 1
+                        ), None)
+                        if context_page is not None:
+                            context_system_index = len(context_page.get("staffPositions", [])) - 1
+                    context_metadata = {"included": False}
+                    if context_page is not None and context_system_index >= 0:
+                        context_positions = [
+                            {**position, "page": 1}
+                            for position in context_page.get("staffPositions", [])
+                        ]
+                        crop_bytes, context_metadata = prepend_previous_system_context(
+                            crop_bytes,
+                            Path(context_page["imagePath"]).read_bytes(),
+                            context_positions,
+                            context_system_index,
+                        )
+                    crop["previousSystemContext"] = context_metadata
+                    crop["page"] = page_info.get("page", 1)
+                    crop["localMeasure"] = local_measure
+                    artifact_name = f"review-crops/measure-{measure_number:04d}.png"
+                    crop["artifact"] = artifact_name
+                    review_artifacts[artifact_name] = crop_bytes
+                    candidate = extract_measure_candidate(xml_path, measure_number)
+                    previous_candidate = (
+                        extract_measure_candidate(xml_path, measure_number - 1)
+                        if measure_number > 1 else None
+                    )
+                    review = review_score_region_with_escalation(
+                        crop_bytes,
+                        "image/png",
+                        candidate,
+                        {
+                            "measure": measure_number,
+                            "measureCount": quality["stats"]["measureCount"],
+                            "auditIssues": [
+                                issue for issue in quality["issues"]
+                                if str(issue.get("measure")) == str(measure_number)
+                            ],
+                            "imageLayout": (
+                                "previous system above target crop"
+                                if context_metadata.get("included") else "target crop only"
+                            ),
+                            "previousMeasureCandidate": previous_candidate,
+                        },
+                    )
+                    reviews.append({"measure": measure_number, "crop": crop, "review": review})
+                except (
+                    KeyError, TypeError, OmrError, OSError, ValueError,
+                    VisionConfigurationError, VisionUpstreamError,
+                ) as exc:
+                    review_errors.append({"measure": measure_number, "error": str(exc)})
+
+        editor_payload["rawSummary"] = raw_payload.get("summary", {})
+        editor_payload["readerResult"] = raw_payload
+        _annotate_editor_analysis(editor_payload)
+        editor_payload["importRoute"] = "reader-projection"
+        source_musicxml = xml_path.read_text(encoding="utf-8-sig")
+        editor_payload["sourceMusicXml"] = source_musicxml
+        confidence_summary = summarize_recognition_confidence(
+            omr_result.get("pages", [])
+        )
+        vision_summary = {
+            "enabled": useVision,
+            "reviewedRegions": reviews,
+            "errors": review_errors,
+            "autoApplied": False,
+        }
+        readiness = assess_omr_readiness(quality, confidence_summary, vision_summary)
+        editor_payload["omr"] = {
+            "engine": omr_result["engine"],
+            "quality": quality,
+            "pageCount": len(omr_result.get("pages", [])),
+            "staffPositions": omr_result.get("staffPositions", []),
+            "recognitionConfidence": confidence_summary,
+            "vision": vision_summary,
+            "transcriptionReadiness": readiness,
+        }
+        if not readiness["solverAllowed"]:
+            blocker = {
+                "code": "OMR_REVIEW_REQUIRED",
+                "message": "OMR contains unresolved recognition risks.",
+                "details": readiness["issues"],
+            }
+            for mode in editor_payload.get("solverEligibility", {}).values():
+                mode["eligible"] = False
+                mode.setdefault("issues", []).append(blocker)
+        run_id = uuid.uuid4().hex
+        save_review_run(
+            OMR_REVIEW_ROOT,
+            run_id,
+            image_bytes,
+            suffix,
+            source_musicxml,
+            {
+                "engine": omr_result["engine"],
+                "createdAt": _utc_timestamp(),
+                "sourceFileName": source_filename,
+                "sourceSuffix": suffix,
+                "quality": quality,
+                "recognitionConfidence": confidence_summary,
+                "vision": editor_payload["omr"]["vision"],
+                "transcriptionReadiness": readiness,
+            },
+            artifacts=review_artifacts,
+        )
+        editor_payload["omr"]["datasetRunId"] = run_id
+        editor_payload["endToEnd"] = (
+            _solve_imported_exercise(editor_payload)
+            if autoSolve else {
+                "status": "ready",
+                "stage": "exercise",
+                "questionType": (editor_payload.get("exerciseExtraction") or {}).get("recommendedQuestionType"),
+                "issues": [],
+            }
+        )
+        return editor_payload
+
+
+def _omr_page_for_measure(
+    pages: list[dict[str, Any]], measure_number: int
+) -> tuple[dict[str, Any], int]:
+    """Map a merged score measure to its source page and page-local measure."""
+    if not pages:
+        raise OmrError("OMR did not report rendered page metadata.")
+    offset = 0
+    for page in pages:
+        count = max(0, int(page.get("measureCount") or 0))
+        if count and measure_number <= offset + count:
+            return page, measure_number - offset
+        offset += count
+    raise OmrError(f"Measure {measure_number} cannot be mapped to a rendered page.")
+
+
+@app.post("/api/omr/review-runs/{run_id}/final-musicxml")
+async def save_human_final_musicxml(run_id: str, file: UploadFile = File(...)) -> dict:
+    """Attach a validated, versioned human target without altering HOMR output."""
+    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid OMR review run id.")
+    run_dir = OMR_REVIEW_ROOT / run_id
+    record_path = run_dir / "review.json"
+    if not record_path.is_file():
+        raise HTTPException(status_code=404, detail="OMR review run was not found.")
+    submitted_name = Path(file.filename or "").name
+    if Path(submitted_name).suffix.lower() not in {".xml", ".musicxml"}:
+        raise HTTPException(status_code=400, detail="A MusicXML file is required.")
+    payload = await file.read(MAX_FINAL_MUSICXML_BYTES + 1)
+    await file.close()
+    if len(payload) > MAX_FINAL_MUSICXML_BYTES:
+        raise HTTPException(status_code=413, detail="MusicXML exceeds 10 MB.")
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="MusicXML must be UTF-8 encoded.") from exc
+    audit = audit_musicxml(text)
+    if audit["status"] == "invalid":
+        raise HTTPException(status_code=422, detail={"message": "Final MusicXML failed validation.", "audit": audit})
+
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="OMR review record is invalid.") from exc
+    if not isinstance(record, dict):
+        raise HTTPException(status_code=422, detail="OMR review record is invalid.")
+
+    with tempfile.TemporaryDirectory(prefix="music-reader-human-final-") as temp_dir:
+        candidate_path = Path(temp_dir) / "human-final.musicxml"
+        candidate_path.write_text(text, encoding="utf-8")
+        try:
+            parsed = read_score(candidate_path)
+            score_ir_validation = validate_score_ir(parsed.get("scoreIr", {}))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Final MusicXML cannot be converted to the internal score representation.",
+                    "error": str(exc)[:500],
+                },
+            ) from exc
+        if not score_ir_validation["valid"]:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Final MusicXML produced an invalid internal score representation.",
+                    "validation": score_ir_validation,
+                },
+            )
+        try:
+            comparison = {
+                "available": True,
+                **score_musicxml_semantics(candidate_path, run_dir / "homr.musicxml"),
+            }
+        except Exception as exc:
+            comparison = {"available": False, "error": str(exc)[:500]}
+
+    normalized_bytes = text.encode("utf-8")
+    final_sha256 = hashlib.sha256(normalized_bytes).hexdigest()
+    final_path = run_dir / "human-final.musicxml"
+    existing_sha256 = None
+    try:
+        existing_revision = max(0, int(record.get("humanFinalRevision") or 0))
+    except (TypeError, ValueError):
+        existing_revision = 0
+    if final_path.is_file():
+        existing_bytes = final_path.read_bytes()
+        existing_sha256 = hashlib.sha256(existing_bytes).hexdigest()
+        existing_revision = max(existing_revision, 1)
+
+    idempotent = existing_sha256 == final_sha256
+    if final_path.is_file() and not idempotent:
+        archive_dir = run_dir / "human-final-revisions"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_name = f"revision-{existing_revision:04d}-{existing_sha256[:12]}.musicxml"
+        archive_path = archive_dir / archive_name
+        if not archive_path.exists():
+            _atomic_write_text(archive_path, final_path.read_text(encoding="utf-8-sig"))
+        history = record.get("humanFinalHistory")
+        if not isinstance(history, list):
+            history = []
+        if not any(item.get("sha256") == existing_sha256 for item in history if isinstance(item, dict)):
+            history.append({
+                "revision": existing_revision,
+                "sha256": existing_sha256,
+                "savedAt": record.get("humanFinalSavedAt"),
+                "archive": archive_path.relative_to(run_dir).as_posix(),
+            })
+        record["humanFinalHistory"] = history
+
+    revision = existing_revision if idempotent else existing_revision + 1
+    if revision == 0:
+        revision = 1
+    _atomic_write_text(final_path, text)
+    record["humanFinalAvailable"] = True
+    record["humanFinalRevision"] = revision
+    record["humanFinalSha256"] = final_sha256
+    record["humanFinalFileName"] = submitted_name
+    record["humanFinalSavedAt"] = _utc_timestamp()
+    record["humanFinalAudit"] = audit
+    record["humanFinalScoreIrValidation"] = score_ir_validation
+    record["homrVsHuman"] = comparison
+    record["labelStatus"] = "gold-human"
+    record["trainingEvidence"] = {
+        "labelEligible": True,
+        "realImageAligned": False,
+        "reason": "The stored source is page/document-level; HOMR staff-window training uses synthetic renders until explicit staff alignment exists.",
+    }
+    _atomic_write_text(record_path, json.dumps(record, ensure_ascii=False, indent=2))
+    return {
+        "runId": run_id,
+        "saved": True,
+        "idempotent": idempotent,
+        "revision": revision,
+        "audit": audit,
+        "scoreIrValidation": score_ir_validation,
+        "homrVsHuman": comparison,
+        "trainingEvidence": record["trainingEvidence"],
+    }
 
 
 # P18.6: 全局兜底, 任何未捕获的 Python 异常都返回 200 + 安全 message,
@@ -244,9 +1149,12 @@ async def read_score_upload(file: UploadFile = File(...)) -> dict:
                 omr_dir = Path(temp_dir) / "omr-output"
                 omr_result = transcribe_with_audiveris(target, omr_dir)
                 result = _remove_source_path(read_score(omr_result["exportedPath"]))
+                _annotate_score_ir_source(result, omr_result["engine"])
                 result["omr"] = {
                     "engine": omr_result["engine"],
                     "exportedFileName": Path(omr_result["exportedPath"]).name,
+                    "quality": audit_musicxml(omr_result["exportedPath"]),
+                    "staffPositions": omr_result.get("staffPositions", []),
                     "note": "OMR output should be treated as a draft and checked before analysis.",
                 }
                 result["warnings"].insert(
@@ -284,6 +1192,7 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
     if suffix not in supported:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
 
+    omr_metadata = None
     with tempfile.TemporaryDirectory(prefix="music-reader-parse-") as temp_dir:
         target = Path(temp_dir) / _safe_upload_name(file.filename, suffix)
         with target.open("wb") as handle:
@@ -296,6 +1205,13 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
                 omr_dir = Path(temp_dir) / "omr-output"
                 omr_result = transcribe_with_audiveris(target, omr_dir)
                 raw_payload = _remove_source_path(read_score(omr_result["exportedPath"]))
+                _annotate_score_ir_source(raw_payload, omr_result["engine"])
+                omr_metadata = {
+                    "engine": omr_result["engine"],
+                    "quality": audit_musicxml(omr_result["exportedPath"]),
+                    "staffPositions": omr_result.get("staffPositions", []),
+                    "visionAvailable": vision_status().get("configured", False),
+                }
             else:
                 raw_payload = _remove_source_path(read_score(target))
         except OmrError as exc:
@@ -307,8 +1223,12 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
     editor_payload = reader_payload_to_editor(raw_payload)
     # 附上原始 summary 给前端 (keyPerMeasure, cadences, etc.)
     editor_payload["rawSummary"] = raw_payload.get("summary", {})
+    _annotate_editor_analysis(editor_payload)
+    editor_payload["importRoute"] = _musicxml_import_route(source_musicxml)
     if source_musicxml is not None:
         editor_payload["sourceMusicXml"] = source_musicxml
+    if omr_metadata is not None:
+        editor_payload["omr"] = omr_metadata
     return editor_payload
 
 
@@ -319,7 +1239,10 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
 # 全部 XML 在 SHTE_ROOT (eval-data/extracted/hamony dataset/) 下面, 388 个.
 # 限制: 一次最多返 N 个 (默认 1 个, 让用户先试通流程).
 
-SHTE_ROOT = Path(r"C:\Users\Administrator\Documents\try\eval-data\extracted\hamony dataset")
+SHTE_ROOT = Path(os.environ.get(
+    "SHTE_ROOT",
+    str(CURRENT_DIR / "data" / "external" / "sposobin-shte" / "SHTE_V1" / "hamony dataset"),
+))
 _XML_FILE_REGISTRY: dict[str, Path] = {}
 
 
@@ -418,7 +1341,9 @@ async def parse_score_by_id(request: Request) -> dict:
 
     editor_payload = reader_payload_to_editor(raw_payload)
     editor_payload["rawSummary"] = raw_payload.get("summary", {})
+    _annotate_editor_analysis(editor_payload)
     source_musicxml = _read_source_musicxml(target)
+    editor_payload["importRoute"] = _musicxml_import_route(source_musicxml)
     if source_musicxml is not None:
         editor_payload["sourceMusicXml"] = source_musicxml
     return editor_payload
@@ -480,6 +1405,8 @@ def _solver_to_four_part_response(
     solver_result_dict: dict,
     request: FourPartRequest,
     melody_rhythm: list | None = None,
+    alto_rhythm: list | None = None,
+    tenor_rhythm: list | None = None,
     bass_rhythm: list | None = None,
 ) -> dict:
     """Convert solver.to_dict() output into the response schema the
@@ -680,6 +1607,19 @@ def _solver_to_four_part_response(
 
     summary = solver_result_dict.get("summary", {})
     key = summary.get("key", request.key)
+    independent_validation = validate_four_part_solution(
+        solver_result_dict,
+        key=key,
+        question_type=request.questionType,
+    )
+    solver_qualifies = bool(summary.get("qualify"))
+    independently_valid = bool(independent_validation["valid"])
+    qualifies = solver_qualifies and independently_valid
+    violations = list(summary.get("violations", []) or [])
+    violations.extend(
+        f"{issue['code']}: {issue['message']}"
+        for issue in independent_validation["errors"]
+    )
     # Convert flat chord-per-beat → per-measure "harmonies" array
     harmonies_per_measure = []
     for mi, m in enumerate(measures_data):
@@ -714,7 +1654,7 @@ def _solver_to_four_part_response(
             "fallback": False,
         },
         "summary": {
-            "status": "complete" if summary.get("qualify") else "complete_with_warnings",
+            "status": "complete" if qualifies else "complete_with_warnings",
             "analyzedKey": {
                 "name": key.split()[0] if key else "",
                 "mode": key.split()[1] if len(key.split()) > 1 else "",
@@ -724,8 +1664,9 @@ def _solver_to_four_part_response(
             "partCount": 4,
             "measureCount": summary.get("measureCount", len(measures_data)),
             "cadence": _solver_cadence_per_measure(solver_result_dict)[-1] if measures_data else None,
-            "qualify": summary.get("qualify", False),
-            "violations": summary.get("violations", []),
+            "qualify": qualifies,
+            "violations": violations,
+            "independentValidation": independent_validation,
             "score": summary.get("score"),
             "cadences": _solver_cadence_per_measure(solver_result_dict),
             # P7.5.1: per-measure local key (empty when no modulation).
@@ -739,12 +1680,12 @@ def _solver_to_four_part_response(
         "fourPart": {
             "timeSignature": request.timeSignature,
             "voices": [
-                voice_track("soprano", melody_rhythm if request.questionType != "bass" else None),
-                voice_track("alto"),
-                voice_track("tenor"),
+                voice_track("soprano", melody_rhythm if request.questionType == "melody" else None),
+                voice_track("alto", alto_rhythm if request.questionType == "alto" else None),
+                voice_track("tenor", tenor_rhythm if request.questionType == "tenor" else None),
                 voice_track("bass", bass_rhythm if request.questionType == "bass" else None),
             ],
-            "qualityStatus": "pass" if summary.get("qualify") else "warn",
+            "qualityStatus": "pass" if qualifies else "warn",
             "harmonies": harmonies_per_measure,
             # P18.7: explanation 必须传 array, 前端 (answer.explanation || []).map(...)
             # 直接 .map 一个 string 会抛 "answer.explanation.map is not a function".
@@ -874,15 +1815,26 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     natively.  The frontend populates request.bassMeasures (or
     request.bassEntries) and the solver runs in bass-given mode.
     """
+    source_blocker = _source_projection_blocker(request.sourceProjection)
+    if source_blocker is not None:
+        return _safe_four_part_error_response(
+            request,
+            str(source_blocker["message"]),
+            internal=f"source projection rejected: {source_blocker['code']}",
+            error_code=str(source_blocker["code"]),
+        )
+
     # P8: bass-given mode.  Pull the bass line from the request, pass
     # it to the solver.  Melody can still be present (used as soft
     # context for NCT classification) but is not enforced.
-    if request.questionType not in ("melody", "bass"):
+    if request.questionType not in ("melody", "alto", "tenor", "bass"):
         return _safe_four_part_error_response(
             request, "题型必须是 melody 或 bass。", error_code="BAD_QUESTION_TYPE"
         )
 
     bass_for_solver: list[list] | None = None
+    alto_for_solver: list[list] | None = None
+    tenor_for_solver: list[list] | None = None
     if request.questionType == "bass":
         bass_for_solver = request.bassMeasures
         if not bass_for_solver and request.bassEntries:
@@ -895,6 +1847,25 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
             )
 
     # Convert app.js format → solver format
+    if request.questionType == "alto":
+        alto_for_solver = request.altoMeasures
+        if not alto_for_solver and request.altoEntries:
+            alto_for_solver = [request.altoEntries]
+        if not alto_for_solver:
+            return _safe_four_part_error_response(
+                request, "Alto-given mode requires an alto line.",
+                error_code="EMPTY_ALTO",
+            )
+    elif request.questionType == "tenor":
+        tenor_for_solver = request.tenorMeasures
+        if not tenor_for_solver and request.tenorEntries:
+            tenor_for_solver = [request.tenorEntries]
+        if not tenor_for_solver:
+            return _safe_four_part_error_response(
+                request, "Tenor-given mode requires a tenor line.",
+                error_code="EMPTY_TENOR",
+            )
+
     measures_for_solver = request.melodyMeasures
     if not measures_for_solver and request.melodyEntries:
         # Frontend may send a flat melodyEntries when there's only one
@@ -907,13 +1878,14 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     # is given (it uses bass as the anchor, not soprano).  In
     # melody-given mode (or when no bass is provided either),
     # melodyMeasures must be non-empty.
-    if not measures_for_solver and bass_for_solver is None:
+    fixed_for_solver = bass_for_solver or alto_for_solver or tenor_for_solver
+    if not measures_for_solver and fixed_for_solver is None:
         # P18.6: 用友好 message + 200, 不要让前端看到 "HTTP 400" 错误.
         return _safe_four_part_error_response(
             request, "旋律题需要在「3 五线谱制谱」区用鼠标点输入旋律, 或在下方文本框填好后点「填入到五线谱」按钮, 再生成四部和声参考答案.",
             error_code="EMPTY_MELODY",
         )
-    if bass_for_solver is not None:
+    if fixed_for_solver is not None:
         # P8 review: regardless of whether the user passed melodyMeasures,
         # bass-given mode requires the bass to be the binding constraint.
         # If the user also sent a melody, the solver would treat
@@ -921,15 +1893,37 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         # triggering the enumerate_voicings mutex.  Force the melody
         # to a rest-only placeholder matching the bass line shape so
         # the soprano is free to be filled in by the search.
-        target_shape = bass_for_solver
+        target_shape = fixed_for_solver
         measures_for_solver = [
             [None] * len(m)
             for m in target_shape
         ]
 
+    eligibility = _solver_input_eligibility(
+        measures_for_solver if fixed_for_solver is None else [],
+        bass_for_solver,
+        request.timeSignature,
+        request.questionType,
+        alto_measures=alto_for_solver,
+        tenor_measures=tenor_for_solver,
+    )
+    if not eligibility["eligible"]:
+        first_issue = eligibility["issues"][0]
+        error_code = (
+            "BAD_TIME_SIGNATURE"
+            if first_issue["code"] == "BAD_TIME_SIGNATURE"
+            else "INPUT_NOT_SOLVER_READY"
+        )
+        return _safe_four_part_error_response(
+            request,
+            str(first_issue["message"]),
+            internal=f"solver input rejected: {first_issue['code']}",
+            error_code=error_code,
+        )
+
     try:
         # B1: 网格细分因子由"活跃输入"的最细时值决定 (旋律题看旋律, 低音题看低音).
-        subdiv_source = bass_for_solver if bass_for_solver is not None else measures_for_solver
+        subdiv_source = fixed_for_solver if fixed_for_solver is not None else measures_for_solver
         kwargs: dict = {
             "subdivision": _appjs_measures_subdivision(subdiv_source, request.timeSignature),
         }
@@ -942,6 +1936,18 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
             # two per-measure grids diverge.
             melody_pitches = [[None] * len(measure) for measure in converted_bass]
             kwargs["bass_pitches"] = converted_bass
+        elif alto_for_solver is not None:
+            converted_alto = _appjs_measures_to_solver_melody(
+                alto_for_solver, request.timeSignature
+            )
+            melody_pitches = [[None] * len(measure) for measure in converted_alto]
+            kwargs["alto_pitches"] = converted_alto
+        elif tenor_for_solver is not None:
+            converted_tenor = _appjs_measures_to_solver_melody(
+                tenor_for_solver, request.timeSignature
+            )
+            melody_pitches = [[None] * len(measure) for measure in converted_tenor]
+            kwargs["tenor_pitches"] = converted_tenor
         else:
             melody_pitches = _appjs_measures_to_solver_melody(
                 measures_for_solver, request.timeSignature
@@ -971,6 +1977,8 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         return _solver_to_four_part_response(
             solver_dict, request,
             melody_rhythm=measures_for_solver,
+            alto_rhythm=alto_for_solver,
+            tenor_rhythm=tenor_for_solver,
             bass_rhythm=bass_for_solver,
         )
     except ValueError as exc:

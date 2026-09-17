@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>乐谱分析工具</title>
-    <link rel="stylesheet" href="styles.css?v=100" />
+    <link rel="stylesheet" href="styles.css?v=101" />
   </head>
   <body>
     <main class="app">
@@ -47,7 +47,23 @@
           <div class="upload-icon" aria-hidden="true">♩</div>
           <h2>上传乐谱文件</h2>
           <p>MusicXML、MIDI、印刷谱图片或 PDF</p>
+          <label class="auto-solve-control">
+            <input id="autoSolveInput" type="checkbox" checked>
+            <span>识谱后自动生成四部和声答案</span>
+          </label>
           <button id="pickButton" type="button">选择文件</button>
+          <section id="endToEndWorkflow" class="workflow-status" aria-live="polite">
+            <header>
+              <strong>端到端处理</strong>
+              <span id="workflowOverallStatus">等待文件</span>
+            </header>
+            <ol>
+              <li data-workflow-step="recognition"><span>1</span><b>识谱</b><small>等待</small></li>
+              <li data-workflow-step="validation"><span>2</span><b>校验</b><small>等待</small></li>
+              <li data-workflow-step="solver"><span>3</span><b>解题</b><small>等待</small></li>
+              <li data-workflow-step="notation"><span>4</span><b>答案谱</b><small>等待</small></li>
+            </ol>
+          </section>
         </section>
 
         <section class="manual-panel view-panel" data-view="chords">
@@ -852,6 +868,8 @@
                 <span>题型</span>
                 <select id="questionTypeSelect">
                   <option value="melody">旋律题</option>
+                  <option value="alto">女低音题</option>
+                  <option value="tenor">男高音题</option>
                   <option value="bass">低音题</option>
                 </select>
               </label>
@@ -878,9 +896,11 @@
             </div>
           </header>
           <div class="answer-meta">
-            <span>可直接读取上方文本，多小节用 || 分隔</span>
+            <span>参考答案：平行五八与声部交叉为硬约束；导音、七音解决为软约束，不等同严格批改。</span>
             <div class="answer-meta-actions">
               <button id="applyFourPartButton" class="secondary-button" type="button" disabled>套用到制谱区</button>
+              <button id="downloadAnswerMusicXmlButton" class="secondary-button" type="button" disabled title="导出答案 MusicXML">↓ MusicXML</button>
+              <button id="downloadAnswerSvgButton" class="secondary-button" type="button" disabled title="导出当前答案谱 SVG">↓ SVG</button>
               <strong id="fourPartStatus">等待生成</strong>
             </div>
           </div>
@@ -931,6 +951,20 @@
             <header><h2>校验警告</h2></header>
             <div id="warningList" class="warning-list empty">尚无校验结果</div>
           </article>
+
+          <article id="omrReviewPanel" class="panel omr-review-panel" hidden>
+            <header>
+              <h2>OMR 人工复核</h2>
+              <span id="omrReviewStatus"></span>
+            </header>
+            <div id="omrReviewList" class="omr-review-list"></div>
+            <div class="omr-review-actions">
+              <button id="applyOmrCorrectionsButton" type="button">应用选中修正</button>
+              <input id="omrFinalMusicXmlInput" type="file" accept=".xml,.musicxml,application/xml" hidden>
+              <button id="submitOmrFinalButton" type="button" title="上传人工校正后的 MusicXML">提交人工最终稿</button>
+            </div>
+            <p id="omrFinalStatus" class="omr-final-status" aria-live="polite"></p>
+          </article>
         </section>
       </section>
     </main>
@@ -939,6 +973,6 @@
     <script src="coordinate-system.js?v=100"></script>
     <!-- P22.5-B.1: Score Model (数据契约层) — 必须在 app.js 前加载 -->
     <script src="score-model.js?v=100"></script>
-    <script src="app.js?v=102"></script>
+    <script src="app.js?v=107"></script>
   </body>
 </html>

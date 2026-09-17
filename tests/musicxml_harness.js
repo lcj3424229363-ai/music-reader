@@ -95,7 +95,7 @@ function extractConst(source, name) {
 function loadMusicXmlFunctions() {
   const source = fs.readFileSync(APP_JS, 'utf8');
   const constants = [
-    'musicXmlTypes', 'MUSICXML_DIVISIONS', 'DIVISIONS_PER_UNIT', 'tupletRatios',
+    'stepIndex', 'durationUnits', 'musicXmlTypes', 'MUSICXML_DIVISIONS', 'DIVISIONS_PER_UNIT', 'tupletRatios',
     'articulationXml', 'ornamentXml', 'keyFifths', 'typeToDuration',
     'xmlToArticulation', 'xmlToOrnament', 'xmlToDynamics', 'xmlToBarline',
     'xmlRepeatToBarline', 'fifthsToKey', 'fifthsToMinorKey'
@@ -106,7 +106,11 @@ function loadMusicXmlFunctions() {
     'musicXmlNotations', 'musicXmlBarlines', 'parseChordSymbol', 'chordKind',
     'musicXmlHarmony', 'musicXmlVoiceNumber', 'parseMusicXmlText',
     'parseMusicXmlMeasure', 'parseMusicXmlDirection', 'parseMusicXmlHarmony',
-    'parseMusicXmlNote', 'noteToEntry', 'keyFromFifths', 'xmlEscape', 'xmlUnescape'
+    'parseMusicXmlNote', 'noteToEntry', 'keyFromFifths', 'xmlEscape', 'xmlUnescape',
+    'isMusicReaderCanonicalXml', 'unitsForDuration', 'unitsForEntry', 'sumEntryUnits',
+    'entryVoice', 'sortPitches', 'normalizeEntryForExport', 'exportVoiceEntries',
+    'normalizeKeyForSelect', 'normalizeAnswerEntryForEditor',
+    'buildAnswerScoreDocument', 'buildAnswerMusicXml'
   ];
   const declarations = [
     ...constants.map((name) => extractConst(source, name)),
@@ -120,7 +124,12 @@ function loadMusicXmlFunctions() {
       throw new Error(`Invalid extracted declaration ${name}: ${error.message}`);
     }
   });
-  const sandbox = {};
+  const sandbox = {
+    editorTime: { value: '4/4' },
+    editorKey: { value: 'C' },
+    scoreDocumentTitle: 'Test score',
+    lastFourPartResult: null
+  };
   vm.createContext(sandbox);
   vm.runInContext(
     `${declarations.join('\n\n')}\nthis.__exports = { ${functions.join(', ')} };`,

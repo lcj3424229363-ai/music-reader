@@ -7,14 +7,26 @@ import pytest
 import omr
 
 
+def test_project_homr_environment_precedes_user_install(monkeypatch, tmp_path):
+    project_homr = tmp_path / ".venv-homr" / "Scripts" / "homr.exe"
+    project_homr.parent.mkdir(parents=True)
+    project_homr.write_bytes(b"")
+    monkeypatch.delenv("HOMR_EXE", raising=False)
+    monkeypatch.setattr(omr, "__file__", str(tmp_path / "omr.py"))
+
+    assert omr.find_homr() == project_homr.resolve()
+
+
 def test_repeated_image_transcription_uses_fresh_output(monkeypatch, tmp_path):
     source = tmp_path / "score.png"
     source.write_bytes(b"fake image")
     fake_homr = tmp_path / "homr.exe"
     fake_homr.write_bytes(b"")
     monkeypatch.setattr(omr, "find_homr", lambda: fake_homr)
+    commands = []
 
     def fake_run(command, *, cwd, **kwargs):
+        commands.append(command)
         Path(cwd, command[1]).with_suffix(".musicxml").write_text("<score/>", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
@@ -26,6 +38,7 @@ def test_repeated_image_transcription_uses_fresh_output(monkeypatch, tmp_path):
     assert first["exportedPath"] != second["exportedPath"]
     assert Path(first["exportedPath"]).is_file()
     assert Path(second["exportedPath"]).is_file()
+    assert all("--write-staff-positions" in command for command in commands)
 
 
 def test_pdf_is_rendered_page_by_page_and_merged(monkeypatch, tmp_path):
@@ -66,4 +79,6 @@ def test_pdf_is_rendered_page_by_page_and_merged(monkeypatch, tmp_path):
 
     assert result["engine"] == "homr+pymupdf"
     assert len(calls) == 2
+    assert [page["measureCount"] for page in result["pages"]] == [1, 1]
+    assert all(Path(page["imagePath"]).is_file() for page in result["pages"])
     assert len(list(parsed.parts[0].getElementsByClass(music21.stream.Measure))) == 2

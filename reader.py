@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from music21 import chord, converter, key, meter, note, stream
+from music21 import chord, clef, converter, key, meter, note, stream
+from score_ir import fraction_text, score_ir_from_reader_payload
 
 # 把项目根目录加到 sys.path, 让 from theory import ... 能找到
 _PROJECT_ROOT = Path(__file__).parent
@@ -41,7 +43,7 @@ def read_score(path: str | Path) -> dict[str, Any]:
 
     warnings = _collect_warnings(part_results, harmony_timeline)
 
-    return {
+    result = {
         "source": {
             "fileName": score_path.name,
             "extension": extension,
@@ -63,6 +65,8 @@ def read_score(path: str | Path) -> dict[str, Any]:
         "harmonyTimeline": harmony_timeline,
         "warnings": warnings,
     }
+    result["scoreIr"] = score_ir_from_reader_payload(result)
+    return result
 
 
 def _build_harmony_timeline(theory_result: dict) -> list[dict]:
@@ -136,29 +140,43 @@ def _analyze_key(score: stream.Score) -> dict[str, Any]:
 def _read_part(part: stream.Part, index: int) -> dict[str, Any]:
     measures = list(part.getElementsByClass(stream.Measure))
     part_name = part.partName or part.partAbbreviation or f"Part {index}"
-    measure_results = [_read_measure(measure) for measure in measures]
+    staff_number = _part_staff_number(part)
+    measure_results = [_read_measure(measure, staff_number) for measure in measures]
 
     return {
         "index": index,
         "id": part.id,
         "name": part_name,
+        "staffNumber": staff_number,
         "measureCount": len(measure_results),
         "measures": measure_results,
     }
 
 
-def _read_measure(measure: stream.Measure) -> dict[str, Any]:
+def _part_staff_number(part: stream.Part) -> int:
+    """Return the original MusicXML staff number when music21 split PartStaff."""
+    for value in (getattr(part, "staffNumber", None), getattr(part, "id", None)):
+        if isinstance(value, int) and value > 0:
+            return value
+        match = re.search(r"(?:Staff|staff)[-_ ]?(\d+)$", str(value or ""))
+        if match:
+            return int(match.group(1))
+    return 1
+
+
+def _read_measure(measure: stream.Measure, staff_number: int = 1) -> dict[str, Any]:
     time_signature = _active_time_signature(measure)
     key_signature = _active_key_signature(measure)
+    active_clef = _active_clef(measure)
     events = []
 
     for element in measure.recurse().notesAndRests:
         if isinstance(element, note.Rest):
-            events.append(_rest_event(element, measure))
+            events.append(_rest_event(element, measure, staff_number))
         elif isinstance(element, note.Note):
-            events.append(_note_event(element, measure))
+            events.append(_note_event(element, measure, staff_number))
         elif isinstance(element, chord.Chord):
-            events.append(_chord_event(element, measure))
+            events.append(_chord_event(element, measure, staff_number))
 
     expected_quarters = _expected_quarter_length(time_signature)
     actual_quarters = _measure_actual_quarter_length(measure)
@@ -172,13 +190,34 @@ def _read_measure(measure: stream.Measure) -> dict[str, Any]:
     return {
         "number": measure.measureNumber,
         "offset": _round_float(measure.offset),
+        "offsetFraction": fraction_text(measure.offset),
+        "implicit": bool(getattr(measure, "paddingLeft", 0)),
         "timeSignature": time_signature,
         "keySignature": key_signature,
+        "clef": active_clef,
         "expectedQuarterLength": expected_quarters,
+        "expectedQuarterFraction": (
+            time_signature["barDurationFraction"]
+            if time_signature else None
+        ),
         "actualQuarterLength": actual_quarters,
+        "actualQuarterFraction": fraction_text(measure.duration.quarterLength),
         "eventCount": len(events),
         "events": events,
         "warnings": local_warnings,
+    }
+
+
+def _active_clef(measure: stream.Measure) -> dict[str, Any] | None:
+    local = list(measure.getElementsByClass(clef.Clef))
+    active = local[0] if local else measure.getContextByClass(clef.Clef)
+    if active is None:
+        return None
+    return {
+        "name": type(active).__name__,
+        "sign": getattr(active, "sign", None),
+        "line": getattr(active, "line", None),
+        "octaveChange": int(getattr(active, "octaveChange", 0) or 0),
     }
 
 
@@ -194,6 +233,7 @@ def _active_time_signature(measure: stream.Measure) -> dict[str, Any] | None:
     return {
         "ratio": active.ratioString,
         "barDurationQuarterLength": _round_float(active.barDuration.quarterLength),
+        "barDurationFraction": fraction_text(active.barDuration.quarterLength),
     }
 
 
@@ -229,37 +269,89 @@ def _voice_id(element) -> str | None:
     return v.id if v is not None else None
 
 
-def _note_event(element: note.Note, measure: stream.Measure) -> dict[str, Any]:
+def _note_event(element: note.Note, measure: stream.Measure, staff_number: int = 1) -> dict[str, Any]:
     return {
         "type": "note",
         "offset": _round_float(element.getOffsetInHierarchy(measure)),
+        "offsetFraction": fraction_text(element.getOffsetInHierarchy(measure)),
         "duration": _round_float(element.duration.quarterLength),
+        "durationFraction": fraction_text(element.duration.quarterLength),
         "pitch": element.pitch.nameWithOctave,
         "pitchClass": element.pitch.pitchClass,
+        "pitchComponents": [_pitch_components(element.pitch)],
         "voice": _voice_id(element),
+        "staff": staff_number,
+        "dots": int(element.duration.dots or 0),
+        "grace": bool(element.duration.isGrace),
+        "ties": _ties(element),
+        "tuplets": _tuplets(element),
     }
 
 
-def _rest_event(element: note.Rest, measure: stream.Measure) -> dict[str, Any]:
+def _rest_event(element: note.Rest, measure: stream.Measure, staff_number: int = 1) -> dict[str, Any]:
     return {
         "type": "rest",
         "offset": _round_float(element.getOffsetInHierarchy(measure)),
+        "offsetFraction": fraction_text(element.getOffsetInHierarchy(measure)),
         "duration": _round_float(element.duration.quarterLength),
+        "durationFraction": fraction_text(element.duration.quarterLength),
         "voice": _voice_id(element),
+        "staff": staff_number,
+        "dots": int(element.duration.dots or 0),
+        "grace": bool(element.duration.isGrace),
+        "ties": [],
+        "tuplets": _tuplets(element),
     }
 
 
-def _chord_event(element: chord.Chord, measure: stream.Measure) -> dict[str, Any]:
+def _chord_event(element: chord.Chord, measure: stream.Measure, staff_number: int = 1) -> dict[str, Any]:
     return {
         "type": "chord",
         "offset": _round_float(element.getOffsetInHierarchy(measure)),
+        "offsetFraction": fraction_text(element.getOffsetInHierarchy(measure)),
         "duration": _round_float(element.duration.quarterLength),
+        "durationFraction": fraction_text(element.duration.quarterLength),
         "pitches": [pitch.nameWithOctave for pitch in element.pitches],
+        "pitchComponents": [_pitch_components(pitch) for pitch in element.pitches],
         "pitchClasses": sorted(set(pitch.pitchClass for pitch in element.pitches)),
         "commonName": _safe_common_name(element),
         "root": _safe_root(element),
         "voice": _voice_id(element),
+        "staff": staff_number,
+        "dots": int(element.duration.dots or 0),
+        "grace": bool(element.duration.isGrace),
+        "ties": sorted({tie for item in element.notes for tie in _ties(item)}),
+        "tuplets": _tuplets(element),
     }
+
+
+def _pitch_components(value) -> dict[str, Any]:
+    alter = value.accidental.alter if value.accidental is not None else 0
+    return {
+        "step": value.step,
+        "alter": int(alter) if float(alter).is_integer() else float(alter),
+        "octave": value.octave,
+        "display": value.nameWithOctave,
+        "pitchClass": value.pitchClass,
+    }
+
+
+def _ties(element) -> list[str]:
+    tie = getattr(element, "tie", None)
+    if tie is None or not tie.type:
+        return []
+    return [str(tie.type)]
+
+
+def _tuplets(element) -> list[dict[str, Any]]:
+    return [
+        {
+            "actual": int(value.numberNotesActual),
+            "normal": int(value.numberNotesNormal),
+            "type": value.type,
+        }
+        for value in element.duration.tuplets
+    ]
 
 
 def _read_chordified_harmony(score: stream.Score) -> list[dict[str, Any]]:

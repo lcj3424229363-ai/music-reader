@@ -44,3 +44,9 @@ def test_native_musicxml_is_not_routed_through_omr():
 def test_uploaded_source_path_is_removed():
     payload = {"source": {"fileName": "score.xml", "path": r"C:\temp\score.xml"}}
     assert "path" not in server._remove_source_path(payload)["source"]
+
+
+def test_frontend_only_labels_solver_output_as_a_rule_guided_draft():
+    source = (server.CURRENT_DIR / "web" / "app.js").read_text(encoding="utf-8")
+    assert "已生成规则草案" in source
+    assert "这不是严格批改结果" in source

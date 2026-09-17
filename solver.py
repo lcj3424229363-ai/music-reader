@@ -815,7 +815,8 @@ VOICE_RANGES = {
     "soprano": (Note.from_name("A3"), Note.from_name("D6")),
     "alto":    (Note.from_name("G3"), Note.from_name("E5")),
     "tenor":   (Note.from_name("C3"), Note.from_name("A4")),
-    "bass":    (Note.from_name("E2"), Note.from_name("D4")),
+    # The bundled Sposobin exercises include chromatic Eb2 bass notes.
+    "bass":    (Note.from_name("D2"), Note.from_name("D4")),
 }
 VOICE_ORDER = ("soprano", "alto", "tenor", "bass")
 
@@ -1002,6 +1003,16 @@ def has_voice_crossing(va: Voicing) -> list[str]:
             issues.append("alto crosses tenor")
         if va.tenor.midi < va.bass.midi:
             issues.append("tenor crosses bass")
+    return issues
+
+
+def has_voice_spacing_violation(voicing: Voicing) -> list[str]:
+    """Upper adjacent voices may not be separated by more than an octave."""
+    issues: list[str] = []
+    if voicing.soprano.midi - voicing.alto.midi > 12:
+        issues.append("soprano/alto spacing exceeds an octave")
+    if voicing.alto.midi - voicing.tenor.midi > 12:
+        issues.append("alto/tenor spacing exceeds an octave")
     return issues
 
 
@@ -2179,6 +2190,7 @@ def check_voicing(
     """
     errs: list[str] = []
     errs.extend(has_voice_crossing(voicing))
+    errs.extend(has_voice_spacing_violation(voicing))
     # 只有"平行五八度 + 声部交叉"作为 hard 约束 (fundamental, 绝不能违反).
     # 导音解决 / 七音解决 / 导音不得重复 都改为软惩罚 (score_voicing),
     # 否则旋律含导音/七音时束搜索会被整死, 触发降级合成出错误和弦
@@ -2299,6 +2311,8 @@ def enumerate_voicings(
     key: Key,
     *,
     melody: Note | None = None,
+    fixed_alto: Note | None = None,
+    fixed_tenor: Note | None = None,
     fixed_bass: Note | None = None,
     prev: Voicing | None = None,
     prev_chord: Chord | None = None,
@@ -2330,16 +2344,22 @@ def enumerate_voicings(
     alto and tenor with all valid combinations of the remaining chord tones
     within their ranges, with at most one doubling.
     """
-    if melody is not None and fixed_bass is not None:
+    anchors = [melody, fixed_alto, fixed_tenor, fixed_bass]
+    if sum(anchor is not None for anchor in anchors) > 1:
         raise ValueError(
-            "enumerate_voicings: melody and fixed_bass are mutually exclusive; "
+            "enumerate_voicings: SATB anchors are mutually exclusive; "
             "pass exactly one anchor."
         )
     if max_results <= 0:
         return []
     # P0.1-bugfix: 固定声部 (旋律/低音) 不强制导音解决, 否则旋律导音下行时
     # 束搜索会被 hard 约束整死. 自由声部才强制.
-    _skip_voice = "soprano" if melody is not None else ("bass" if fixed_bass is not None else None)
+    _skip_voice = (
+        "soprano" if melody is not None else
+        "alto" if fixed_alto is not None else
+        "tenor" if fixed_tenor is not None else
+        "bass" if fixed_bass is not None else None
+    )
     chord_pcs = chord.pitch_classes(key)
     results: list[tuple[Voicing, float, list[str]]] = []
     bass_pc = chord.bass_pitch_class(key)
@@ -2388,8 +2408,18 @@ def enumerate_voicings(
                     out.append(cand)
         return out
 
-    altos = inner_candidates("alto")
-    tenors = inner_candidates("tenor")
+    if fixed_alto is not None:
+        altos = [fixed_alto] if (
+            in_range("alto", fixed_alto) and fixed_alto.pc in chord_pcs
+        ) else []
+    else:
+        altos = inner_candidates("alto")
+    if fixed_tenor is not None:
+        tenors = [fixed_tenor] if (
+            in_range("tenor", fixed_tenor) and fixed_tenor.pc in chord_pcs
+        ) else []
+    else:
+        tenors = inner_candidates("tenor")
 
     # P4: classify the melody as chord-tone / non-chord-tone
     # (passing / neighbor / suspension) so we can allow non-chord-tone
@@ -3029,6 +3059,8 @@ class Beat:
     offset: float
     duration: float
     soprano: Note | None = None  # None for rests
+    alto: Note | None = None     # None unless alto-given mode
+    tenor: Note | None = None    # None unless tenor-given mode
     bass: Note | None = None     # None unless bass-given mode (P8)
 
 
@@ -3093,6 +3125,8 @@ def solve_melody(
     top_n: int = 1,
     key_changes: "list[KeyChange | tuple[int, str]] | None" = None,
     bass_pitches: "list[list[Note | None]] | None" = None,
+    alto_pitches: "list[list[Note | None]] | None" = None,
+    tenor_pitches: "list[list[Note | None]] | None" = None,
     chord_pool_profile: str | None = None,
     # P21.4: phrase-plan hint layer.  Optional; default None
     # reproduces P0-P7.7 behaviour exactly.
@@ -3176,6 +3210,18 @@ def solve_melody(
                 raise ValueError(f"第 {m_idx} 小节的低音网格数必须与旋律网格数一致。")
 
     # B1: 解析拍号, 得到拍长 (四分单位) 与每小节拍数, 供强/弱拍与终止式槽位判断.
+    for voice, grid in (("alto", alto_pitches), ("tenor", tenor_pitches)):
+        if grid is None:
+            continue
+        if not isinstance(grid, list) or len(grid) != measure_count:
+            raise ValueError(f"{voice} measure count must match the solver grid")
+        for m_idx, (melody_measure, voice_measure) in enumerate(
+                zip(melody_pitches, grid), start=1):
+            if not isinstance(voice_measure, list) or len(voice_measure) != len(melody_measure):
+                raise ValueError(
+                    f"measure {m_idx} {voice} grid must match the solver grid"
+                )
+
     beat_dur_quarters = 4.0 / _den_beats
 
     # P8.1: resolve chord pool profile.  When set, the chapter's allowed
@@ -3240,8 +3286,12 @@ def solve_melody(
         [n for m in bass_pitches for n in m] if bass_pitches is not None else []
     )
     flat_bass_check = [n for n in flat_bass_check if n is not None]
-    if not flat and not flat_bass_check:
-        raise ValueError("melody is empty (no notes and no bass)")
+    flat_inner_checks = {
+        "alto": [n for m in (alto_pitches or []) for n in m if n is not None],
+        "tenor": [n for m in (tenor_pitches or []) for n in m if n is not None],
+    }
+    if not flat and not flat_bass_check and not any(flat_inner_checks.values()):
+        raise ValueError("solver input is empty (no anchored notes)")
     sop_lo, sop_hi = VOICE_RANGES["soprano"]
     for n in flat:
         if n.midi < sop_lo.midi or n.midi > sop_hi.midi:
@@ -3258,6 +3308,14 @@ def solve_melody(
                     f"bass note {n.name} is out of bass range "
                     f"[{bass_lo.name}..{bass_hi.name}].  "
                     f"Pass bass in bass range or set VOICE_RANGES wider."
+                )
+    for voice, notes in flat_inner_checks.items():
+        lo, hi = VOICE_RANGES[voice]
+        for n in notes:
+            if n.midi < lo.midi or n.midi > hi.midi:
+                raise ValueError(
+                    f"{voice} note {n.name} is out of {voice} range "
+                    f"[{lo.name}..{hi.name}]."
                 )
 
     # Build beat list
@@ -3279,12 +3337,21 @@ def solve_melody(
         for b_idx, mel in enumerate(measure):
             offset = sum(durs[:b_idx])
             b_note: Note | None = None
+            a_note: Note | None = None
+            t_note: Note | None = None
             if bass_pitches is not None and m_idx < len(bass_pitches):
                 m_bass = bass_pitches[m_idx]
                 if b_idx < len(m_bass):
                     b_note = m_bass[b_idx]
+            if alto_pitches is not None and b_idx < len(alto_pitches[m_idx]):
+                a_note = alto_pitches[m_idx][b_idx]
+            if tenor_pitches is not None and b_idx < len(tenor_pitches[m_idx]):
+                t_note = tenor_pitches[m_idx][b_idx]
             beats.append(
-                Beat(offset=offset, duration=durs[b_idx], soprano=mel, bass=b_note)
+                Beat(
+                    offset=offset, duration=durs[b_idx], soprano=mel,
+                    alto=a_note, tenor=t_note, bass=b_note,
+                )
             )
             flat_melody.append(mel)
             flat_bass.append(b_note)
@@ -3448,6 +3515,16 @@ def solve_melody(
             pool = [c for c in pool
                     if c.bass_pitch_class(local_key) == target_bass_pc]
 
+        # Inner-voice exercises constrain the chord pitch class here and
+        # the exact octave/register in enumerate_voicings below.
+        inner_anchor = beat.alto if beat.alto is not None else beat.tenor
+        if inner_anchor is not None:
+            if is_cadence_beat and len(pool) == 1 \
+                    and inner_anchor.pc not in pool[0].pitch_classes(local_key):
+                pool = _pool(local_key)
+            pool = [c for c in pool
+                    if inner_anchor.pc in c.pitch_classes(local_key)]
+
         # P7.5.2: at the modulation boundary, restrict the pool to
         # pivot chords only.  The function-shift (Sposobin ch34 §5)
         # happens AT the pivot, so this is the only valid choice.
@@ -3566,6 +3643,8 @@ def solve_melody(
                 voicings = enumerate_voicings(
                     chord, local_key,
                     melody=beat.soprano,
+                    fixed_alto=beat.alto,
+                    fixed_tenor=beat.tenor,
                     fixed_bass=beat.bass,
                     prev=prev_v,
                     prev_chord=prev_c,
@@ -3595,6 +3674,12 @@ def solve_melody(
                         errs,
                     ))
         if not expansions:
+            if beat.alto is not None or beat.tenor is not None:
+                voice = "alto" if beat.alto is not None else "tenor"
+                note = beat.alto if beat.alto is not None else beat.tenor
+                raise ValueError(
+                    f"no valid SATB voicing preserves fixed {voice} note {note.name}"
+                )
             # P18.5: if the melody-wins forced-fallback below succeeds,
             # we DON'T want a hard "no valid voicing" warning (the
             # user gets a working voicing, just not textbook-preferred).

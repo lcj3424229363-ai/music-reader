@@ -23,10 +23,27 @@ from solver import (
     detect_cadence,
     has_parallel,
     has_voice_crossing,
+    has_voice_spacing_violation,
     in_range,
     VOICE_RANGES,
     Note as N,
 )
+
+
+def test_upper_voice_spacing_is_a_hard_constraint():
+    valid = Voicing(
+        soprano=N.from_name("C5"), alto=N.from_name("C4"),
+        tenor=N.from_name("G3"), bass=N.from_name("C3"),
+    )
+    invalid = Voicing(
+        soprano=N.from_name("D5"), alto=N.from_name("C4"),
+        tenor=N.from_name("G3"), bass=N.from_name("C3"),
+    )
+
+    assert has_voice_spacing_violation(valid) == []
+    assert has_voice_spacing_violation(invalid) == [
+        "soprano/alto spacing exceeds an octave"
+    ]
 
 
 def _flat_melody(measures: list[list[N]]) -> list[N]:

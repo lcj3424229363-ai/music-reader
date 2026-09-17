@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import shutil
 import subprocess
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +24,65 @@ class OmrError(RuntimeError):
     pass
 
 
+def _read_staff_positions(path: Path, page: int) -> list[dict[str, Any]]:
+    """Read homr's normalized staff boxes without importing its internals."""
+    if not path.is_file():
+        return []
+    positions = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            staff_class, center_x, center_y, width, height = map(float, line.split())
+        except (TypeError, ValueError):
+            continue
+        if not all(0 <= value <= 1 for value in (center_x, center_y, width, height)):
+            continue
+        positions.append({
+            "page": page,
+            "grandStaff": bool(staff_class),
+            "centerX": center_x,
+            "centerY": center_y,
+            "width": width,
+            "height": height,
+        })
+    return positions
+
+
+def _musicxml_measure_count(path: Path) -> int:
+    """Return measures per page without counting the same measure in every part."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return 0
+    tag = lambda element: element.tag.rsplit("}", 1)[-1]
+    if tag(root) == "score-timewise":
+        return sum(tag(child) == "measure" for child in root)
+    counts = [
+        sum(tag(child) == "measure" for child in part)
+        for part in root if tag(part) == "part"
+    ]
+    return max(counts, default=0)
+
+
+def _read_recognition_confidence(path: Path) -> dict[str, Any] | None:
+    confidence_path = path.with_suffix(".confidence.json")
+    if not confidence_path.is_file():
+        return None
+    try:
+        value = json.loads(confidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("schemaVersion") != "homr-confidence-v1":
+        return None
+    return value
+
+
 def find_homr() -> Path | None:
     """Locate homr from HOMR_EXE, PATH, or common per-user installs."""
     configured = os.environ.get("HOMR_EXE")
+    project_homr = Path(__file__).resolve().parent / ".venv-homr" / "Scripts" / "homr.exe"
     candidates = [
         Path(configured).expanduser() if configured else None,
+        project_homr,
         Path.home() / ".local" / "bin" / "homr.exe",
         Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "homr" / "Scripts" / "homr.exe",
     ]
@@ -55,7 +111,7 @@ def _run_homr(
 
     try:
         completed = subprocess.run(
-            [str(homr), work_input.name],
+            [str(homr), work_input.name, "--write-staff-positions"],
             cwd=str(target_dir),
             capture_output=True,
             text=True,
@@ -223,11 +279,24 @@ def transcribe_with_audiveris(
         pages, render_engine = _render_pdf_pages(source, target_dir, timeout_seconds)
 
     page_outputs: list[Path] = []
+    staff_positions: list[dict[str, Any]] = []
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
-    for page in pages:
+    page_metadata: list[dict[str, Any]] = []
+    for page_index, page in enumerate(pages, start=1):
         exported, stdout, stderr = _run_homr(homr, page, target_dir, timeout_seconds)
         page_outputs.append(exported)
+        recognition_confidence = _read_recognition_confidence(exported)
+        page_staff_positions = _read_staff_positions(exported.with_suffix(".txt"), page_index)
+        staff_positions.extend(page_staff_positions)
+        page_metadata.append({
+            "page": page_index,
+            "imagePath": str(page.resolve()),
+            "musicXmlPath": str(exported.resolve()),
+            "measureCount": _musicxml_measure_count(exported),
+            "staffPositions": page_staff_positions,
+            "recognitionConfidence": recognition_confidence,
+        })
         stdout_parts.append(stdout)
         stderr_parts.append(stderr)
 
@@ -247,6 +316,12 @@ def transcribe_with_audiveris(
         "exportedPath": str(exported),
         "stdout": "\n".join(stdout_parts)[-4000:],
         "stderr": "\n".join(stderr_parts)[-4000:],
+        "staffPositions": staff_positions,
+        "pages": page_metadata,
+        "recognitionConfidence": [
+            page["recognitionConfidence"] for page in page_metadata
+            if page["recognitionConfidence"] is not None
+        ],
     }
 
 

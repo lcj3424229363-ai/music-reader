@@ -309,6 +309,115 @@ h2 {
   font-weight: 800;
 }
 
+.auto-solve-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: #24332c;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.auto-solve-control input {
+  display: block;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #1f7a56;
+}
+
+.workflow-status {
+  width: min(760px, 100%);
+  margin-top: 12px;
+  padding-top: 14px;
+  border-top: 1px solid #e0e5de;
+}
+
+.workflow-status header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.workflow-status header span {
+  color: #607065;
+}
+
+.workflow-status ol {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workflow-status li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 0 8px;
+  padding: 9px;
+  border: 1px solid #dfe3dc;
+  background: #f8f9f5;
+}
+
+.workflow-status li > span {
+  grid-row: 1 / 3;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: #526158;
+  border: 1px solid #bdc8bf;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.workflow-status li b,
+.workflow-status li small {
+  overflow-wrap: anywhere;
+}
+
+.workflow-status li b {
+  font-size: 13px;
+}
+
+.workflow-status li small {
+  color: #718078;
+}
+
+.workflow-status li.is-active {
+  border-color: #5b9275;
+  background: #edf6ef;
+}
+
+.workflow-status li.is-complete > span {
+  color: #ffffff;
+  border-color: #1f7a56;
+  background: #1f7a56;
+}
+
+.workflow-status li.is-blocked {
+  border-color: #d8a27f;
+  background: #fff6ee;
+}
+
+.workflow-status li.is-failed {
+  border-color: #d59892;
+  background: #fff0ee;
+}
+
+@media (max-width: 700px) {
+  .workflow-status ol {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .manual-panel,
 .note-panel,
 .answer-panel {
@@ -1036,6 +1145,65 @@ dd {
   padding: 12px;
   background: #f8f9f5;
   border: 1px solid #e3e7df;
+}
+
+.omr-review-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.omr-review-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #dfe3dc;
+  background: #f8f9f5;
+}
+
+.omr-review-row input {
+  margin-top: 3px;
+}
+
+.omr-review-row strong,
+.omr-review-row small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.omr-review-row small {
+  margin-top: 5px;
+  color: #607065;
+}
+
+.omr-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.omr-review-empty,
+.omr-final-status {
+  color: #607065;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.omr-review-empty {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #dfe3dc;
+  background: #f8f9f5;
+}
+
+.omr-final-status {
+  min-height: 20px;
+  margin: 8px 0 0;
+  text-align: right;
 }
 
 .part-block strong,

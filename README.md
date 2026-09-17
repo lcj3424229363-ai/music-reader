@@ -1,5 +1,9 @@
 # Music Reader MVP
 
+> Project owner: [lcj3424229363-ai](https://github.com/lcj3424229363-ai)
+>
+> Engineering assistance: OpenAI Codex
+
 这个目录是乐谱分析工具的第一条可运行流水线：先读结构化乐谱文件，再输出结构化读谱结果。
 
 当前支持：

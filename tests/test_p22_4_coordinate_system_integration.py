@@ -15,16 +15,18 @@ P22.4 CoordinateSystem v1 — B.2 集成测试 (静态契约 + server smoke)
 
 import os
 import re
-import subprocess
 import unittest
-import urllib.request
+
+from fastapi.testclient import TestClient
+
+import server
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_JS = os.path.join(ROOT, "web", "app.js")
 INDEX_HTML = os.path.join(ROOT, "web", "index.html")
 SERVER_PY = os.path.join(ROOT, "server.py")
 CS_JS = os.path.join(ROOT, "web", "coordinate-system.js")
-BASE_URL = "http://127.0.0.1:8765"
+CLIENT = TestClient(server.app)
 
 
 def _read(p):
@@ -33,19 +35,11 @@ def _read(p):
 
 
 def _http_get(path):
-    """GET http://127.0.0.1:8765<path>, return (status_code, body_str).
+    """GET one app route and return (status_code, body_str).
     第一次 GET 偶尔会因 server 刚启动 / chunked encoding 返回不完整 body; retry 一次保稳.
     """
-    last_err = None
-    for _ in range(3):
-        try:
-            req = urllib.request.Request(f"{BASE_URL}{path}")
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, r.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            last_err = e
-            import time; time.sleep(0.2)
-    return 0, str(last_err) if last_err else "unknown"
+    response = CLIENT.get(path)
+    return response.status_code, response.content.decode("utf-8", errors="replace")
 
 
 class TestIndexHtmlScriptOrder(unittest.TestCase):

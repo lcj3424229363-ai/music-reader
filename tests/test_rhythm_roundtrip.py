@@ -111,6 +111,29 @@ def test_bass_mode_bass_roundtrip():
     assert bass[0]["pitches"][0]["display"] == "C3"
 
 
+def test_inner_voice_anchor_and_rhythm_roundtrip():
+    cases = (("alto", "C", 4), ("tenor", "G", 3))
+    for voice, step, octave in cases:
+        measures = [[_note(step, octave, "1", 32)]]
+        fixed = appjs_measures_to_solver_melody(measures, "4/4")
+        kwargs = {f"{voice}_pitches": fixed}
+        result = solve_melody("C", "4/4", [[None] * 4], **kwargs)
+        request_kwargs = {f"{voice}Measures": measures}
+        request = FourPartRequest(
+            key="C major", timeSignature="4/4", questionType=voice,
+            **request_kwargs,
+        )
+        response_kwargs = {f"{voice}_rhythm": measures}
+        out = _solver_to_four_part_response(
+            result.to_dict(), request, **response_kwargs,
+        )
+
+        entries = _voice_entries(out, voice)
+        assert len(entries) == 1
+        assert entries[0]["duration"] == "1"
+        assert entries[0]["pitches"][0]["display"] == f"{step}{octave}"
+
+
 def test_ornament_and_grace_passthrough():
     """修饰音/演奏记号 (ornament/grace/articulation/fermata/dynamic/slur/
     textMark/chordSymbol) 在往返后必须原样保留, 不能丢。"""

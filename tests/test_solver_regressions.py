@@ -33,6 +33,20 @@ def test_bass_anchor_survives_every_fallback_layer():
 
 
 @pytest.mark.parametrize(
+    ("voice", "note_name"),
+    [("alto", "C4"), ("tenor", "G3")],
+)
+def test_inner_voice_anchor_is_preserved_exactly(voice, note_name):
+    note = solver.Note.from_name(note_name)
+    result = solver.solve_melody(
+        "C", "4/4", [[None] * 4],
+        **{f"{voice}_pitches": [[note] * 4]},
+    ).to_dict()
+
+    assert [beat[voice] for beat in result["measures"][0]["beats"]] == [note_name] * 4
+
+
+@pytest.mark.parametrize(
     ("name", "tonic", "accidentals"),
     [
         ("Db", "Db", -5),

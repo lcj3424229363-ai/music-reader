@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 .pyre/
+.venv*/
 
 # ===== Node =====
 node_modules/
@@ -39,11 +40,22 @@ Thumbs.db
 
 # ===== OCR / processing outputs (large, regenerable) =====
 omr-runs/
+data/omr-review-runs/
 p2_1_results/
 *_results/
 __trash_
 __trash_/
 provenance_check_stdout.txt
+
+# Downloaded OMR engines, checkpoints, and generated training corpora
+data/omr-models/
+data/omr-training/
+data/omr-benchmark/
+data/external/
+data/omr-review-runs-audit.json
+
+# Local comparison artifacts
+_diff_*.txt
 
 # ===== Working / debug scripts (root-level, ad-hoc) =====
 # 这些是临时 debug / audit / verify / phase / run / smoke / inspect / show / test

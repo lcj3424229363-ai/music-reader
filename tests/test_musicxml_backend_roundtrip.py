@@ -7,10 +7,20 @@ from music21 import converter
 import server
 from reader import read_score
 from reader_to_editor import reader_payload_to_editor
-from server import _read_source_musicxml
+from server import _musicxml_import_route, _read_source_musicxml
 
 
 client = TestClient(server.app)
+
+
+def test_frontend_propagates_import_projection_to_solver_request():
+    app_js = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+
+    assert "payload.sourceProjection = activeSourceProjection;" in app_js
+    assert 'fetch("/api/score-ir/apply-corrections"' in app_js
+    assert "activeScoreIrRevision !== editorRevision" in app_js
+    assert 'bindEvent(applyOmrCorrectionsButton, "click", applySelectedOmrCorrections);' in app_js
+    assert '".tif", ".tiff", ".bmp", ".pdf"' in app_js
 
 
 FRONTEND_STYLE_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -38,6 +48,11 @@ FRONTEND_STYLE_XML = """<?xml version="1.0" encoding="UTF-8"?>
   </part>
 </score-partwise>
 """
+
+FRONTEND_CANONICAL_XML = FRONTEND_STYLE_XML.replace(
+    '<part-list>',
+    '<identification><miscellaneous><miscellaneous-field name="music-reader-schema">manual-score-v1</miscellaneous-field></miscellaneous></identification><part-list>',
+)
 
 
 def test_frontend_style_musicxml_preserves_key_voices_and_rests(tmp_path: Path):
@@ -84,12 +99,29 @@ def test_parse_score_endpoint_returns_exact_canonical_xml():
 
     assert response.status_code == 200
     assert response.json()["sourceMusicXml"] == FRONTEND_STYLE_XML
+    assert response.json()["importRoute"] == "reader-projection"
+    assert response.json()["solverEligibility"]["melody"]["eligible"] is True
 
 
-def test_frontend_prefers_canonical_xml_over_solver_projection():
+def test_parse_score_endpoint_marks_frontend_owned_xml_as_canonical():
+    response = client.post(
+        "/parse-score",
+        files={"file": ("frontend.musicxml", FRONTEND_CANONICAL_XML.encode("utf-8"), "application/vnd.recordare.musicxml+xml")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["importRoute"] == "frontend-canonical"
+    assert response.json()["sourceMusicXml"] == FRONTEND_CANONICAL_XML
+
+
+def test_only_frontend_marked_xml_uses_the_canonical_frontend_route():
     source = (Path(__file__).parents[1] / "web" / "app.js").read_text(encoding="utf-8")
-    assert "if (editorPayload?.sourceMusicXml)" in source
-    assert "loadParsedMusicXml(parseMusicXmlText(editorPayload.sourceMusicXml));" in source
+    assert 'editorPayload?.importRoute === "frontend-canonical"' in source
+    assert "loadParsedMusicXml(parseMusicXmlText(editorPayload.sourceMusicXml)," in source
+    assert _musicxml_import_route(FRONTEND_STYLE_XML) == "reader-projection"
+    assert _musicxml_import_route(
+        '<miscellaneous-field name="music-reader-schema">manual-score-v1</miscellaneous-field>'
+    ) == "frontend-canonical"
 
 
 def test_frontend_export_is_readable_by_music21():

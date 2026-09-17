@@ -5,10 +5,17 @@ const test = require('node:test');
 const { loadMusicXmlFunctions } = require('./musicxml_harness');
 const { fixture, note, voice } = require('./musicxml_fixture');
 
-const { buildMusicXml, parseMusicXmlText } = loadMusicXmlFunctions();
+const {
+  buildMusicXml,
+  parseMusicXmlText,
+  isMusicReaderCanonicalXml,
+  buildAnswerMusicXml
+} = loadMusicXmlFunctions();
 
 test('frontend MusicXML preserves four independent staff/voice timelines', () => {
   const xml = buildMusicXml(fixture());
+  assert.equal(isMusicReaderCanonicalXml(xml), true);
+  assert.equal(isMusicReaderCanonicalXml('<score-partwise version="4.0"/>'), false);
   const backups = [...xml.matchAll(/<backup>[\s\S]*?<duration>(\d+)<\/duration>[\s\S]*?<\/backup>/g)]
     .map((match) => Number(match[1]));
   assert.deepEqual(backups, [192, 192, 192]);
@@ -92,4 +99,36 @@ test('single bass staff remains a bass staff after roundtrip', () => {
   assert.equal(parsed.staves.bass.length, 1);
   assert.deepEqual(Array.from(parsed.staves.bass[0].voices, (item) => item.id), ['1', '2']);
   assert.equal(parsed.staves.bass[0].voices[1].entries[1].chordSymbol, 'Cm7/G');
+});
+
+test('generated SATB answer exports as a lossless two-staff MusicXML document', () => {
+  const answerNote = (step, octave) => note(step, octave, { duration: '1', units: 32 });
+  const result = {
+    summary: { analyzedKey: { label: 'A minor' } },
+    fourPart: {
+      timeSignature: '4/4',
+      voices: [
+        { id: 'soprano', measures: [{ entries: [answerNote('E', 5)] }] },
+        { id: 'alto', measures: [{ entries: [answerNote('C', 5)] }] },
+        { id: 'tenor', measures: [{ entries: [answerNote('A', 3)] }] },
+        { id: 'bass', measures: [{ entries: [answerNote('A', 2)] }] }
+      ]
+    }
+  };
+
+  const xml = buildAnswerMusicXml(result);
+  assert.equal(isMusicReaderCanonicalXml(xml), true);
+  assert.match(xml, /<staves>2<\/staves>/);
+  assert.equal((xml.match(/<backup>/g) || []).length, 3);
+
+  const parsed = parseMusicXmlText(xml);
+  assert.equal(parsed.staffMode, 'piano');
+  assert.equal(parsed.timeSignature, '4/4');
+  assert.equal(parsed.keySignature, 'Am');
+  assert.deepEqual(Array.from(parsed.staves.treble[0].voices, (item) => item.id), ['1', '2']);
+  assert.deepEqual(Array.from(parsed.staves.bass[0].voices, (item) => item.id), ['1', '2']);
+  assert.equal(parsed.staves.treble[0].voices[0].entries[0].pitches[0].display, 'E5');
+  assert.equal(parsed.staves.treble[0].voices[1].entries[0].pitches[0].display, 'C5');
+  assert.equal(parsed.staves.bass[0].voices[0].entries[0].pitches[0].display, 'A3');
+  assert.equal(parsed.staves.bass[0].voices[1].entries[0].pitches[0].display, 'A2');
 });
