@@ -107,10 +107,10 @@ function loadMusicXmlFunctions() {
     'musicXmlHarmony', 'musicXmlVoiceNumber', 'parseMusicXmlText',
     'parseMusicXmlMeasure', 'parseMusicXmlDirection', 'parseMusicXmlHarmony',
     'parseMusicXmlNote', 'noteToEntry', 'keyFromFifths', 'xmlEscape', 'xmlUnescape',
-    'isMusicReaderCanonicalXml', 'unitsForDuration', 'unitsForEntry', 'sumEntryUnits',
+    'isMusicReaderCanonicalXml', 'unitsForDuration', 'unitsForEntry', 'sumEntryUnits', 'sameUnitValue',
     'entryVoice', 'sortPitches', 'normalizeEntryForExport', 'exportVoiceEntries',
     'normalizeKeyForSelect', 'normalizeAnswerEntryForEditor',
-    'buildAnswerScoreDocument', 'buildAnswerMusicXml'
+    'answerIntegrityReport', 'buildAnswerScoreDocument', 'buildAnswerMusicXml'
   ];
   const declarations = [
     ...constants.map((name) => extractConst(source, name)),

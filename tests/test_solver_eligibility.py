@@ -123,7 +123,13 @@ def test_end_to_end_solver_runs_only_for_unambiguous_ready_exercise(monkeypatch)
 
     def fake_solver(request):
         captured["request"] = request
-        return {"fourPart": {"voices": [{"id": "soprano"}]}, "summary": {"status": "complete"}}
+        return {
+            "fourPart": {
+                "voices": [{"id": role} for role in ("soprano", "alto", "tenor", "bass")],
+                "answerContract": {"valid": True},
+            },
+            "summary": {"status": "complete"},
+        }
 
     monkeypatch.setattr(server, "solve_melody_endpoint", fake_solver)
     melody = [[entry("C", 4)]]

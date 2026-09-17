@@ -46,6 +46,13 @@ def test_musicxml_editor_solver_roundtrip_has_four_aligned_voices():
 
     voices = solved["fourPart"]["voices"]
     assert [voice["id"] for voice in voices] == ["soprano", "alto", "tenor", "bass"]
+    contract = solved["fourPart"]["answerContract"]
+    assert contract["valid"] is True
+    assert contract["version"] == "satb-grand-staff-v1"
+    assert contract["staves"] == [
+        {"id": "treble", "number": 1, "clef": "treble", "voices": ["soprano", "alto"]},
+        {"id": "bass", "number": 2, "clef": "bass", "voices": ["tenor", "bass"]},
+    ]
     measure_counts = {len(_voice_measures(voices, voice_id)) for voice_id in (
         "soprano", "alto", "tenor", "bass"
     )}

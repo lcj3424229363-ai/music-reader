@@ -123,6 +123,63 @@ def test_review_run_only_persists_its_own_confirmed_proposal(tmp_path, monkeypat
     assert "selected from this OMR review run" in rejected.json()["detail"]
 
 
+def test_confirmed_vlm_correction_continues_through_solver_to_grand_staff_answer(
+    tmp_path, monkeypatch
+):
+    run_id = "b" * 32
+    run_dir = tmp_path / run_id
+    run_dir.mkdir()
+    proposed = correction()
+    record = {
+        "engine": "homr",
+        "quality": {"status": "valid", "reviewRequired": False},
+        "recognitionConfidence": {"available": True, "status": "pass"},
+        "vision": {
+            "enabled": True,
+            "errors": [],
+            "reviewedRegions": [{
+                "measure": 1,
+                "review": {"final": {
+                    "decision": "replace_candidate",
+                    "validator": {"accepted": True, "issues": []},
+                    "corrections": [proposed],
+                }},
+            }],
+        },
+    }
+    (run_dir / "review.json").write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(server, "OMR_REVIEW_ROOT", tmp_path)
+
+    score_ir = copy.deepcopy(read_score(SAMPLE)["scoreIr"])
+    score_ir["parts"] = score_ir["parts"][:1]
+    for measure in score_ir["parts"][0]["measures"]:
+        measure["events"] = [
+            event for event in measure["events"] if str(event.get("voice")) == "1"
+        ]
+    score_ir["metadata"]["partCount"] = 1
+
+    response = client.post("/api/score-ir/apply-corrections", json={
+        "scoreIr": score_ir,
+        "corrections": [proposed],
+        "confirmed": True,
+        "source": "vlm",
+        "reviewId": run_id,
+    })
+
+    assert response.status_code == 200
+    payload = response.json()["editorPayload"]
+    assert payload["omr"]["transcriptionReadiness"]["solverAllowed"] is True
+    assert payload["endToEnd"]["status"] == "complete"
+    answer = payload["endToEnd"]["solution"]["fourPart"]
+    assert [voice["id"] for voice in answer["voices"]] == [
+        "soprano", "alto", "tenor", "bass"
+    ]
+    assert answer["answerContract"]["valid"] is True
+    assert [staff["voices"] for staff in answer["answerContract"]["staves"]] == [
+        ["soprano", "alto"], ["tenor", "bass"]
+    ]
+
+
 def test_validator_detects_overlap_from_event_timeline():
     score_ir = read_score(SAMPLE)["scoreIr"]
     first_measure = score_ir["parts"][0]["measures"][0]

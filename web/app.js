@@ -592,11 +592,15 @@ async function presentImportedWorkflow(editorPayload, { omr = false } = {}) {
 }
 
 function showFourPartResult(result) {
-  lastFourPartResult = result;
-  renderFourPartAnswer(result);
-  const voices = result?.fourPart?.voices || [];
-  const isError = result?.summary?.status === "error" || voices.length === 0;
+  const integrity = answerIntegrityReport(result);
+  const isError = result?.summary?.status === "error" || !integrity.valid;
   if (isError) {
+    lastFourPartResult = null;
+    fourPartCanvas?.replaceChildren();
+    if (fourPartCanvas) {
+      fourPartCanvas.textContent = `答案谱不完整：${integrity.issues.join("；") || "求解失败"}`;
+      fourPartCanvas.classList.add("notation-error");
+    }
     if (fourPartStatus) {
       fourPartStatus.classList.remove("status-ok");
       fourPartStatus.classList.add("status-failed");
@@ -607,12 +611,19 @@ function showFourPartResult(result) {
     if (downloadAnswerSvgButton) downloadAnswerSvgButton.disabled = true;
     return false;
   }
+  lastFourPartResult = result;
+  renderFourPartAnswer(result);
   if (fourPartStatus) {
     fourPartStatus.classList.remove("status-failed");
     fourPartStatus.classList.add("status-ok");
     const engine = result?.source?.engine || "sposobin-solver";
-    fourPartStatus.textContent = `已生成规则草案 (${engine})`;
-    fourPartStatus.title = "基础和声规则检查已完成；这不是严格批改结果。";
+    const passed = result?.fourPart?.qualityStatus === "pass";
+    fourPartStatus.textContent = passed
+      ? `参考答案已通过规则检查 (${engine})`
+      : `参考答案已生成，需复核 (${engine})`;
+    fourPartStatus.title = passed
+      ? "四声部完整性与独立声部进行检查已通过。"
+      : "答案可以查看和导出，但独立规则检查发现了需要人工复核的问题。";
   }
   if (downloadAnswerMusicXmlButton) downloadAnswerMusicXmlButton.disabled = false;
   if (downloadAnswerSvgButton) downloadAnswerSvgButton.disabled = !fourPartCanvas?.querySelector("svg");
@@ -1676,6 +1687,17 @@ function renderFourPartAnswer(result) {
   const warningRows = (result.warnings || []).map((line) => (
     `<div class="warning-row">${escapeHtml(line)}</div>`
   ));
+  const independentValidation = result.summary?.independentValidation || {};
+  const validationRows = [
+    ...(independentValidation.errors || []),
+    ...(independentValidation.warnings || [])
+  ].map((issue) => {
+    const location = [
+      issue.measure ? `第 ${issue.measure} 小节` : "",
+      issue.beat ? `第 ${issue.beat} 拍` : ""
+    ].filter(Boolean).join(" ");
+    return `<div class="warning-row"><strong>${escapeHtml(issue.code || "规则检查")}</strong>${location ? ` · ${escapeHtml(location)}` : ""}<p>${escapeHtml(issue.message || "")}</p></div>`;
+  });
 
   // P18.5: 置信度 0-100% + 依据列表. 这是用户要的"百分比依据".
   // summary.confidence + summary.confidenceEvidence 来自 solver (P18.5).
@@ -1733,7 +1755,7 @@ function renderFourPartAnswer(result) {
   }
 
   fourPartDetails.className = "answer-details";
-  fourPartDetails.innerHTML = [errorCodeBanner, degradedBanner, confidenceBlock, alternativesBlock, ...harmonyRows, ...explanationRows, ...warningRows].filter(Boolean).join("") || "没有生成文字说明。";
+  fourPartDetails.innerHTML = [errorCodeBanner, degradedBanner, confidenceBlock, alternativesBlock, ...harmonyRows, ...explanationRows, ...warningRows, ...validationRows].filter(Boolean).join("") || "没有生成文字说明。";
   } catch (err) {
     // P18.6: 任何内部错误都不让用户看到 "list index out of range" 这种
     // Python 风格错误, 改成中文提示 + 让用户刷新或重试.
@@ -2085,7 +2107,8 @@ function renderFourPartScore(voices, timeSignature, harmonies = [], cadence = ""
 function applyFourPartAnswerToEditor() {
   const answer = lastFourPartResult?.fourPart;
   const voices = answer?.voices || [];
-  if (!voices.length) {
+  const integrity = answerIntegrityReport(lastFourPartResult);
+  if (!integrity.valid) {
     fourPartStatus.textContent = "暂无可套用答案";
     return;
   }
@@ -2174,7 +2197,58 @@ function normalizeAnswerEntryForEditor(entry, voiceId) {
   };
 }
 
+function answerIntegrityReport(result) {
+  const answer = result?.fourPart || {};
+  const voices = Array.isArray(answer.voices) ? answer.voices : [];
+  const expectedRoles = ["soprano", "alto", "tenor", "bass"];
+  const byRole = new Map(voices.map((voice) => [voice?.id, voice]));
+  const issues = [];
+  if (voices.length !== expectedRoles.length || expectedRoles.some((role) => !byRole.has(role))) {
+    issues.push("女高音、女低音、男高音、男低音声部必须齐全");
+  }
+  if (byRole.size !== voices.length) issues.push("答案包含重复声部");
+
+  const measureCounts = expectedRoles
+    .map((role) => byRole.get(role))
+    .filter(Boolean)
+    .map((voice) => Array.isArray(voice.measures) ? voice.measures.length : 0);
+  const measureCount = measureCounts[0] || 0;
+  if (!measureCount || measureCounts.some((count) => count !== measureCount)) {
+    issues.push("四个声部的小节数不一致");
+  }
+
+  const meter = meterForTimeSignature(answer.timeSignature || editorTime.value);
+  if (
+    measureCounts.length === expectedRoles.length
+    && measureCount
+    && measureCounts.every((count) => count === measureCount)
+  ) {
+    expectedRoles.forEach((role) => {
+      byRole.get(role).measures.forEach((measure, measureIndex) => {
+        const entries = Array.isArray(measure?.entries) ? measure.entries : [];
+        if (!entries.length) {
+          issues.push(`${role} 第 ${measureIndex + 1} 小节为空`);
+          return;
+        }
+        const used = sumEntryUnits(entries);
+        if (!sameUnitValue(used, meter.capacity)) {
+          issues.push(`${role} 第 ${measureIndex + 1} 小节时值不完整`);
+        }
+      });
+    });
+  }
+
+  const contract = answer.answerContract;
+  if (contract && contract.valid !== true) issues.push("后端答案完整性校验未通过");
+  if (contract?.version && contract.version !== "satb-grand-staff-v1") {
+    issues.push("答案谱布局版本不受支持");
+  }
+  return { valid: issues.length === 0, issues: Array.from(new Set(issues)), measureCount };
+}
+
 function buildAnswerScoreDocument(result) {
+  const integrity = answerIntegrityReport(result);
+  if (!integrity.valid) throw new Error(`答案谱不完整：${integrity.issues.join("；")}`);
   const answer = result?.fourPart || {};
   const byRole = new Map((answer.voices || []).map((voice) => [voice.id, voice]));
   const measureCount = Math.max(1, ...(answer.voices || []).map((voice) => (voice.measures || []).length));

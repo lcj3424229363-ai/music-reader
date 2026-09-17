@@ -464,7 +464,8 @@ def _solve_imported_exercise(editor_payload: dict) -> dict:
         sourceProjection=_editor_source_projection(editor_payload),
     )
     solution = solve_melody_endpoint(request)
-    successful = bool((solution.get("fourPart") or {}).get("voices"))
+    answer_contract = (solution.get("fourPart") or {}).get("answerContract") or {}
+    successful = answer_contract.get("valid") is True
     return {
         "status": "complete" if successful else "failed",
         "stage": "answer" if successful else "solver",
@@ -1691,6 +1692,34 @@ def _solver_to_four_part_response(
     # the frontend can render alternative voicings.
     raw_alternatives = solver_result_dict.get("alternatives", []) or []
 
+    voice_tracks = [
+        voice_track("soprano", melody_rhythm if request.questionType == "melody" else None),
+        voice_track("alto", alto_rhythm if request.questionType == "alto" else None),
+        voice_track("tenor", tenor_rhythm if request.questionType == "tenor" else None),
+        voice_track("bass", bass_rhythm if request.questionType == "bass" else None),
+    ]
+    expected_roles = ["soprano", "alto", "tenor", "bass"]
+    measure_counts = [len(track.get("measures", [])) for track in voice_tracks]
+    contract_issues = []
+    if [track.get("id") for track in voice_tracks] != expected_roles:
+        contract_issues.append("SATB_VOICES_INCOMPLETE")
+    if not measure_counts or min(measure_counts) <= 0 or len(set(measure_counts)) != 1:
+        contract_issues.append("SATB_MEASURES_MISALIGNED")
+    for track in voice_tracks:
+        if any(not (measure.get("entries") or []) for measure in track.get("measures", [])):
+            contract_issues.append("SATB_MEASURE_EMPTY")
+            break
+    answer_contract = {
+        "version": "satb-grand-staff-v1",
+        "valid": not contract_issues,
+        "issues": contract_issues,
+        "measureCount": measure_counts[0] if measure_counts and len(set(measure_counts)) == 1 else 0,
+        "staves": [
+            {"id": "treble", "number": 1, "clef": "treble", "voices": ["soprano", "alto"]},
+            {"id": "bass", "number": 2, "clef": "bass", "voices": ["tenor", "bass"]},
+        ],
+    }
+
     return {
         "source": {
             "engine": "sposobin-solver",
@@ -1724,12 +1753,8 @@ def _solver_to_four_part_response(
         },
         "fourPart": {
             "timeSignature": request.timeSignature,
-            "voices": [
-                voice_track("soprano", melody_rhythm if request.questionType == "melody" else None),
-                voice_track("alto", alto_rhythm if request.questionType == "alto" else None),
-                voice_track("tenor", tenor_rhythm if request.questionType == "tenor" else None),
-                voice_track("bass", bass_rhythm if request.questionType == "bass" else None),
-            ],
+            "voices": voice_tracks,
+            "answerContract": answer_contract,
             "qualityStatus": "pass" if qualifies else "warn",
             "harmonies": harmonies_per_measure,
             # P18.7: explanation 必须传 array, 前端 (answer.explanation || []).map(...)

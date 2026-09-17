@@ -9,7 +9,8 @@ const {
   buildMusicXml,
   parseMusicXmlText,
   isMusicReaderCanonicalXml,
-  buildAnswerMusicXml
+  buildAnswerMusicXml,
+  answerIntegrityReport
 } = loadMusicXmlFunctions();
 
 test('frontend MusicXML preserves four independent staff/voice timelines', () => {
@@ -131,4 +132,21 @@ test('generated SATB answer exports as a lossless two-staff MusicXML document', 
   assert.equal(parsed.staves.treble[0].voices[1].entries[0].pitches[0].display, 'C5');
   assert.equal(parsed.staves.bass[0].voices[0].entries[0].pitches[0].display, 'A3');
   assert.equal(parsed.staves.bass[0].voices[1].entries[0].pitches[0].display, 'A2');
+});
+
+test('SATB answer rejects a missing voice before notation or export', () => {
+  const answerNote = (step, octave) => note(step, octave, { duration: '1', units: 32 });
+  const result = {
+    fourPart: {
+      timeSignature: '4/4',
+      voices: [
+        { id: 'soprano', measures: [{ entries: [answerNote('E', 5)] }] },
+        { id: 'alto', measures: [{ entries: [answerNote('C', 5)] }] },
+        { id: 'bass', measures: [{ entries: [answerNote('A', 2)] }] }
+      ]
+    }
+  };
+
+  assert.equal(answerIntegrityReport(result).valid, false);
+  assert.throws(() => buildAnswerMusicXml(result), /声部必须齐全/);
 });
