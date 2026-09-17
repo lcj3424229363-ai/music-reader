@@ -405,11 +405,13 @@ def prepend_previous_system_context(
         target = target.convert("RGB")
         output_width = max(context_crop.width, target.width)
         separator = 16
+        target_left = (output_width - target.width) // 2
+        target_top = context_crop.height + separator
         combined = Image.new(
             "RGB", (output_width, context_crop.height + separator + target.height), "white"
         )
         combined.paste(context_crop, ((output_width - context_crop.width) // 2, 0))
-        combined.paste(target, ((output_width - target.width) // 2, context_crop.height + separator))
+        combined.paste(target, (target_left, target_top))
         output = io.BytesIO()
         combined.save(output, format="PNG", optimize=True)
     return output.getvalue(), {
@@ -417,6 +419,10 @@ def prepend_previous_system_context(
         "layout": "previous-system-above-target-crop",
         "contextSystemIndex": context_system_index,
         "contextBox": list(box),
+        "targetBox": [
+            target_left, target_top,
+            target_left + target.width, target_top + target.height,
+        ],
         "width": combined.width,
         "height": combined.height,
     }

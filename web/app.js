@@ -461,7 +461,7 @@ function setError(message) {
   warningList.innerHTML = `<div class="warning-row">${escapeHtml(message)}</div>`;
 }
 
-const WORKFLOW_STEPS = ["recognition", "validation", "solver", "notation"];
+const WORKFLOW_STEPS = ["recognition", "review", "validation", "solver", "notation"];
 
 function setWorkflowStep(step, state, label) {
   if (!endToEndWorkflow) return;
@@ -514,6 +514,28 @@ async function presentImportedWorkflow(editorPayload, { omr = false } = {}) {
   const workflow = editorPayload?.endToEnd;
 
   if (omr && workflow) {
+    const vision = editorPayload?.omr?.vision || {};
+    const reviewRegions = vision.reviewedRegions || [];
+    const confirmedCorrections = new Set(
+      (vision.confirmedCorrections || []).map(omrCorrectionIdentity)
+    );
+    const pendingReview = reviewRegions.some((region) => {
+      const final = region?.review?.final || {};
+      if (final.decision === "uncertain") return true;
+      if (final.decision !== "replace_candidate") return false;
+      return (final.corrections || []).some(
+        (correction) => !confirmedCorrections.has(omrCorrectionIdentity(correction))
+      );
+    }) || (vision.errors || []).length > 0;
+    if (reviewRegions.length || (vision.errors || []).length) {
+      setWorkflowStep(
+        "review",
+        pendingReview ? "blocked" : "complete",
+        pendingReview ? "等待确认" : "Qwen 复核完成"
+      );
+    } else {
+      setWorkflowStep("review", "complete", "无需视觉修正");
+    }
     if (workflow.status === "ready") {
       setWorkflowStep("validation", "complete", "识谱已就绪");
       showWorkspaceView("editor");
@@ -534,7 +556,9 @@ async function presentImportedWorkflow(editorPayload, { omr = false } = {}) {
       showFourPartResult(workflow.solution);
       return false;
     }
-    const blockedStage = workflow.stage === "recognition" ? "validation" : "solver";
+    const blockedStage = workflow.stage === "recognition" && pendingReview ? "review"
+      : workflow.stage === "recognition" ? "validation"
+      : "solver";
     setWorkflowStep(blockedStage, "blocked", workflow.status === "selection-required" ? "需确认题型" : "需要人工复核");
     showEditorMessage(workflowIssueMessage(workflow), "warning");
     showWorkspaceView(workflow.stage === "recognition" ? "analysis" : "editor");
@@ -5287,21 +5311,59 @@ function omrCorrectionIdentity(correction) {
   });
 }
 
+function omrReviewArtifactUrl(runId, artifact) {
+  if (!/^[a-f0-9]{32}$/.test(runId || "") || !artifact) return "";
+  const safePath = String(artifact).split("/").map(encodeURIComponent).join("/");
+  return `/api/omr/review-runs/${runId}/artifacts/${safePath}`;
+}
+
+function omrReviewDecision(final) {
+  if (final?.decision === "replace_candidate") return { label: "Qwen 建议修正", tone: "replace" };
+  if (final?.decision === "accept_candidate") return { label: "Qwen 与 HOMR 一致", tone: "accept" };
+  return { label: "需要人工判断", tone: "uncertain" };
+}
+
+function omrCandidateEvent(region, correction) {
+  for (const part of region?.candidate?.parts || []) {
+    for (const event of part?.events || []) {
+      if (event.role === correction.voice && String(event.onset) === String(correction.onset)) {
+        return { ...event, measure: correction.measure, voice: event.role };
+      }
+    }
+  }
+  return null;
+}
+
+function omrTargetOverlayStyle(crop) {
+  const context = crop?.previousSystemContext || {};
+  const box = context.targetBox;
+  const width = Number(context.width);
+  const height = Number(context.height);
+  if (!Array.isArray(box) || box.length !== 4 || !(width > 0) || !(height > 0)) return "";
+  const left = Math.max(0, Math.min(100, Number(box[0]) / width * 100));
+  const top = Math.max(0, Math.min(100, Number(box[1]) / height * 100));
+  const right = Math.max(left, Math.min(100, Number(box[2]) / width * 100));
+  const bottom = Math.max(top, Math.min(100, Number(box[3]) / height * 100));
+  return `left:${left}%;top:${top}%;width:${right - left}%;height:${bottom - top}%`;
+}
+
 function renderOmrCorrectionReview(omr) {
   if (!omrReviewPanel || !omrReviewList || !applyOmrCorrectionsButton) return;
   const previousRunId = activeOmrRunId;
   const runId = /^[a-f0-9]{32}$/.test(omr?.datasetRunId || "") ? omr.datasetRunId : null;
   const corrections = [];
+  const regions = omr?.vision?.reviewedRegions || [];
   const confirmed = new Set(
     (omr?.vision?.confirmedCorrections || []).map(omrCorrectionIdentity)
   );
-  (omr?.vision?.reviewedRegions || []).forEach((region) => {
+  regions.forEach((region, regionIndex) => {
     const final = region?.review?.final;
     if (final?.decision !== "replace_candidate") return;
     (final.corrections || []).forEach((correction) => {
       if (confirmed.has(omrCorrectionIdentity(correction))) return;
       corrections.push({
         correction,
+        regionIndex,
         confidence: Number(final.confidence || 0),
         model: final.model || region?.review?.attempts?.at(-1)?.model || "VLM"
       });
@@ -5312,25 +5374,60 @@ function renderOmrCorrectionReview(omr) {
     runId,
     corrections
   } : null;
-  omrReviewPanel.hidden = !runId && !corrections.length;
+  omrReviewPanel.hidden = !runId && !regions.length;
   if (omrReviewPanel.hidden) {
     omrReviewList.replaceChildren();
     if (omrReviewStatus) omrReviewStatus.textContent = "";
     if (omrFinalStatus) omrFinalStatus.textContent = "";
     return;
   }
-  omrReviewList.innerHTML = corrections.length
-    ? corrections.map((item, index) => {
-        const correction = item.correction;
-        const locatable = ["soprano", "alto", "tenor", "bass"].includes(correction.voice);
-        return `<label class="omr-review-row">
-          <input type="checkbox" data-correction-index="${index}" ${locatable ? "" : "disabled"}>
-          <span><strong>${escapeHtml(formatOmrCorrection(correction))}</strong><small>${escapeHtml(item.model)} · ${(item.confidence * 100).toFixed(0)}%</small></span>
-        </label>`;
+  omrReviewList.innerHTML = regions.length
+    ? regions.map((region, regionIndex) => {
+        const final = region?.review?.final || {};
+        const decision = omrReviewDecision(final);
+        const model = final.model || region?.review?.attempts?.at(-1)?.model || "Qwen";
+        const confidence = Number(final.confidence || 0);
+        const artifactUrl = omrReviewArtifactUrl(runId, region?.crop?.artifact);
+        const overlayStyle = omrTargetOverlayStyle(region?.crop);
+        const regionCorrections = corrections
+          .map((item, index) => ({ ...item, index }))
+          .filter((item) => item.regionIndex === regionIndex);
+        const observations = (final.observations || []).slice(0, 4);
+        const warnings = (final.warnings || []).slice(0, 4);
+        const rows = regionCorrections.length
+          ? regionCorrections.map((item) => {
+              const correction = item.correction;
+              const original = omrCandidateEvent(region, correction);
+              const locatable = ["soprano", "alto", "tenor", "bass"].includes(correction.voice);
+              return `<label class="omr-review-row">
+                <input type="checkbox" data-correction-index="${item.index}" ${locatable ? "" : "disabled"}>
+                <span class="omr-review-comparison">
+                  <span><small>HOMR</small><strong>${escapeHtml(original ? formatOmrCorrection(original) : "未找到原始事件")}</strong></span>
+                  <span class="omr-review-arrow" aria-hidden="true">→</span>
+                  <span><small>Qwen</small><strong>${escapeHtml(formatOmrCorrection(correction))}</strong></span>
+                </span>
+              </label>`;
+            }).join("")
+          : `<p class="omr-review-empty">${escapeHtml(
+              final.decision === "accept_candidate" ? "该区域未发现需要替换的事件。" : "该区域没有可安全应用的修正。"
+            )}</p>`;
+        return `<section class="omr-review-region" data-review-tone="${decision.tone}">
+          <header class="omr-review-region-header">
+            <div><strong>第 ${escapeHtml(String(region.measure || "-"))} 小节</strong><small>${escapeHtml(model)}</small></div>
+            <span class="omr-review-decision">${escapeHtml(decision.label)} · ${(confidence * 100).toFixed(0)}%</span>
+          </header>
+          ${artifactUrl ? `<figure class="omr-review-figure">
+            <img src="${artifactUrl}" alt="第 ${escapeHtml(String(region.measure || ""))} 小节的 Qwen 复核区域" loading="lazy">
+            <span class="omr-review-target" ${overlayStyle ? `style="${overlayStyle}"` : ""}><b>Qwen 复核区</b></span>
+          </figure>` : '<p class="omr-review-empty">复核图片不可用。</p>'}
+          ${observations.length ? `<ul class="omr-review-observations">${observations.map((value) => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : ""}
+          ${rows}
+          ${warnings.length ? `<div class="omr-review-warnings">${warnings.map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
+        </section>`;
       }).join("")
-    : '<p class="omr-review-empty">本次没有可直接应用的 VLM 修正。</p>';
+    : '<p class="omr-review-empty">本次没有生成 Qwen 视觉复核区域。</p>';
   if (omrReviewStatus) {
-    omrReviewStatus.textContent = corrections.length ? `${corrections.length} 条建议` : "待人工确认";
+    omrReviewStatus.textContent = `${regions.length} 个区域 · ${corrections.length} 条建议`;
   }
   applyOmrCorrectionsButton.hidden = !corrections.length;
   applyOmrCorrectionsButton.disabled = !corrections.some((item) =>

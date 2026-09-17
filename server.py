@@ -731,6 +731,46 @@ async def review_vision_region(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/omr/review-runs/{run_id}/artifacts/{artifact_path:path}")
+def get_omr_review_artifact(run_id: str, artifact_path: str) -> FileResponse:
+    """Serve only image artifacts explicitly recorded for one review run."""
+    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid OMR review run id.")
+    relative_path = Path(artifact_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise HTTPException(status_code=400, detail="Invalid OMR review artifact path.")
+
+    run_dir = OMR_REVIEW_ROOT / run_id
+    record_path = run_dir / "review.json"
+    if not record_path.is_file():
+        raise HTTPException(status_code=404, detail="OMR review run was not found.")
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="OMR review record is invalid.") from exc
+
+    normalized = relative_path.as_posix()
+    allowed = {
+        str(name) for name in (record.get("reviewArtifacts", []) or [])
+        if isinstance(name, str)
+    }
+    if normalized not in allowed:
+        raise HTTPException(status_code=404, detail="OMR review artifact was not found.")
+    target = (run_dir / relative_path).resolve()
+    resolved_run = run_dir.resolve()
+    if resolved_run not in target.parents or not target.is_file():
+        raise HTTPException(status_code=404, detail="OMR review artifact was not found.")
+    media_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+    media_type = media_types.get(target.suffix.lower())
+    if media_type is None:
+        raise HTTPException(status_code=415, detail="Unsupported review artifact type.")
+    return FileResponse(
+        target,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 @app.post("/api/omr/audit-musicxml")
 async def audit_musicxml_upload(file: UploadFile = File(...)) -> dict:
     if Path(file.filename or "").suffix.lower() not in {".xml", ".musicxml"}:
@@ -858,7 +898,12 @@ async def enhanced_omr_parse(
                             "previousMeasureCandidate": previous_candidate,
                         },
                     )
-                    reviews.append({"measure": measure_number, "crop": crop, "review": review})
+                    reviews.append({
+                        "measure": measure_number,
+                        "crop": crop,
+                        "candidate": candidate,
+                        "review": review,
+                    })
                 except (
                     KeyError, TypeError, OmrError, OSError, ValueError,
                     VisionConfigurationError, VisionUpstreamError,

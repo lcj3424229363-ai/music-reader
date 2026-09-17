@@ -1149,8 +1149,93 @@ dd {
 
 .omr-review-list {
   display: grid;
-  gap: 8px;
+  gap: 20px;
   margin-top: 16px;
+}
+
+.omr-review-region {
+  min-width: 0;
+  padding-top: 14px;
+  border-top: 2px solid #bcc6bd;
+}
+
+.omr-review-region[data-review-tone="replace"] {
+  border-color: #c4552d;
+}
+
+.omr-review-region[data-review-tone="accept"] {
+  border-color: #2f7a50;
+}
+
+.omr-review-region[data-review-tone="uncertain"] {
+  border-color: #a37213;
+}
+
+.omr-review-region-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.omr-review-region-header strong,
+.omr-review-region-header small {
+  display: block;
+}
+
+.omr-review-region-header small {
+  margin-top: 3px;
+  color: #607065;
+}
+
+.omr-review-decision {
+  font-size: 13px;
+  font-weight: 800;
+  color: #35423a;
+  text-align: right;
+}
+
+.omr-review-figure {
+  position: relative;
+  margin: 0 0 12px;
+  overflow: hidden;
+  border: 1px solid #cfd6cf;
+  background: #fff;
+}
+
+.omr-review-figure img {
+  display: block;
+  width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+}
+
+.omr-review-target {
+  position: absolute;
+  inset: 5px;
+  border: 3px solid #dc3f27;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.85);
+}
+
+.omr-review-target b {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 4px 7px;
+  background: #dc3f27;
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.omr-review-observations {
+  margin: 0 0 10px;
+  padding-left: 20px;
+  color: #48574d;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .omr-review-row {
@@ -1161,6 +1246,39 @@ dd {
   padding: 12px;
   border: 1px solid #dfe3dc;
   background: #f8f9f5;
+}
+
+.omr-review-comparison {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.omr-review-comparison > span:not(.omr-review-arrow) {
+  min-width: 0;
+}
+
+.omr-review-arrow {
+  color: #c4552d;
+  font-size: 18px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.omr-review-warnings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.omr-review-warnings span {
+  padding: 4px 7px;
+  border-left: 3px solid #a37213;
+  background: #fff8e8;
+  color: #6d4b0b;
+  font-size: 12px;
 }
 
 .omr-review-row input {
@@ -1191,6 +1309,24 @@ dd {
   color: #607065;
   font-size: 13px;
   line-height: 1.5;
+}
+
+@media (max-width: 720px) {
+  .omr-review-region-header {
+    display: grid;
+  }
+
+  .omr-review-decision {
+    text-align: left;
+  }
+
+  .omr-review-comparison {
+    grid-template-columns: 1fr;
+  }
+
+  .omr-review-arrow {
+    transform: rotate(90deg);
+  }
 }
 
 .omr-review-empty {

@@ -59,9 +59,10 @@
             </header>
             <ol>
               <li data-workflow-step="recognition"><span>1</span><b>识谱</b><small>等待</small></li>
-              <li data-workflow-step="validation"><span>2</span><b>校验</b><small>等待</small></li>
-              <li data-workflow-step="solver"><span>3</span><b>解题</b><small>等待</small></li>
-              <li data-workflow-step="notation"><span>4</span><b>答案谱</b><small>等待</small></li>
+              <li data-workflow-step="review"><span>2</span><b>Qwen 复核</b><small>等待</small></li>
+              <li data-workflow-step="validation"><span>3</span><b>校验</b><small>等待</small></li>
+              <li data-workflow-step="solver"><span>4</span><b>解题</b><small>等待</small></li>
+              <li data-workflow-step="notation"><span>5</span><b>答案谱</b><small>等待</small></li>
             </ol>
           </section>
         </section>
@@ -954,7 +955,7 @@
 
           <article id="omrReviewPanel" class="panel omr-review-panel" hidden>
             <header>
-              <h2>OMR 人工复核</h2>
+              <h2>Qwen 视觉复核</h2>
               <span id="omrReviewStatus"></span>
             </header>
             <div id="omrReviewList" class="omr-review-list"></div>
@@ -973,6 +974,6 @@
     <script src="coordinate-system.js?v=100"></script>
     <!-- P22.5-B.1: Score Model (数据契约层) — 必须在 app.js 前加载 -->
     <script src="score-model.js?v=100"></script>
-    <script src="app.js?v=107"></script>
+    <script src="app.js?v=108"></script>
   </body>
 </html>

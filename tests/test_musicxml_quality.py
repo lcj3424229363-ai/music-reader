@@ -219,6 +219,8 @@ def test_previous_system_context_is_stacked_above_target_crop():
         assert image.height > 120
     assert metadata["included"] is True
     assert metadata["contextSystemIndex"] == 0
+    assert metadata["targetBox"][1] > metadata["contextBox"][1]
+    assert metadata["targetBox"][3] == metadata["height"]
 
 
 def test_musicxml_audit_endpoint_accepts_valid_score():
@@ -247,6 +249,32 @@ def test_review_run_persists_vlm_crop_artifacts(tmp_path):
     record = json.loads((run_dir / "review.json").read_text(encoding="utf-8"))
     assert record["reviewArtifacts"] == ["review-crops/measure-0001.png"]
     assert (run_dir / "review-crops" / "measure-0001.png").read_bytes() == b"crop"
+
+
+def test_review_crop_endpoint_serves_only_recorded_artifacts(monkeypatch, tmp_path):
+    run_id = "c" * 32
+    save_review_run(
+        tmp_path,
+        run_id,
+        b"image",
+        ".png",
+        SAMPLE.read_text(encoding="utf-8-sig"),
+        {"quality": {}},
+        artifacts={"review-crops/measure-0001.png": b"crop-image"},
+    )
+    monkeypatch.setattr(server, "OMR_REVIEW_ROOT", tmp_path)
+
+    response = client.get(
+        f"/api/omr/review-runs/{run_id}/artifacts/review-crops/measure-0001.png"
+    )
+    missing = client.get(
+        f"/api/omr/review-runs/{run_id}/artifacts/review-crops/unlisted.png"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.content == b"crop-image"
+    assert missing.status_code == 404
 
 
 def test_human_final_is_stored_beside_immutable_homr_result(monkeypatch, tmp_path):

@@ -327,6 +327,8 @@ def test_enhanced_pdf_review_uses_the_matching_rendered_page(tmp_path, monkeypat
     assert region["crop"]["localMeasure"] == 1
     assert region["crop"]["previousSystemContext"]["included"] is True
     assert region["crop"]["previousSystemContext"]["contextSystemIndex"] == 0
+    assert region["candidate"]["measure"] == 2
+    assert region["candidate"]["parts"]
     assert response.json()["omr"]["recognitionConfidence"]["status"] == "unavailable"
     assert response.json()["omr"]["transcriptionReadiness"]["status"] == "needs-review"
     assert response.json()["endToEnd"]["status"] == "review-required"

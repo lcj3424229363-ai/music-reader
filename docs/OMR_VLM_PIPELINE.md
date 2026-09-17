@@ -39,6 +39,10 @@
 - `POST /api/omr/enhanced-parse`: run HOMR, audit, crop, and optional VLM review.
 - `POST /api/omr/review-runs/{run_id}/final-musicxml`: attach human-approved gold.
 - `POST /api/vision/review-region`: manually review one bounded image crop.
+- `GET /api/omr/review-runs/{run_id}/artifacts/{path}`: serve a crop only when
+  the path is explicitly listed in that run's review record. The frontend uses
+  it to overlay the Qwen target region and compare HOMR events with proposed
+  replacements before confirmation.
 
 Audit all persisted runs with:
 

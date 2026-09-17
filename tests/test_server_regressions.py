@@ -50,3 +50,15 @@ def test_frontend_only_labels_solver_output_as_a_rule_guided_draft():
     source = (server.CURRENT_DIR / "web" / "app.js").read_text(encoding="utf-8")
     assert "已生成规则草案" in source
     assert "这不是严格批改结果" in source
+
+
+def test_frontend_renders_qwen_crop_and_homr_comparison():
+    source = (server.CURRENT_DIR / "web" / "app.js").read_text(encoding="utf-8")
+    html = (server.CURRENT_DIR / "web" / "index.html").read_text(encoding="utf-8")
+
+    assert "omrReviewArtifactUrl" in source
+    assert "Qwen 复核区" in source
+    assert "omrCandidateEvent" in source
+    assert "omr-review-comparison" in source
+    assert 'data-workflow-step="review"' in html
+    assert '"recognition", "review", "validation", "solver", "notation"' in source
