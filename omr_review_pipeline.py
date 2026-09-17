@@ -111,10 +111,48 @@ def assess_omr_readiness(
         for item in (vision.get("confirmedCorrections", []) or [])
         if isinstance(item, dict)
     }
+    resolved_review_measures: set[int] = set()
+    for region in vision.get("reviewedRegions", []) or []:
+        final = (region.get("review") or {}).get("final") or {}
+        validator = final.get("validator") or {}
+        decision = final.get("decision")
+        proposed = [
+            correction for correction in (final.get("corrections", []) or [])
+            if isinstance(correction, dict)
+        ]
+        replacement_confirmed = (
+            decision == "replace_candidate"
+            and bool(proposed)
+            and all(
+                _canonical_correction(correction) in confirmed_corrections
+                for correction in proposed
+            )
+        )
+        if validator.get("accepted") and (
+            decision == "accept_candidate" or replacement_confirmed
+        ):
+            try:
+                resolved_review_measures.add(int(region.get("measure")))
+            except (TypeError, ValueError):
+                pass
+
     if quality.get("status") == "invalid":
         issues.append({"code": "OMR_STRUCTURE_INVALID", "message": "MusicXML structure is invalid."})
     elif quality.get("reviewRequired"):
-        issues.append({"code": "OMR_STRUCTURE_REVIEW", "message": "MusicXML structure needs review."})
+        unresolved_quality = []
+        for issue in quality.get("issues", []) or []:
+            try:
+                measure = int(issue.get("measure"))
+            except (AttributeError, TypeError, ValueError):
+                measure = None
+            if measure is None or measure not in resolved_review_measures:
+                unresolved_quality.append(issue)
+        if unresolved_quality:
+            issues.append({
+                "code": "OMR_STRUCTURE_REVIEW",
+                "message": "MusicXML structure needs review.",
+                "details": unresolved_quality,
+            })
     if not confidence.get("available"):
         issues.append({
             "code": "OMR_CONFIDENCE_UNAVAILABLE",

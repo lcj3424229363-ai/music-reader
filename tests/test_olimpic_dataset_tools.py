@@ -101,3 +101,15 @@ def test_confidence_router_calibration_separates_precision_and_recall():
     assert result["falseNegative"] == 1
     assert result["precision"] == 0.5
     assert result["recall"] == 0.5
+
+
+def test_confidence_router_prefers_voice_aware_pitch_risk():
+    result = confidence_router_calibration([{
+        "recognitionConfidence": {"overall": {"rhythm": {"mean": 0.95}}},
+        "orderedPitchEditRecognitionRate": 1.0,
+        "voicePitchEditRecognitionRate": 0.5,
+        "normalizedRhythmEditRecognitionRate": 1.0,
+    }])
+
+    assert result["falseNegative"] == 1
+    assert result["riskDefinition"].startswith("voice-aware pitch")

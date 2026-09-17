@@ -108,6 +108,9 @@ def audit_musicxml(source: str | Path) -> dict[str, Any]:
             previous_onset = Fraction(0)
             max_end = Fraction(0)
             voice_ends: dict[str, Fraction] = defaultdict(Fraction)
+            stream_pitches: dict[tuple[str, str], dict[Fraction, list[int]]] = defaultdict(
+                lambda: defaultdict(list)
+            )
             measure_notes = 0
             for element in measure:
                 name = _tag(element)
@@ -146,6 +149,11 @@ def audit_musicxml(source: str | Path) -> dict[str, Any]:
                     alter = _integer(pitch, "alter") if _child(pitch, "alter") is not None else 0
                     if step not in set("ABCDEFG") or octave is None or not 0 <= octave <= 9 or alter is None or not -2 <= alter <= 2:
                         _issue(issues, "BAD_PITCH", "error", "Pitch spelling is outside MusicXML bounds.", part=part_id, measure=measure_number, voice=voice)
+                    else:
+                        staff = _text(element, "staff", "1")
+                        natural_pc = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}[step]
+                        midi = (octave + 1) * 12 + natural_pc + alter
+                        stream_pitches[(staff, voice)][onset].append(midi)
                 elif _child(element, "rest") is None and _child(element, "unpitched") is None:
                     _issue(issues, "MISSING_PITCH", "error", "Note has no pitch, rest, or unpitched value.", part=part_id, measure=measure_number, voice=voice)
 
@@ -173,6 +181,42 @@ def audit_musicxml(source: str | Path) -> dict[str, Any]:
             implicit = measure.get("implicit") == "yes"
             if expected is not None and max_end and max_end < expected and not implicit and measure_index not in {1, len(measures)}:
                 _issue(issues, "MEASURE_UNDERFILL", "warning", f"Events end at {max_end}, before expected {expected} divisions.", part=part_id, measure=measure_number)
+
+            # Structurally valid OMR can still contain a one-line staff jump
+            # or swapped voices.  These are review triggers, not proof of an
+            # error, and therefore remain warnings.
+            for (staff, voice), onset_map in stream_pitches.items():
+                ordered = [onset_map[onset] for onset in sorted(onset_map)]
+                for previous_pitches, current_pitches in zip(ordered, ordered[1:]):
+                    if min(abs(a - b) for a in previous_pitches for b in current_pitches) > 12:
+                        _issue(
+                            issues, "SUSPICIOUS_MELODIC_LEAP", "warning",
+                            "A voice jumps by more than an octave; verify the recognized staff position.",
+                            part=part_id, measure=measure_number, voice=voice,
+                        )
+                        break
+
+            by_staff_onset: dict[tuple[str, Fraction], dict[str, list[int]]] = defaultdict(dict)
+            for (staff, voice), onset_map in stream_pitches.items():
+                for onset, pitches in onset_map.items():
+                    by_staff_onset[(staff, onset)][voice] = pitches
+            reversal_found = False
+            for voices_at_onset in by_staff_onset.values():
+                numeric = sorted(
+                    ((int(voice), pitches) for voice, pitches in voices_at_onset.items() if voice.isdigit()),
+                    key=lambda item: item[0],
+                )
+                for (_upper_id, upper), (_lower_id, lower) in zip(numeric, numeric[1:]):
+                    if max(upper) < min(lower):
+                        _issue(
+                            issues, "VOICE_ORDER_REVERSAL", "warning",
+                            "Lower-numbered and higher-numbered voices reverse vertical order; verify voice assignment.",
+                            part=part_id, measure=measure_number,
+                        )
+                        reversal_found = True
+                        break
+                if reversal_found:
+                    break
 
     if measure_counts and len(set(measure_counts)) > 1:
         _issue(issues, "PART_MEASURE_MISMATCH", "error", f"Part measure counts differ: {measure_counts}.")

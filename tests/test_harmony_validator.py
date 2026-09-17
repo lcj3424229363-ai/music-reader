@@ -63,3 +63,53 @@ def test_independent_validator_skips_user_anchored_leading_tone():
     )
 
     assert "LEADING_TONE_RESOLUTION" not in codes(report)
+
+
+def test_independent_validator_uses_local_key_and_rejects_doubled_leading_tone():
+    data = solution(("F#5", "F#4", "D4", "B2"))
+    data["measures"][0]["beats"][0]["localTonicPitchClass"] = 7
+
+    report = validate_four_part_solution(data, key="C major")
+
+    assert "DOUBLED_LEADING_TONE" in codes(report)
+
+
+def test_independent_validator_checks_seventh_chord_completeness_and_resolution():
+    data = solution(
+        ("F5", "B4", "G4", "G3"),
+        ("G5", "C5", "E4", "C3"),
+    )
+    first, second = data["measures"][0]["beats"]
+    first.update({
+        "chordKind": "seventh",
+        "chordPitchClasses": [2, 5, 7, 11],
+        "chordSeventhPitchClass": 5,
+        "chordIdentity": "G7",
+    })
+    second.update({
+        "chordKind": "triad",
+        "chordPitchClasses": [0, 4, 7],
+        "chordIdentity": "C",
+    })
+
+    report = validate_four_part_solution(data, key="C major", question_type="bass")
+
+    assert "CHORDAL_SEVENTH_RESOLUTION" in codes(report)
+
+
+def test_dominant_leading_tone_cannot_be_held_when_harmony_changes():
+    data = solution(
+        ("B4", "G4", "D4", "G3"),
+        ("B4", "G4", "E4", "C3"),
+    )
+    first, second = data["measures"][0]["beats"]
+    first.update({
+        "function": "D", "chordIdentity": "G", "localTonicPitchClass": 0,
+    })
+    second.update({
+        "function": "T", "chordIdentity": "C", "localTonicPitchClass": 0,
+    })
+
+    report = validate_four_part_solution(data, key="C major", question_type="bass")
+
+    assert "LEADING_TONE_RESOLUTION" in codes(report)

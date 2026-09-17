@@ -60,8 +60,12 @@ def confidence_router_calibration(results: list[dict]) -> dict:
         rhythm_mean = (overall.get("rhythm") or {}).get("mean")
         if not isinstance(rhythm_mean, (int, float)):
             continue
-        actual_risk = min(
+        voice_pitch_rate = result.get(
+            "voicePitchEditRecognitionRate",
             result["orderedPitchEditRecognitionRate"],
+        )
+        actual_risk = min(
+            voice_pitch_rate,
             result["normalizedRhythmEditRecognitionRate"],
         ) < 0.8
         evaluated.append((rhythm_mean < MODEL_RHYTHM_REVIEW_THRESHOLD, actual_risk))
@@ -71,7 +75,7 @@ def confidence_router_calibration(results: list[dict]) -> dict:
     true_negative = sum(not predicted and not actual for predicted, actual in evaluated)
     return {
         "threshold": MODEL_RHYTHM_REVIEW_THRESHOLD,
-        "riskDefinition": "ordered pitch or normalized rhythm recognition below 0.80",
+        "riskDefinition": "voice-aware pitch or normalized rhythm recognition below 0.80",
         "evaluated": len(evaluated),
         "flagged": true_positive + false_positive,
         "truePositive": true_positive,
@@ -149,7 +153,7 @@ def main() -> None:
             "corpus micro-average: 1 - total ScoreIR semantic edit distance / "
             "max(total reference events, total prediction events)"
         ),
-        "metricRepresentation": "part/measure/onset/duration/pitch/alter events from music21 -> ScoreIR",
+        "metricRepresentation": "part/measure/staff/voice/onset/duration/pitch/alter events from music21 -> ScoreIR",
         "model": {
             "encoder": Path(os.environ.get("HOMR_ENCODER_MODEL", "official")).name,
             "decoder": Path(os.environ.get("HOMR_DECODER_MODEL", "official")).name,

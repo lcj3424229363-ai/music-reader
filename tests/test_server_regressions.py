@@ -46,10 +46,11 @@ def test_uploaded_source_path_is_removed():
     assert "path" not in server._remove_source_path(payload)["source"]
 
 
-def test_frontend_only_labels_solver_output_as_a_rule_guided_draft():
+def test_frontend_distinguishes_rule_checked_and_review_required_answers():
     source = (server.CURRENT_DIR / "web" / "app.js").read_text(encoding="utf-8")
-    assert "已生成规则草案" in source
-    assert "这不是严格批改结果" in source
+    assert "参考答案已通过规则检查" in source
+    assert "参考答案已生成，需复核" in source
+    assert 'result?.fourPart?.qualityStatus === "pass"' in source
 
 
 def test_frontend_renders_qwen_crop_and_homr_comparison():

@@ -50,6 +50,26 @@ def test_audit_flags_measure_overflow():
     assert "MEASURE_OVERFLOW" in {issue["code"] for issue in result["issues"]}
 
 
+def test_audit_prioritizes_implausible_omr_pitch_and_voice_order():
+    xml = """<?xml version="1.0"?>
+    <score-partwise version="4.0"><part-list><score-part id="P1"><part-name>P1</part-name></score-part></part-list>
+    <part id="P1"><measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff><type>quarter</type></note>
+    <note><pitch><step>G</step><octave>5</octave></pitch><duration>3</duration><voice>1</voice><staff>1</staff><type>half</type><dot/></note>
+    <backup><duration>4</duration></backup>
+    <note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration><voice>2</voice><staff>1</staff><type>whole</type></note>
+    </measure></part></score-partwise>"""
+
+    result = audit_musicxml(xml)
+    codes = {issue["code"] for issue in result["issues"]}
+
+    assert result["status"] == "review"
+    assert result["flaggedMeasures"] == ["1"]
+    assert "SUSPICIOUS_MELODIC_LEAP" in codes
+    assert "VOICE_ORDER_REVERSAL" in codes
+    assert select_review_measures(result, 1) == [1]
+
+
 def test_review_selection_includes_flagged_then_page_sentinels():
     audit = {"flaggedMeasures": ["4"], "stats": {"measureCount": 12}}
 
@@ -123,6 +143,41 @@ def test_omr_readiness_is_only_provisional_after_clean_acceptance():
 
     assert readiness["status"] == "provisional"
     assert readiness["solverAllowed"] is True
+
+
+def test_visual_acceptance_clears_only_matching_quality_review_measure():
+    quality = {
+        "status": "review",
+        "reviewRequired": True,
+        "issues": [{
+            "code": "SUSPICIOUS_MELODIC_LEAP", "severity": "warning", "measure": "2",
+        }],
+    }
+    confidence = {"available": True, "status": "model-stable"}
+    accepted = {
+        "enabled": True,
+        "errors": [],
+        "reviewedRegions": [{
+            "measure": 2,
+            "review": {"final": {
+                "decision": "accept_candidate",
+                "validator": {"accepted": True},
+            }},
+        }],
+    }
+
+    resolved = assess_omr_readiness(quality, confidence, accepted)
+    unresolved = assess_omr_readiness(
+        {**quality, "issues": [*quality["issues"], {
+            "code": "VOICE_ORDER_REVERSAL", "severity": "warning", "measure": "3",
+        }]},
+        confidence,
+        accepted,
+    )
+
+    assert resolved["solverAllowed"] is True
+    assert unresolved["solverAllowed"] is False
+    assert "OMR_STRUCTURE_REVIEW" in unresolved["blockingCodes"]
 
 
 def test_confirmed_vlm_correction_clears_only_its_pending_blocker():

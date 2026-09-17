@@ -3936,6 +3936,21 @@ def solve_melody(
                     "inversion": c.inversion,
                     "doubled": dbl or "none",
                     "function": func,
+                    # Machine-readable harmony facts for the independent
+                    # post-solver validator.  These avoid reparsing Roman
+                    # numerals (especially secondary dominants/modulations).
+                    "localTonicPitchClass": lk.tonic_pc,
+                    "chordKind": c.kind,
+                    "chordQuality": c.quality,
+                    "chordPitchClasses": sorted(set(c.pitch_classes(lk))),
+                    "chordSeventhPitchClass": (
+                        c.seventh_pc(lk) if c.kind in {"seventh", "ninth"} else None
+                    ),
+                    "chordNinthPitchClass": c.ninth_pc(lk) if c.kind == "ninth" else None,
+                    "chordIdentity": (
+                        f"{lk.tonic_pc}:{lk.mode}:{c.degree}:{c.quality}:"
+                        f"{c.inversion}:{c.kind}:{c.target or ''}"
+                    ),
                     "non_chord_tone": nct_type or "none",
                     "voice_ncts": voice_ncts,
                     "multi_voice_suspension": multi_susp,

@@ -1661,6 +1661,7 @@ def _solver_to_four_part_response(
     solver_qualifies = bool(summary.get("qualify"))
     independently_valid = bool(independent_validation["valid"])
     qualifies = solver_qualifies and independently_valid
+    has_validation_warnings = bool(independent_validation.get("warningCount"))
     violations = list(summary.get("violations", []) or [])
     violations.extend(
         f"{issue['code']}: {issue['message']}"
@@ -1728,7 +1729,7 @@ def _solver_to_four_part_response(
             "fallback": False,
         },
         "summary": {
-            "status": "complete" if qualifies else "complete_with_warnings",
+            "status": "complete" if qualifies and not has_validation_warnings else "complete_with_warnings",
             "analyzedKey": {
                 "name": key.split()[0] if key else "",
                 "mode": key.split()[1] if len(key.split()) > 1 else "",
@@ -1755,7 +1756,7 @@ def _solver_to_four_part_response(
             "timeSignature": request.timeSignature,
             "voices": voice_tracks,
             "answerContract": answer_contract,
-            "qualityStatus": "pass" if qualifies else "warn",
+            "qualityStatus": "pass" if qualifies and not has_validation_warnings else "warn",
             "harmonies": harmonies_per_measure,
             # P18.7: explanation 必须传 array, 前端 (answer.explanation || []).map(...)
             # 直接 .map 一个 string 会抛 "answer.explanation.map is not a function".

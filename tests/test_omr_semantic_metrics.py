@@ -26,6 +26,8 @@ def test_identical_musicxml_has_perfect_semantic_recognition():
     assert result["accidentalEditRecognitionRate"] == 1.0
     assert result["orderedPitchEditRecognitionRate"] == 1.0
     assert result["normalizedRhythmEditRecognitionRate"] == 1.0
+    assert result["voicePitchEditRecognitionRate"] == 1.0
+    assert result["voiceRhythmEditRecognitionRate"] == 1.0
 
 
 def test_semantic_metric_detects_a_pitch_change(tmp_path):
@@ -37,3 +39,14 @@ def test_semantic_metric_detects_a_pitch_change(tmp_path):
 
     assert result["pitchDistance"] > 0
     assert result["pitchEditRecognitionRate"] < 1.0
+
+
+def test_voice_aware_metric_detects_wrong_voice_with_correct_pitches(tmp_path):
+    changed = tmp_path / "wrong-voice.musicxml"
+    text = SAMPLE.read_text(encoding="utf-8")
+    changed.write_text(text.replace("<voice>1</voice>", "<voice>9</voice>", 1), encoding="utf-8")
+
+    result = score_musicxml_semantics(SAMPLE, changed)
+
+    assert result["voicePitchEditRecognitionRate"] < 1.0
+    assert result["voiceRhythmEditRecognitionRate"] < 1.0

@@ -112,9 +112,62 @@ def validate_four_part_solution(
                     "UPPER_VOICE_SPACING", "Alto and tenor exceed one octave.", "error",
                     voices=["alto", "tenor"], **location,
                 ))
-            frames.append({"notes": notes, **location})
+            tonic_value = beat.get("localTonicPitchClass")
+            local_tonic_pc = tonic_value if isinstance(tonic_value, int) and 0 <= tonic_value <= 11 else _key_tonic_pc(key)
+            leading_pc = (local_tonic_pc - 1) % 12 if local_tonic_pc is not None else None
+            if leading_pc is not None:
+                doubled = [voice for voice, (_midi, pc) in notes.items() if pc == leading_pc]
+                if len(doubled) > 1:
+                    errors.append(_issue(
+                        "DOUBLED_LEADING_TONE",
+                        "The active key's leading tone is doubled.", "error",
+                        voices=doubled, **location,
+                    ))
 
-    tonic_pc = _key_tonic_pc(key)
+            for upper, lower in zip(VOICE_ORDER, VOICE_ORDER[1:]):
+                if notes[upper][0] == notes[lower][0]:
+                    warnings.append(_issue(
+                        "ADJACENT_VOICE_UNISON",
+                        f"{upper} and {lower} share an exact unison.", "warning",
+                        voices=[upper, lower], **location,
+                    ))
+
+            chord_pcs_raw = beat.get("chordPitchClasses")
+            chord_pcs = {
+                value for value in (chord_pcs_raw or [])
+                if isinstance(value, int) and 0 <= value <= 11
+            }
+            chord_kind = str(beat.get("chordKind") or "")
+            sounding_pcs = {pc for _midi, pc in notes.values()}
+            if chord_kind == "seventh" and len(chord_pcs) == 4:
+                missing = sorted(chord_pcs - sounding_pcs)
+                if missing:
+                    errors.append(_issue(
+                        "SEVENTH_CHORD_INCOMPLETE",
+                        "A four-part seventh chord is missing a chord tone.", "error",
+                        missingPitchClasses=missing, **location,
+                    ))
+            elif chord_kind == "ninth" and chord_pcs:
+                ninth_pc = beat.get("chordNinthPitchClass")
+                missing = chord_pcs - sounding_pcs
+                if ninth_pc in missing or len(missing) > 1:
+                    errors.append(_issue(
+                        "NINTH_CHORD_INCOMPLETE",
+                        "A ninth chord must retain the ninth and may omit at most one chord tone.",
+                        "error", missingPitchClasses=sorted(missing), **location,
+                    ))
+
+            frames.append({
+                "notes": notes,
+                "tonicPc": local_tonic_pc,
+                "chordPitchClasses": chord_pcs,
+                "chordKind": chord_kind,
+                "chordFunction": beat.get("function"),
+                "chordIdentity": beat.get("chordIdentity"),
+                "chordSeventhPitchClass": beat.get("chordSeventhPitchClass"),
+                **location,
+            })
+
     for previous, current in zip(frames, frames[1:]):
         prev_notes = previous["notes"]
         curr_notes = current["notes"]
@@ -137,6 +190,14 @@ def validate_four_part_solution(
                     voices=[upper, lower], **location,
                 ))
 
+        for voice in VOICE_ORDER:
+            melodic_delta = curr_notes[voice][0] - prev_notes[voice][0]
+            if abs(melodic_delta) > 12:
+                warnings.append(_issue(
+                    "MELODIC_LEAP_OVER_OCTAVE",
+                    f"{voice} leaps by more than an octave.", "warning",
+                    voice=voice, semitones=abs(melodic_delta), **location,
+                ))
         soprano_delta = curr_notes["soprano"][0] - prev_notes["soprano"][0]
         bass_delta = curr_notes["bass"][0] - prev_notes["bass"][0]
         outer_interval = (curr_notes["soprano"][0] - curr_notes["bass"][0]) % 12
@@ -150,6 +211,7 @@ def validate_four_part_solution(
                 "warning", voices=["soprano", "bass"], **location,
             ))
 
+        tonic_pc = previous.get("tonicPc")
         if tonic_pc is not None:
             leading_pc = (tonic_pc - 1) % 12
             for voice in VOICE_ORDER:
@@ -157,17 +219,53 @@ def validate_four_part_solution(
                     continue
                 previous_midi, previous_pc = prev_notes[voice]
                 current_midi, current_pc = curr_notes[voice]
-                if previous_pc == leading_pc and current_midi != previous_midi:
-                    if current_pc != tonic_pc or current_midi - previous_midi != 1:
+                if previous_pc == leading_pc:
+                    harmony_changed = (
+                        previous.get("chordIdentity") is not None
+                        and previous.get("chordIdentity") != current.get("chordIdentity")
+                    )
+                    resolution_required = current_midi != previous_midi or (
+                        previous.get("chordFunction") == "D" and harmony_changed
+                    )
+                    if resolution_required and (
+                        current_pc != tonic_pc or current_midi - previous_midi != 1
+                    ):
                         errors.append(_issue(
                             "LEADING_TONE_RESOLUTION",
                             f"Leading tone in {voice} does not resolve upward by semitone.",
                             "error", voice=voice, **location,
                         ))
 
+        seventh_pc = previous.get("chordSeventhPitchClass")
+        if (
+            previous.get("chordKind") in {"seventh", "ninth"}
+            and isinstance(seventh_pc, int)
+        ):
+            same_chord = (
+                previous.get("chordIdentity") is not None
+                and previous.get("chordIdentity") == current.get("chordIdentity")
+            )
+            current_chord_pcs = current.get("chordPitchClasses") or set()
+            for voice in VOICE_ORDER:
+                previous_midi, previous_pc = prev_notes[voice]
+                current_midi, current_pc = curr_notes[voice]
+                if previous_pc != seventh_pc:
+                    continue
+                if same_chord and previous_midi == current_midi:
+                    continue
+                delta = current_midi - previous_midi
+                if delta not in {-1, -2} or (current_chord_pcs and current_pc not in current_chord_pcs):
+                    target = warnings if voice == anchored_voice else errors
+                    severity = "warning" if voice == anchored_voice else "error"
+                    target.append(_issue(
+                        "CHORDAL_SEVENTH_RESOLUTION",
+                        f"Chordal seventh in {voice} does not resolve downward by step.",
+                        severity, voice=voice, **location,
+                    ))
+
     return {
         "valid": not errors,
-        "ruleSet": "independent-satb-v1",
+        "ruleSet": "independent-satb-v2",
         "checkedFrames": len(frames),
         "errorCount": len(errors),
         "warningCount": len(warnings),
