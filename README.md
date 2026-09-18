@@ -13,11 +13,12 @@ AI-readable analysis.
 - Convert recognized scores into the internal editor/solver representation.
 - Generate rule-based Sposobin-style harmony and four-part answer payloads.
 - Explain solver output through the LLM/agent endpoints when configured.
+- Provide a lightweight upload frontend for score photos, PDFs, MusicXML, and MIDI.
 
 The browser-based score-making editor page and bundled sample/evaluation
-datasets have been moved out of this repository. The recognition, MusicXML
-parsing, solver, answer generation, and AI explanation chain remains in the
-backend.
+datasets have been moved out of this repository. The score-photo upload page,
+recognition, MusicXML parsing, solver, answer generation, and AI explanation
+chain remain in the project.
 
 Use an external notation or OMR tool, such as PhotoScore, to create/export
 MusicXML, then submit that file to this backend for analysis and answer
@@ -50,6 +51,12 @@ POST /read-score or /api/omr/enhanced-parse
 python reader.py path\to\score.musicxml --pretty
 python photoscore_ai.py path\to\photoscore-export.xml --pretty
 python server.py
+```
+
+Open the upload frontend after starting the server:
+
+```text
+http://127.0.0.1:8765/
 ```
 
 Health check:
@@ -110,3 +117,15 @@ Explain an answer:
 POST http://127.0.0.1:8765/api/explain
 POST http://127.0.0.1:8765/agent/explain
 ```
+
+## Technology Stack
+
+- Python: FastAPI backend, score readers, MusicXML quality checks, OMR pipeline,
+  solver, and AI/agent integration.
+- HTML/CSS/JavaScript: lightweight upload frontend only.
+- External recognition tools: PhotoScore exports MusicXML for the backend;
+  Audiveris/HOMR-style OMR support is used when configured for image/PDF input.
+
+The current repository is therefore not Python-only, but Python is the core
+runtime. The browser code is intentionally small and only handles file upload
+and result display.

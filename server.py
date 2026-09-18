@@ -13,6 +13,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -127,6 +128,18 @@ app = FastAPI(title="Music Reader MVP", version="0.1.0")
 OMR_REVIEW_ROOT = CURRENT_DIR / "data" / "omr-review-runs"
 MAX_OMR_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_FINAL_MUSICXML_BYTES = 10 * 1024 * 1024
+WEB_DIR = CURRENT_DIR / "web"
+
+if WEB_DIR.exists():
+    app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    index_path = WEB_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Upload frontend is not installed.")
+    return FileResponse(index_path)
 
 
 def _utc_timestamp() -> str:

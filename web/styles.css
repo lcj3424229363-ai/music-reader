@@ -1,0 +1,164 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", Arial, sans-serif;
+  background: #f6f7f4;
+  color: #1d2321;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.shell {
+  width: min(1120px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 32px 0;
+}
+
+.hero {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px 0 28px;
+  border-bottom: 1px solid #d8ddd4;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: #496456;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(30px, 5vw, 52px);
+  line-height: 1.08;
+  letter-spacing: 0;
+}
+
+.summary {
+  max-width: 680px;
+  margin: 14px 0 0;
+  color: #53615a;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.status {
+  min-width: 156px;
+  padding: 10px 12px;
+  border: 1px solid #bec8c0;
+  background: #ffffff;
+  color: #2e4639;
+  font-size: 14px;
+  text-align: center;
+}
+
+.panel {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 16px;
+  align-items: stretch;
+  padding: 24px 0;
+}
+
+.drop-zone {
+  display: grid;
+  gap: 8px;
+  min-height: 132px;
+  padding: 24px;
+  border: 2px dashed #90a398;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.drop-title {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.drop-hint {
+  color: #5e6d66;
+  line-height: 1.5;
+}
+
+input[type="file"] {
+  width: 100%;
+}
+
+.controls {
+  display: grid;
+  gap: 12px;
+  min-width: 220px;
+}
+
+button {
+  min-height: 48px;
+  border: 1px solid #293c33;
+  background: #24382f;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:nth-child(2) {
+  background: #ffffff;
+  color: #24382f;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.65;
+}
+
+.results {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+article {
+  min-width: 0;
+}
+
+h2 {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+
+pre {
+  min-height: 420px;
+  max-height: 65vh;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  border: 1px solid #d5dbd2;
+  background: #111715;
+  color: #d8f3df;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 760px) {
+  .hero,
+  .panel,
+  .results {
+    grid-template-columns: 1fr;
+    display: grid;
+  }
+
+  .status,
+  .controls {
+    width: 100%;
+  }
+}
