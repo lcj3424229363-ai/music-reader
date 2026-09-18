@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import mimetypes
 import json
 import re
 import shutil
@@ -14,14 +13,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-
-# Register woff2 mime (Python <3.13 不自带). StaticFiles 用 mimetypes 推断 Content-Type.
-mimetypes.add_type("font/woff2", ".woff2")
-mimetypes.add_type("font/woff", ".woff")
-mimetypes.add_type("font/ttf", ".ttf")
-mimetypes.add_type("font/otf", ".otf")
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -31,6 +23,7 @@ from reader import SUPPORTED_EXTENSIONS, read_score
 from omr import SUPPORTED_OMR_EXTENSIONS, OmrError, transcribe_with_audiveris
 from musicxml_quality import audit_musicxml
 from omr_semantic_metrics import score_musicxml_semantics
+from photoscore_ai import build_photoscore_ai_context
 from harmony_validator import validate_four_part_solution
 from exercise_extractor import extract_exercise_constraints
 from score_ir import validate_score_ir
@@ -55,17 +48,15 @@ from vision_review import (
 from manual_chords import analyze_manual_chords
 from manual_notes import locate_manual_notes
 # P8 (Level 2 integration, 2026-08-09): four_part.py has been removed.
-# The Sposobin solver (solver.py) now handles ALL four-part problems —
-# both melody-given and bass-given.
+# The Sposobin solver (solver.py) now handles ALL four-part problems 鈥?# both melody-given and bass-given.
 #
-# 阶段0 (架构清理): solver.py 是唯一求解器 (v1.6, beam K=50 / top_n=50),
-# frozen_v1_6/ 已合并进来.  SOLVER_VERSION=v1.5 只是把 beam 收紧到
-# K=3 / top_n=1 (历史回退), 不再切换代码文件.
+# 闃舵0 (鏋舵瀯娓呯悊): solver.py 鏄敮涓€姹傝В鍣?(v1.6, beam K=50 / top_n=50),
+# frozen_v1_6/ 宸插悎骞惰繘鏉?  SOLVER_VERSION=v1.5 鍙槸鎶?beam 鏀剁揣鍒?# K=3 / top_n=1 (鍘嗗彶鍥為€€), 涓嶅啀鍒囨崲浠ｇ爜鏂囦欢.
 import os
 
 import solver as sposobin_solver
 
-# 历史回退: SOLVER_VERSION=v1.5 → K=3 / top_n=1 (否则默认 v1.6 K=50).
+# 鍘嗗彶鍥為€€: SOLVER_VERSION=v1.5 鈫?K=3 / top_n=1 (鍚﹀垯榛樿 v1.6 K=50).
 _SOLVER_BEAM_K = 3 if os.environ.get("SOLVER_VERSION") == "v1.5" else 50
 _SOLVER_TOP_N = 1 if os.environ.get("SOLVER_VERSION") == "v1.5" else 50
 
@@ -79,16 +70,15 @@ from editor_to_solver import (
     appjs_measures_rhythm_template,
 )
 
-# Back-compat aliases (P22 第一刀: 函数搬家, server 内部仍按 _appjs_* 名字调用).
+# Back-compat aliases (P22 绗竴鍒€: 鍑芥暟鎼, server 鍐呴儴浠嶆寜 _appjs_* 鍚嶅瓧璋冪敤).
 _appjs_entry_to_soprano_note = appjs_entry_to_soprano_note
 _appjs_measures_subdivision = appjs_measures_subdivision
 _appjs_measures_to_solver_melody = appjs_measures_to_solver_melody
 _appjs_measures_to_solver_bass = appjs_measures_to_solver_bass
 _appjs_measures_rhythm_template = appjs_measures_rhythm_template
 
-# 修饰音 / 演奏记号字段: 前端 entry → 答案 entry 必须原样透传, 否则在
-# solve-melody 往返里会丢失. solver 只理解音高 + 时值, 不理解这些符号,
-# 所以锚定声部 (旋律/低音) 的答案把这些字段从输入模板原样带回.
+# 淇グ闊?/ 婕斿璁板彿瀛楁: 鍓嶇 entry 鈫?绛旀 entry 蹇呴』鍘熸牱閫忎紶, 鍚﹀垯鍦?# solve-melody 寰€杩旈噷浼氫涪澶? solver 鍙悊瑙ｉ煶楂?+ 鏃跺€? 涓嶇悊瑙ｈ繖浜涚鍙?
+# 鎵€浠ラ敋瀹氬０閮?(鏃嬪緥/浣庨煶) 鐨勭瓟妗堟妸杩欎簺瀛楁浠庤緭鍏ユā鏉垮師鏍峰甫鍥?
 _ENTRY_PASSTHROUGH_FIELDS = (
     "tieStart", "tieStop", "slurStart", "slurStop", "fermata", "dynamic",
     "chordSymbol", "articulation", "ornament", "grace", "pedal", "hairpin",
@@ -119,7 +109,7 @@ def _musicxml_import_route(source_musicxml: str | None) -> str:
             return "frontend-canonical"
     return "reader-projection"
 
-# P19: LLM 增强层 (教师式中文讲解)
+# P19: optional LLM explanation layer.
 try:
     from llm import HarmonyExplainer, DeepSeekError  # type: ignore
     from llm.agent import MusicTheoryAgent, AgentResult  # type: ignore
@@ -130,12 +120,10 @@ except Exception as _llm_import_err:  # noqa: BLE001
     MusicTheoryAgent = None  # type: ignore
     AgentResult = None  # type: ignore
     _LLM_AVAILABLE = False
-    print(f"[server] llm 模块未加载，/api/explain + /agent/* 将不可用：{_llm_import_err}", flush=True)
+    print(f"[server] llm module failed to load; explanation endpoints disabled: {_llm_import_err}", flush=True)
 
 
 app = FastAPI(title="Music Reader MVP", version="0.1.0")
-WEB_DIR = CURRENT_DIR / "web"
-VEXFLOW_DIR = CURRENT_DIR / "node_modules" / "vexflow" / "build" / "cjs"
 OMR_REVIEW_ROOT = CURRENT_DIR / "data" / "omr-review-runs"
 MAX_OMR_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_FINAL_MUSICXML_BYTES = 10 * 1024 * 1024
@@ -152,20 +140,6 @@ def _atomic_write_text(path: Path, value: str) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-@app.middleware("http")
-async def no_cache_local_assets(request, call_next):
-    response = await call_next(request)
-    if request.url.path == "/" or request.url.path.startswith(("/assets/", "/vendor/")):
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-    return response
-
-if WEB_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
-
-if VEXFLOW_DIR.exists():
-    app.mount("/vendor/vexflow", StaticFiles(directory=VEXFLOW_DIR), name="vexflow")
 
 
 class ManualChordRequest(BaseModel):
@@ -200,7 +174,7 @@ class FourPartRequest(BaseModel):
     # modulation.  Defaults to [] (no modulation, single home key).
     keyChanges: list[list] | None = None
     # P17: chord pool profile.  When None or 'auto', server picks a profile
-    # based on key signature (e.g. Ab major → ch1-4_triad_only).  When the
+    # based on key signature (e.g. Ab major 鈫?ch1-4_triad_only).  When the
     # user picks a specific chapter range in the UI, the value is passed
     # through to solve_melody(chord_pool_profile=...).
     # Valid values: 'auto', 'ch1-4_triad_only', 'ch5-7_triad_plus_v64',
@@ -272,20 +246,20 @@ def _solver_input_eligibility(
     if expected_units is None:
         issues.append({
             "code": "BAD_TIME_SIGNATURE",
-            "message": "拍号无效，无法判断每小节应有的时值。",
+            "message": "Invalid time signature; measure capacity cannot be determined.",
         })
         expected_units = 0.0
 
     if not measures or not any(measure for measure in measures):
         issues.append({
             "code": "EMPTY_INPUT",
-            "message": "没有可用于四部和声的给定声部。",
+            "message": "No usable given voice was provided for four-part solving.",
         })
         measures = []
     elif len(measures) > _SOLVER_INPUT_MAX_MEASURES:
         issues.append({
             "code": "TOO_MANY_MEASURES",
-            "message": f"自动求解最多处理 {_SOLVER_INPUT_MAX_MEASURES} 小节；请先截取练习片段。",
+            "message": f"Automatic solving supports at most {_SOLVER_INPUT_MAX_MEASURES} measures; trim the exercise first.",
             "actual": len(measures),
             "expected": _SOLVER_INPUT_MAX_MEASURES,
         })
@@ -296,7 +270,7 @@ def _solver_input_eligibility(
         if not isinstance(measure, list) or not measure:
             issues.append({
                 "code": "EMPTY_MEASURE",
-                "message": f"第 {index} 小节为空，无法保持节奏对齐。",
+                "message": f"Measure {index} is empty and cannot preserve rhythmic alignment.",
                 "measure": index,
             })
             continue
@@ -304,7 +278,7 @@ def _solver_input_eligibility(
         if expected_units and abs(actual_units - expected_units) > 1e-6:
             issues.append({
                 "code": "MEASURE_DURATION_MISMATCH",
-                "message": f"第 {index} 小节时值为 {actual_units:g} 单位，应为 {expected_units:g} 单位。",
+                "message": f"Measure {index} has {actual_units:g} units but should have {expected_units:g} units.",
                 "measure": index,
                 "actual": actual_units,
                 "expected": expected_units,
@@ -316,7 +290,7 @@ def _solver_input_eligibility(
             if len(pitches) != 1:
                 issues.append({
                     "code": "MULTI_PITCH_INPUT",
-                    "message": f"第 {index} 小节的给定声部含和弦；请先只保留一条独立声部线。",
+                    "message": f"Measure {index} contains a chord in the given voice; keep only one independent line first.",
                     "measure": index,
                 })
                 continue
@@ -324,13 +298,13 @@ def _solver_input_eligibility(
             if note is None:
                 issues.append({
                     "code": "INVALID_PITCH",
-                    "message": f"第 {index} 小节存在无法识别的音高。",
+                    "message": f"Measure {index} contains an unrecognized pitch.",
                     "measure": index,
                 })
             elif not range_low.midi <= note.midi <= range_high.midi:
                 issues.append({
                     "code": "OUT_OF_RANGE",
-                    "message": f"第 {index} 小节音高 {note.name} 超出 {voice} 可用音域。",
+                    "message": f"Measure {index} pitch {note.name} is outside the usable range for {voice}.",
                     "measure": index,
                 })
 
@@ -787,6 +761,29 @@ async def audit_musicxml_upload(file: UploadFile = File(...)) -> dict:
     return audit_musicxml(text)
 
 
+@app.post("/api/photoscore/ai-context")
+async def photoscore_ai_context_upload(
+    file: UploadFile = File(...),
+    measureLimit: int = Form(32),
+) -> dict:
+    """Convert a PhotoScore-exported MusicXML file into compact AI context."""
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".xml", ".musicxml", ".mxl"}:
+        raise HTTPException(status_code=400, detail="A PhotoScore MusicXML file is required.")
+    payload = await file.read(MAX_FINAL_MUSICXML_BYTES + 1)
+    await file.close()
+    if len(payload) > MAX_FINAL_MUSICXML_BYTES:
+        raise HTTPException(status_code=413, detail="MusicXML exceeds 10 MB.")
+    measure_limit = max(1, min(int(measureLimit), 128))
+    with tempfile.TemporaryDirectory(prefix="music-reader-photoscore-") as temp_dir:
+        target = Path(temp_dir) / _safe_upload_name(file.filename, suffix)
+        target.write_bytes(payload)
+        try:
+            return build_photoscore_ai_context(target, measure_limit=measure_limit)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/omr/enhanced-parse")
 async def enhanced_omr_parse(
     file: UploadFile = File(...),
@@ -1117,8 +1114,8 @@ async def save_human_final_musicxml(run_id: str, file: UploadFile = File(...)) -
     }
 
 
-# P18.6: 全局兜底, 任何未捕获的 Python 异常都返回 200 + 安全 message,
-# 永远不暴露 "list index out of range" 之类内部错误给用户.
+# P18.6: 鍏ㄥ眬鍏滃簳, 浠讳綍鏈崟鑾风殑 Python 寮傚父閮借繑鍥?200 + 瀹夊叏 message,
+# 姘歌繙涓嶆毚闇?"list index out of range" 涔嬬被鍐呴儴閿欒缁欑敤鎴?
 from fastapi import Request as _FastAPIRequest
 from fastapi.responses import JSONResponse as _JSONResponse
 
@@ -1137,45 +1134,18 @@ async def _safe_exception_handler(_request: _FastAPIRequest, exc: Exception) -> 
                 "cadences": [],
                 "keyPerMeasure": [],
                 "confidence": 0,
-                "confidenceEvidence": ["服务器内部错误, 请重试."],
+                "confidenceEvidence": ["鏈嶅姟鍣ㄥ唴閮ㄩ敊璇? 璇烽噸璇?"],
             },
             "fourPart": {
                 "voices": [],
                 "harmonies": [],
                 "qualityStatus": "error",
-                "explanation": ["服务器内部错误, 请重试."],
+                "explanation": ["鏈嶅姟鍣ㄥ唴閮ㄩ敊璇? 璇烽噸璇?"],
             },
-            "warnings": ["服务器内部错误, 请重试."],
+            "warnings": ["鏈嶅姟鍣ㄥ唴閮ㄩ敊璇? 璇烽噸璇?"],
             "harmonyTimeline": [],
         },
     )
-
-
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
-
-
-@app.get("/styles.css")
-def root_styles() -> FileResponse:
-    return FileResponse(WEB_DIR / "styles.css")
-
-
-@app.get("/app.js")
-def root_app_js() -> FileResponse:
-    return FileResponse(WEB_DIR / "app.js")
-
-
-# P22.4-B.2: CoordinateSystem v1 (统一坐标层)
-@app.get("/coordinate-system.js")
-def root_coordinate_system_js() -> FileResponse:
-    return FileResponse(WEB_DIR / "coordinate-system.js")
-
-
-# P22.5-B.1: Score Model (数据契约层)
-@app.get("/score-model.js")
-def root_score_model_js() -> FileResponse:
-    return FileResponse(WEB_DIR / "score-model.js")
 
 
 @app.post("/read-score")
@@ -1219,8 +1189,7 @@ async def read_score_upload(file: UploadFile = File(...)) -> dict:
 
 @app.post("/parse-score")
 async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
-    """P2.7+: take a MusicXML file → run reader.py → run reader_to_editor.py →
-    return editor entry format (melodyMeasures + bassMeasures) that the
+    """P2.7+: take a MusicXML file 鈫?run reader.py 鈫?run reader_to_editor.py 鈫?    return editor entry format (melodyMeasures + bassMeasures) that the
     frontend can directly feed to /solve-melody or load into the editor.
 
     The key difference from /read-score:
@@ -1265,9 +1234,9 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # 把 reader output 转 editor entry format (voice separation 做完)
+    # 鎶?reader output 杞?editor entry format (voice separation 鍋氬畬)
     editor_payload = reader_payload_to_editor(raw_payload)
-    # 附上原始 summary 给前端 (keyPerMeasure, cadences, etc.)
+    # 闄勪笂鍘熷 summary 缁欏墠绔?(keyPerMeasure, cadences, etc.)
     editor_payload["rawSummary"] = raw_payload.get("summary", {})
     _annotate_editor_analysis(editor_payload)
     editor_payload["importRoute"] = _musicxml_import_route(source_musicxml)
@@ -1279,11 +1248,11 @@ async def parse_score_to_editor(file: UploadFile = File(...)) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# P2.7+: XML 文件列表 + 按 file_id 解析
+# P2.7+: XML 鏂囦欢鍒楄〃 + 鎸?file_id 瑙ｆ瀽
 # ---------------------------------------------------------------------------
-# 用户在 step 3 五线谱制谱区点 XML 文件名 → 直接灌入五线谱 (不走 OS file dialog).
-# 全部 XML 在 SHTE_ROOT (eval-data/extracted/hamony dataset/) 下面, 388 个.
-# 限制: 一次最多返 N 个 (默认 1 个, 让用户先试通流程).
+# 鐢ㄦ埛鍦?step 3 浜旂嚎璋卞埗璋卞尯鐐?XML 鏂囦欢鍚?鈫?鐩存帴鐏屽叆浜旂嚎璋?(涓嶈蛋 OS file dialog).
+# 鍏ㄩ儴 XML 鍦?SHTE_ROOT (eval-data/extracted/hamony dataset/) 涓嬮潰, 388 涓?
+# 闄愬埗: 涓€娆℃渶澶氳繑 N 涓?(榛樿 1 涓? 璁╃敤鎴峰厛璇曢€氭祦绋?.
 
 SHTE_ROOT = Path(os.environ.get(
     "SHTE_ROOT",
@@ -1295,23 +1264,23 @@ _XML_FILE_REGISTRY: dict[str, Path] = {}
 def _index_xml_files() -> None:
     """Walk SHTE_ROOT and index all .xml files by an opaque id.
 
-    P2.7+ 策略: SHTE dataset 每个 case 有 2 个版本:
-      - ch4/original/ch4-01_a minor.xml  → 单声部 melody (用户输入形态)
-      - ch4/four/ch4-01_a minor.xml      → 4 voice SATB gold 答案
-    默认 id 指向 `original/` (单声部), 让 user 看到的是题, 不是 gold 答案.
-    `four/` 版本用 disambiguated id ("four/ch4-01_a minor").
+    P2.7+ 绛栫暐: SHTE dataset 姣忎釜 case 鏈?2 涓増鏈?
+      - ch4/original/ch4-01_a minor.xml  鈫?鍗曞０閮?melody (鐢ㄦ埛杈撳叆褰㈡€?
+      - ch4/four/ch4-01_a minor.xml      鈫?4 voice SATB gold 绛旀
+    榛樿 id 鎸囧悜 `original/` (鍗曞０閮?, 璁?user 鐪嬪埌鐨勬槸棰? 涓嶆槸 gold 绛旀.
+    `four/` 鐗堟湰鐢?disambiguated id ("four/ch4-01_a minor").
     """
     if _XML_FILE_REGISTRY:
         return
-    # 按 path 排序保证 deterministic; original/ 优先匹配 stem.
+    # 鎸?path 鎺掑簭淇濊瘉 deterministic; original/ 浼樺厛鍖归厤 stem.
     for xml in sorted(SHTE_ROOT.glob("**/*.xml"), key=lambda p: (p.stem, 0 if "original" in p.parts else 1)):
         fid = xml.stem
         if fid in _XML_FILE_REGISTRY:
-            # 已经指向 original/, 跳过后续的 four/ (因为 sort 把 original 排前面)
+            # 宸茬粡鎸囧悜 original/, 璺宠繃鍚庣画鐨?four/ (鍥犱负 sort 鎶?original 鎺掑墠闈?
             stem_with_parent = f"{xml.parent.name}/{xml.stem}"
             _XML_FILE_REGISTRY[stem_with_parent] = xml
         else:
-            # 第一次: 指向 original/ (单声部)
+            # 绗竴娆? 鎸囧悜 original/ (鍗曞０閮?
             _XML_FILE_REGISTRY[fid] = xml
 
 
@@ -1342,7 +1311,7 @@ async def list_xml_files(query: str = "", limit: int = 1) -> dict:
     items = []
     for fid in all_ids[:limit]:
         path = _XML_FILE_REGISTRY[fid]
-        # chapter: ch4 (取 fid 第一个 ch 段)
+        # chapter: ch4 (鍙?fid 绗竴涓?ch 娈?
         chapter = ""
         for seg in path.parts:
             if seg.startswith("ch") and seg[2:].isdigit():
@@ -1415,7 +1384,7 @@ def manual_notes(request: ManualNoteRequest) -> dict:
 def four_part_answer(request: FourPartRequest) -> dict:
     # P8 (Level 2 integration): /four-part-answer now forwards to the
     # Sposobin solver (same as /solve-melody).  The legacy four_part.py
-    # (music21-based 5-chord pool) is no longer needed — the Sposobin
+    # (music21-based 5-chord pool) is no longer needed 鈥?the Sposobin
     # solver handles both melody-given and bass-given problems natively.
     try:
         return solve_melody_endpoint(request)
@@ -1433,13 +1402,12 @@ def four_part_answer(request: FourPartRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# app.js → solver data conversion (P0-P8, P22 第一刀抽出到 editor_to_solver.py)
+# app.js 鈫?solver data conversion (P0-P8, P22 绗竴鍒€鎶藉嚭鍒?editor_to_solver.py)
 # ---------------------------------------------------------------------------
-# 4 个转换函数 (_appjs_entry_to_soprano_note / _appjs_entry_to_solver_beats /
-# _appjs_measures_to_solver_melody / _appjs_measures_to_solver_bass) 加 2 个常量
-# 字典 (_APPJS_ACCIDENTAL_TO_SOLVER / _APPJS_DURATION_TO_QUARTER) 已在文件顶部
-# import 引入. 真实定义在 editor_to_solver.py.
-# 行为完全一致 (P22 第一刀: 纯抽公共转换层, 一字不改).
+# 4 涓浆鎹㈠嚱鏁?(_appjs_entry_to_soprano_note / _appjs_entry_to_solver_beats /
+# _appjs_measures_to_solver_melody / _appjs_measures_to_solver_bass) 鍔?2 涓父閲?# 瀛楀吀 (_APPJS_ACCIDENTAL_TO_SOLVER / _APPJS_DURATION_TO_QUARTER) 宸插湪鏂囦欢椤堕儴
+# import 寮曞叆. 鐪熷疄瀹氫箟鍦?editor_to_solver.py.
+# 琛屼负瀹屽叏涓€鑷?(P22 绗竴鍒€: 绾娊鍏叡杞崲灞? 涓€瀛椾笉鏀?.
 
 
 def _solver_cadence_per_measure(solver_result_dict: dict) -> list[str | None]:
@@ -1456,7 +1424,7 @@ def _solver_to_four_part_response(
     bass_rhythm: list | None = None,
 ) -> dict:
     """Convert solver.to_dict() output into the response schema the
-    frontend renders.  Single source of truth — the legacy
+    frontend renders.  Single source of truth 鈥?the legacy
     four_part.generate_four_part_answer was removed in P8 (2026-08-09).
 
     ``melody_rhythm`` / ``bass_rhythm`` are the raw per-measure input
@@ -1477,7 +1445,7 @@ def _solver_to_four_part_response(
 
         Bug fix (caught by P8 review): the previous implementation
         used `name[:-1].rstrip("#")` which is wrong for 3-char names
-        like 'F#3' — `name[:-1]` drops the octave digit, and `rstrip("#")`
+        like 'F#3' 鈥?`name[:-1]` drops the octave digit, and `rstrip("#")`
         then sees no trailing '#', so 'F#' would leak into step.
         """
         if not name:
@@ -1509,7 +1477,7 @@ def _solver_to_four_part_response(
 
         P18.7 fix: app.js durationUnits is in 1/16-of-a-whole-note units
         (so 1 quarter = 8 units, 1 whole = 32 units).  The previous
-        code here used 1 quarter = 2 units, which under-flowed 4× for
+        code here used 1 quarter = 2 units, which under-flowed 4脳 for
         every whole-note entry the solver emitted.
 
         Solver's beat duration is in quarter notes (1.0 = quarter, 0.5
@@ -1586,9 +1554,9 @@ def _solver_to_four_part_response(
                 if entry.get("kind") == "rest":
                     entries.append(_rest_entry_from_template(entry))
                     continue
-                # P0-2: 锚定声部直接用输入模板的音高拼写 (输入拼写就是对的),
-                # 不用 solver 的 flat-first 重拼写 (否则升号调里 C# 会变 Db).
-                # 只有输入没给音高时才退回 solver 输出的音.
+                # P0-2: 閿氬畾澹伴儴鐩存帴鐢ㄨ緭鍏ユā鏉跨殑闊抽珮鎷煎啓 (杈撳叆鎷煎啓灏辨槸瀵圭殑),
+                # 涓嶇敤 solver 鐨?flat-first 閲嶆嫾鍐?(鍚﹀垯鍗囧彿璋冮噷 C# 浼氬彉 Db).
+                # 鍙湁杈撳叆娌＄粰闊抽珮鏃舵墠閫€鍥?solver 杈撳嚭鐨勯煶.
                 src_pitch = (entry.get("pitches") or [{}])[0] if entry.get("pitches") else None
                 if src_pitch and src_pitch.get("step"):
                     step = src_pitch.get("step")
@@ -1614,7 +1582,7 @@ def _solver_to_four_part_response(
                     "dotted": entry.get("dotted", False),
                     "units": entry.get("units"),
                 }
-                # 透传修饰音/演奏记号 (grace/ornament/articulation/fermata/...)
+                # 閫忎紶淇グ闊?婕斿璁板彿 (grace/ornament/articulation/fermata/...)
                 for _f in _ENTRY_PASSTHROUGH_FIELDS:
                     if _f in entry:
                         note_entry[_f] = entry[_f]
@@ -1667,7 +1635,7 @@ def _solver_to_four_part_response(
         f"{issue['code']}: {issue['message']}"
         for issue in independent_validation["errors"]
     )
-    # Convert flat chord-per-beat → per-measure "harmonies" array
+    # Convert flat chord-per-beat 鈫?per-measure "harmonies" array
     harmonies_per_measure = []
     for mi, m in enumerate(measures_data):
         per_measure_harmonies = []
@@ -1746,10 +1714,10 @@ def _solver_to_four_part_response(
             "cadences": _solver_cadence_per_measure(solver_result_dict),
             # P7.5.1: per-measure local key (empty when no modulation).
             "keyPerMeasure": summary.get("keyPerMeasure", []),
-            # P18.5: 置信度 0-100% + 依据列表 — 这是用户要的"百分比依据".
+            # P18.5: 缃俊搴?0-100% + 渚濇嵁鍒楄〃 鈥?杩欐槸鐢ㄦ埛瑕佺殑"鐧惧垎姣斾緷鎹?.
             "confidence": summary.get("confidence"),
             "confidenceEvidence": summary.get("confidenceEvidence", []),
-            # P2: 被降级合成的小节 (1-indexed), 前端据此标 ⚠.
+            # P2: 琚檷绾у悎鎴愮殑灏忚妭 (1-indexed), 鍓嶇鎹鏍?鈿?
             "degradedMeasures": summary.get("degradedMeasures", []),
         },
         "fourPart": {
@@ -1758,23 +1726,23 @@ def _solver_to_four_part_response(
             "answerContract": answer_contract,
             "qualityStatus": "pass" if qualifies and not has_validation_warnings else "warn",
             "harmonies": harmonies_per_measure,
-            # P18.7: explanation 必须传 array, 前端 (answer.explanation || []).map(...)
-            # 直接 .map 一个 string 会抛 "answer.explanation.map is not a function".
+            # P18.7: explanation 蹇呴』浼?array, 鍓嶇 (answer.explanation || []).map(...)
+            # 鐩存帴 .map 涓€涓?string 浼氭姏 "answer.explanation.map is not a function".
             "explanation": [
                 (
-                    "由 Sposobin solver (P0-P7: 正三和弦, V7, 副属, "
-                    "aug6/N6, 模进, NCT, SII7/DVII7/D9/DD 变音) 生成. "
-                    "共 "
+                    "鐢?Sposobin solver (P0-P7: 姝ｄ笁鍜屽鸡, V7, 鍓睘, "
+                    "aug6/N6, 妯¤繘, NCT, SII7/DVII7/D9/DD 鍙橀煶) 鐢熸垚. "
+                    "鍏?"
                     f"{sum(1 for c in _solver_cadence_per_measure(solver_result_dict) if c)} "
-                    "个终止式.  规则约束: 平行 5/8, 声部交叉, 导音解决, "
-                    "七音解决, 重属 (DD) 解决, 调性范围."
+                    "涓粓姝㈠紡.  瑙勫垯绾︽潫: 骞宠 5/8, 澹伴儴浜ゅ弶, 瀵奸煶瑙ｅ喅, "
+                    "涓冮煶瑙ｅ喅, 閲嶅睘 (DD) 瑙ｅ喅, 璋冩€ц寖鍥?"
                 )
             ],
         },
         "warnings": solver_result_dict.get("warnings", []),
         "harmonyTimeline": harmonies_per_measure,
-        # P2.6-C3 (2026-08-15): 透传 v1.6 的 50 alternatives 到前端.
-        # 每个 alternative 是 {rank, deltaScore, summary, measures} dict.
+        # P2.6-C3 (2026-08-15): 閫忎紶 v1.6 鐨?50 alternatives 鍒板墠绔?
+        # 姣忎釜 alternative 鏄?{rank, deltaScore, summary, measures} dict.
         "alternatives": raw_alternatives,
         "alternativesCount": len(raw_alternatives),
     }
@@ -1792,11 +1760,11 @@ def _safe_four_part_error_response(
     in `warnings`.  The frontend renders this as a clean red error box,
     never a raw Python exception.
 
-    P5-3: ``error_code`` 是稳定的机器可读错误码 (EMPTY_MELODY / EMPTY_BASS /
-    OUT_OF_RANGE / BAD_DURATION / SOLVER_ERROR), 前端据此映射文案和动作,
-    不再靠解析中文字符串.
+    P5-3: ``error_code`` 鏄ǔ瀹氱殑鏈哄櫒鍙閿欒鐮?(EMPTY_MELODY / EMPTY_BASS /
+    OUT_OF_RANGE / BAD_DURATION / SOLVER_ERROR), 鍓嶇鎹鏄犲皠鏂囨鍜屽姩浣?
+    涓嶅啀闈犺В鏋愪腑鏂囧瓧绗︿覆.
 
-    The `internal` arg is for server-side logs only — it must not leak
+    The `internal` arg is for server-side logs only 鈥?it must not leak
     to the user.
     """
     if internal:
@@ -1844,32 +1812,37 @@ def _safe_four_part_error_response(
 
 
 def _classify_value_error(msg: str, question_type: str) -> str:
-    """P5-3: 把 ValueError 文案归类为稳定的 errorCode."""
-    if "拍号" in msg or "time signature" in msg.lower():
+    """Classify ValueError text into a stable public error code."""
+    lowered = msg.lower()
+    if "time signature" in lowered:
         return "BAD_TIME_SIGNATURE"
-    if "empty" in msg.lower() or "没有" in msg:
+    if "empty" in lowered:
         return "EMPTY_BASS" if question_type == "bass" else "EMPTY_MELODY"
-    if "range" in msg.lower() or "音域" in msg or "范围" in msg:
+    if "range" in lowered:
         return "OUT_OF_RANGE"
-    if ("网格" in msg or "时值" in msg or "超拍" in msg
-            or "无法落到" in msg or "落格" in msg):
+    if (
+        "duration" in lowered
+        or "grid" in lowered
+        or "measure" in lowered
+        or "rhythm" in lowered
+    ):
         return "BAD_DURATION"
     return "SOLVER_ERROR"
 
 
 def _public_value_error_message(error_code: str, question_type: str) -> str:
     range_message = (
-        "输入低音超出低音声部的可用音域范围，请调整后重试。"
+        "The bass input is outside the usable bass range; adjust it and try again."
         if question_type == "bass"
-        else "输入旋律超出女高音声部的可用音域范围，请调整后重试。"
+        else "The melody input is outside the usable soprano range; adjust it and try again."
     )
     messages = {
-        "EMPTY_MELODY": "旋律为空，请先输入至少一个音符。",
-        "EMPTY_BASS": "低音为空，请先输入至少一个低音。",
+        "EMPTY_MELODY": "The melody is empty; enter at least one note first.",
+        "EMPTY_BASS": "The bass is empty; enter at least one bass note first.",
         "OUT_OF_RANGE": range_message,
-        "BAD_DURATION": "小节时值或网格数量不正确，请检查拍号与音符时值。",
-        "BAD_TIME_SIGNATURE": "拍号格式无效，请使用如 4/4、3/4 的格式。",
-        "SOLVER_ERROR": "输入数据无法用于和声求解，请检查调号、拍号和音符。",
+        "BAD_DURATION": "The measure duration or grid is invalid; check the time signature and note values.",
+        "BAD_TIME_SIGNATURE": "The time signature is invalid; use a format like 4/4 or 3/4.",
+        "SOLVER_ERROR": "The input cannot be used for harmony solving; check the key, meter, and notes.",
     }
     return messages[error_code]
 
@@ -1900,7 +1873,9 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     # context for NCT classification) but is not enforced.
     if request.questionType not in ("melody", "alto", "tenor", "bass"):
         return _safe_four_part_error_response(
-            request, "题型必须是 melody 或 bass。", error_code="BAD_QUESTION_TYPE"
+            request,
+            "Question type must be melody, alto, tenor, or bass.",
+            error_code="BAD_QUESTION_TYPE",
         )
 
     bass_for_solver: list[list] | None = None
@@ -1911,13 +1886,13 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         if not bass_for_solver and request.bassEntries:
             bass_for_solver = [request.bassEntries]
         if not bass_for_solver:
-            # P18.6: 用友好 message + 200, 不要让前端看到 "HTTP 400" 错误.
             return _safe_four_part_error_response(
-                request, "低音题需要在「3 五线谱制谱」区下方低音谱表 (声部 2) 输入低音序列, 再生成四部和声参考答案.",
+                request,
+                "Bass-given questions need a bass line before four-part solving.",
                 error_code="EMPTY_BASS",
             )
 
-    # Convert app.js format → solver format
+    # Convert app.js format 鈫?solver format
     if request.questionType == "alto":
         alto_for_solver = request.altoMeasures
         if not alto_for_solver and request.altoEntries:
@@ -1951,9 +1926,9 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     # melodyMeasures must be non-empty.
     fixed_for_solver = bass_for_solver or alto_for_solver or tenor_for_solver
     if not measures_for_solver and fixed_for_solver is None:
-        # P18.6: 用友好 message + 200, 不要让前端看到 "HTTP 400" 错误.
+        # P18.6: 鐢ㄥ弸濂?message + 200, 涓嶈璁╁墠绔湅鍒?"HTTP 400" 閿欒.
         return _safe_four_part_error_response(
-            request, "旋律题需要在「3 五线谱制谱」区用鼠标点输入旋律, 或在下方文本框填好后点「填入到五线谱」按钮, 再生成四部和声参考答案.",
+            request, "鏃嬪緥棰橀渶瑕佸湪銆? 浜旂嚎璋卞埗璋便€嶅尯鐢ㄩ紶鏍囩偣杈撳叆鏃嬪緥, 鎴栧湪涓嬫柟鏂囨湰妗嗗～濂藉悗鐐广€屽～鍏ュ埌浜旂嚎璋便€嶆寜閽? 鍐嶇敓鎴愬洓閮ㄥ拰澹板弬鑰冪瓟妗?",
             error_code="EMPTY_MELODY",
         )
     if fixed_for_solver is not None:
@@ -1993,7 +1968,7 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         )
 
     try:
-        # B1: 网格细分因子由"活跃输入"的最细时值决定 (旋律题看旋律, 低音题看低音).
+        # B1: 缃戞牸缁嗗垎鍥犲瓙鐢?娲昏穬杈撳叆"鐨勬渶缁嗘椂鍊煎喅瀹?(鏃嬪緥棰樼湅鏃嬪緥, 浣庨煶棰樼湅浣庨煶).
         subdiv_source = fixed_for_solver if fixed_for_solver is not None else measures_for_solver
         kwargs: dict = {
             "subdivision": _appjs_measures_subdivision(subdiv_source, request.timeSignature),
@@ -2028,14 +2003,14 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
             kwargs["key_changes"] = [
                 (int(kc[0]), kc[1]) for kc in request.keyChanges
             ]
-        # P17: chord pool profile.  'auto' or None → server picks based on
+        # P17: chord pool profile.  'auto' or None 鈫?server picks based on
         # the key signature accidentals.  Otherwise the user picked one
         # explicitly in the UI (see app.js chordPoolProfile select).
         profile = request.chordPoolProfile or "auto"
         if profile == "auto":
             profile = _auto_pick_profile(request.key)
         kwargs["chord_pool_profile"] = profile
-        # 阶段0: beam 参数由 SOLVER_VERSION 决定 (默认 v1.6 K=50 / v1.5 K=3).
+        # 闃舵0: beam 鍙傛暟鐢?SOLVER_VERSION 鍐冲畾 (榛樿 v1.6 K=50 / v1.5 K=3).
         kwargs.setdefault("beam_k", _SOLVER_BEAM_K)
         kwargs.setdefault("top_n", _SOLVER_TOP_N)
         result = sposobin_solver.solve_melody(
@@ -2055,7 +2030,7 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
     except ValueError as exc:
         # Common case: melody / bass note out of range, or empty input.
         # P18.6: return 200 + safe empty fourPart + warning, never 422/500
-        # with raw Python internals.  P5-3: 归类为稳定 errorCode.
+        # with raw Python internals.  P5-3: 褰掔被涓虹ǔ瀹?errorCode.
         msg = str(exc)
         if not isinstance(msg, str):
             msg = repr(exc)
@@ -2069,8 +2044,8 @@ def solve_melody_endpoint(request: FourPartRequest) -> dict:
         # P18.6: catch ALL exceptions.  Never let a Python internal error
         # like "list index out of range" leak to the user as the response
         # detail.  The frontend should never see a raw traceback or
-        # Python exception message — only a friendly Chinese message.
-        msg = f"和声生成遇到内部错误（{type(exc).__name__}），请重试或换一道题试试。"
+        # Python exception message, only a safe public message.
+        msg = f"Harmony generation hit an internal error ({type(exc).__name__}); retry or simplify the input."
         return _safe_four_part_error_response(request, msg, internal=msg,
                                               error_code="SOLVER_ERROR")
 
@@ -2080,8 +2055,8 @@ def _auto_pick_profile(key: str) -> str:
 
     Heuristic: the more accidentals a key has, the more advanced the
     Sposobin chapter range the user is likely studying.  Users working
-    in 0-1 升降 are typically in ch1-4 (triad only), 2-3 升降 in
-    ch5-7 / ch8-20, 4+ 升降 or minor with chromatic alterations in
+    in 0-1 鍗囬檷 are typically in ch1-4 (triad only), 2-3 鍗囬檷 in
+    ch5-7 / ch8-20, 4+ 鍗囬檷 or minor with chromatic alterations in
     full_p0-p7.
 
     Returns the profile name to pass to solve_melody(chord_pool_profile=...).
@@ -2090,8 +2065,7 @@ def _auto_pick_profile(key: str) -> str:
         k = sposobin_solver.Key.from_name(key)
     except Exception:
         return "full_p0-p7"
-    # 本地五度圈表 (solver.MAJOR_TO_SHARPS 的降号值已修正, 这里保留一份
-    # 独立映射以防将来回退; 两者现在一致).
+    # 鏈湴浜斿害鍦堣〃 (solver.MAJOR_TO_SHARPS 鐨勯檷鍙峰€煎凡淇, 杩欓噷淇濈暀涓€浠?    # 鐙珛鏄犲皠浠ラ槻灏嗘潵鍥為€€; 涓よ€呯幇鍦ㄤ竴鑷?.
     MAJOR_SHARPS = {
         0: 0,    # C
         7: 1,    # G
@@ -2128,49 +2102,42 @@ def _auto_pick_profile(key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# P19: LLM 讲解端点
+# P19: LLM 璁茶В绔偣
 # ---------------------------------------------------------------------------
 class ExplainRequest(BaseModel):
-    """LLM 讲解请求。前端从 /solve-melody 拿到结果后直接喂进来。
-
-    注意：这个端点**不**重新跑 solver — 避免重复算 + 简化错误处理。
-    """
+    """LLM 璁茶В璇锋眰銆傚墠绔粠 /solve-melody 鎷垮埌缁撴灉鍚庣洿鎺ュ杺杩涙潵銆?
+    娉ㄦ剰锛氳繖涓鐐?*涓?*閲嶆柊璺?solver 鈥?閬垮厤閲嶅绠?+ 绠€鍖栭敊璇鐞嗐€?    """
     key: str
     timeSignature: str = "4/4"
     keyChanges: list[list] | None = None
-    # 从 solver 拿到的关键字段
-    measures: list[dict] = []  # 每小节：{ chord, voices: {S,A,T,B: [pitch,..] } }
-    cadences: list[str | None] = []  # ["PAC", "IAC", "HC", ...] 每小节
-    confidence: float | None = None
+    # 浠?solver 鎷垮埌鐨勫叧閿瓧娈?    measures: list[dict] = []  # 姣忓皬鑺傦細{ chord, voices: {S,A,T,B: [pitch,..] } }
+    cadences: list[str | None] = []  # ["PAC", "IAC", "HC", ...] 姣忓皬鑺?    confidence: float | None = None
     score: float | None = None
     algorithm: str = "sposobin-solver"
-    # 可选：原始旋律（用于在 prompt 里展示，不影响讲解）
+    # 鍙€夛細鍘熷鏃嬪緥锛堢敤浜庡湪 prompt 閲屽睍绀猴紝涓嶅奖鍝嶈瑙ｏ級
     inputMelody: list[list] | None = None
 
 
 @app.post("/api/explain")
 def explain_harmony(request: ExplainRequest) -> dict:
-    """P19: 用 LLM 把 solver 输出转成教师式中文讲解。
-
-    P18.6 同款兜底：任何错误都返回 200 + safe response，
-    不暴露内部 Python 异常。
-    """
+    """P19: 鐢?LLM 鎶?solver 杈撳嚭杞垚鏁欏笀寮忎腑鏂囪瑙ｃ€?
+    P18.6 鍚屾鍏滃簳锛氫换浣曢敊璇兘杩斿洖 200 + safe response锛?    涓嶆毚闇插唴閮?Python 寮傚父銆?    """
     if not _LLM_AVAILABLE or HarmonyExplainer is None:
         return {
             "explanation": "",
             "rulesUsed": [],
             "model": "",
-            "error": "AI 讲解模块未启用（llm 模块加载失败）",
+            "error": "AI explanation is not enabled because the llm module failed to load.",
         }
     if not request.measures:
         return {
             "explanation": "",
             "rulesUsed": [],
             "model": "",
-            "error": "需要先调用 /solve-melody 拿到四部和声结果再讲解。",
+            "error": "Call /solve-melody first, then request an explanation.",
         }
 
-    # 把请求转成 explainer 期望的 solver_output 形状
+    # 鎶婅姹傝浆鎴?explainer 鏈熸湜鐨?solver_output 褰㈢姸
     solver_output = {
         "key": request.key,
         "time": request.timeSignature,
@@ -2198,7 +2165,7 @@ def explain_harmony(request: ExplainRequest) -> dict:
             "explanation": "",
             "rulesUsed": [],
             "model": "",
-            "error": f"AI 讲解服务暂时不可用：{type(e).__name__}",
+            "error": f"AI explanation service is temporarily unavailable: {type(e).__name__}",
         }
     except Exception as e:  # noqa: BLE001
         print(f"[server] /api/explain unexpected: {type(e).__name__}: {e}", flush=True)
@@ -2206,7 +2173,7 @@ def explain_harmony(request: ExplainRequest) -> dict:
             "explanation": "",
             "rulesUsed": [],
             "model": "",
-            "error": "AI 讲解遇到内部错误，请稍后重试。",
+            "error": "AI explanation hit an internal error; retry later.",
         }
 
 
@@ -2217,7 +2184,7 @@ import json
 import uuid
 from typing import Any
 
-# P21.6: trace 落盘目录
+# P21.6: trace 钀界洏鐩綍
 AGENT_TRACES_DIR = CURRENT_DIR / "data" / "agent_traces"
 _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -2233,18 +2200,13 @@ def _trace_path(trace_id: str) -> Path:
 
 
 def _save_trace(trace_id: str, payload: dict[str, Any]) -> bool:
-    """落盘 trace JSON。返回 True=写成功, False=跳过（已存在/失败）。
-
-    P21.6 行为:
-    - 已存在 → 跳过（防重写）
-    - IO 失败 → log 后跳过（不影响 endpoint 200 响应）
-    """
+    """Persist an agent trace. Return False if it exists or cannot be saved."""
     try:
         AGENT_TRACES_DIR.mkdir(parents=True, exist_ok=True)
         path = _trace_path(trace_id)
         if path.exists():
             return False
-        # atomic write: 写 .tmp 再 rename 防中断半成品
+        # atomic write: 鍐?.tmp 鍐?rename 闃蹭腑鏂崐鎴愬搧
         tmp_path = path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(path)
@@ -2255,7 +2217,7 @@ def _save_trace(trace_id: str, payload: dict[str, Any]) -> bool:
 
 
 def _load_trace(trace_id: str) -> dict[str, Any] | None:
-    """读 trace JSON。返回 None=不存在 / IO 失败。"""
+    """Load an agent trace, returning None when it is missing or unreadable."""
     try:
         path = _trace_path(trace_id)
         if not path.exists():
@@ -2267,27 +2229,19 @@ def _load_trace(trace_id: str) -> dict[str, Any] | None:
 
 
 class AgentExplainRequest(BaseModel):
-    """P21.6: 调 MusicTheoryAgent 跑 5 步 preset pipeline。
-
-    输入: score + melody + key + style_id + time_signature。
-    输出: trace_id + AgentResult.to_dict()。
-    """
+    """Request body for the music-theory agent endpoint."""
     score: dict[str, Any] = Field(default_factory=dict)
     melody: list[dict[str, Any]] = Field(default_factory=list)
     key: str = "C major"
     styleId: str = "sposobin"
     timeSignature: str = "4/4"
-    # 可选: 自定义 trace_id (幂等重跑用); 不传则自动生成 UUID4
+    # Optional caller-supplied trace id for idempotent reruns.
     traceId: str | None = None
 
 
 @app.post("/agent/explain")
 def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
-    """P21.6: Music Theory Agent Runtime — ReAct 5 步 preset pipeline + trace 落盘。
-
-    错误降级: llm 不可用 / agent.run 抛错 → 200 + safe response,
-    不暴露内部 Python 异常给前端。
-    """
+    """Run the music-theory agent and persist a trace."""
     if not _LLM_AVAILABLE or MusicTheoryAgent is None:
         return {
             "traceId": None,
@@ -2296,7 +2250,7 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
             "trace": {"steps": [], "toolCallCount": 0, "style": request.styleId},
             "rulesUsed": [],
             "casesCited": [],
-            "errors": ["AI Agent 模块未启用（llm 模块加载失败）"],
+            "errors": ["AI Agent is not enabled because the llm module failed to load."],
         }
     if not request.melody:
         return {
@@ -2306,10 +2260,9 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
             "trace": {"steps": [], "toolCallCount": 0, "style": request.styleId},
             "rulesUsed": [],
             "casesCited": [],
-            "errors": ["需要提供 melody 列表才能跑 Agent。"],
+            "errors": ["A melody list is required before running the agent."],
         }
 
-    # P21.6 行为: 强制 styleId = sposobin（V1 默认，未来 multi-style 扩展）
     style_id = request.styleId or "sposobin"
     trace_id = request.traceId or str(uuid.uuid4())
     if not _TRACE_ID_RE.fullmatch(trace_id):
@@ -2320,7 +2273,7 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
             "trace": {"steps": [], "toolCallCount": 0, "style": style_id},
             "rulesUsed": [],
             "casesCited": [],
-            "errors": ["traceId 只能包含字母、数字、下划线和连字符，且最长 128 字符。"],
+            "errors": ["traceId may contain only letters, digits, underscores, and hyphens, up to 128 characters."],
         }
 
     try:
@@ -2341,10 +2294,9 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
             "trace": {"steps": [], "toolCallCount": 0, "style": style_id},
             "rulesUsed": [],
             "casesCited": [],
-            "errors": [f"AI Agent 服务暂时不可用：{type(e).__name__}"],
+            "errors": [f"AI Agent service is temporarily unavailable: {type(e).__name__}"],
         }
     except Exception as e:  # noqa: BLE001
-        # P21.6: 错误信息不暴露 type(e).__name__ 给前端 (P19 沿用了 type(e).__name__, P21.6 收紧)
         print(f"[server] /agent/explain unexpected: {type(e).__name__}: {e}", flush=True)
         return {
             "traceId": trace_id,
@@ -2353,10 +2305,9 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
             "trace": {"steps": [], "toolCallCount": 0, "style": style_id},
             "rulesUsed": [],
             "casesCited": [],
-            "errors": ["AI Agent 内部错误，请稍后重试。"],
+            "errors": ["AI Agent hit an internal error; retry later."],
         }
 
-    # 序列化 trace + 落盘
     result_dict = {
         "explanation": result.explanation,
         "trace": result.trace.to_dict(),
@@ -2369,7 +2320,7 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
         "key": request.key,
         "styleId": style_id,
         "timeSignature": request.timeSignature,
-        "savedAt": str(uuid.uuid1()),  # P21.6 简化: 用 UUID1 时间戳代替 ISO 字符串
+        "savedAt": str(uuid.uuid1()),
         **result_dict,
     })
 
@@ -2382,22 +2333,21 @@ def agent_explain(request: AgentExplainRequest) -> dict[str, Any]:
 
 @app.get("/agent/trace/{trace_id}")
 def agent_get_trace(trace_id: str) -> dict[str, Any]:
-    """P21.6: 读 trace JSON。404 友好（trace 不存在）。"""
+    """Read a persisted agent trace."""
     if not _TRACE_ID_RE.fullmatch(trace_id):
         return {
             "traceId": trace_id,
             "found": False,
-            "error": "traceId 格式无效",
+            "error": "Invalid traceId format.",
         }
     data = _load_trace(trace_id)
     if data is None:
         return {
             "traceId": trace_id,
             "found": False,
-            "error": "trace 不存在或 IO 失败",
+            "error": "Trace was not found or could not be read.",
         }
     return {"found": True, **data}
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8765)

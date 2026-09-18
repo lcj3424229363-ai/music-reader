@@ -44,22 +44,3 @@ def test_native_musicxml_is_not_routed_through_omr():
 def test_uploaded_source_path_is_removed():
     payload = {"source": {"fileName": "score.xml", "path": r"C:\temp\score.xml"}}
     assert "path" not in server._remove_source_path(payload)["source"]
-
-
-def test_frontend_distinguishes_rule_checked_and_review_required_answers():
-    source = (server.CURRENT_DIR / "web" / "app.js").read_text(encoding="utf-8")
-    assert "参考答案已通过规则检查" in source
-    assert "参考答案已生成，需复核" in source
-    assert 'result?.fourPart?.qualityStatus === "pass"' in source
-
-
-def test_frontend_renders_qwen_crop_and_homr_comparison():
-    source = (server.CURRENT_DIR / "web" / "app.js").read_text(encoding="utf-8")
-    html = (server.CURRENT_DIR / "web" / "index.html").read_text(encoding="utf-8")
-
-    assert "omrReviewArtifactUrl" in source
-    assert "Qwen 复核区" in source
-    assert "omrCandidateEvent" in source
-    assert "omr-review-comparison" in source
-    assert 'data-workflow-step="review"' in html
-    assert '"recognition", "review", "validation", "solver", "notation"' in source
