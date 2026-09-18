@@ -32,12 +32,18 @@
         <div class="controls">
           <button id="photoscore-button" type="button">PhotoScore XML 出答案</button>
           <button id="recognize-button" type="button">照片/PDF 识别出答案</button>
+          <button id="download-score-button" type="button" disabled>导出 PNG 谱面</button>
         </div>
+      </section>
+
+      <section class="score-preview">
+        <h2>谱面答案</h2>
+        <div id="score-image" class="score-image">答案生成后会在这里显示可视化谱面</div>
       </section>
 
       <section class="results">
         <article>
-          <h2>答案</h2>
+          <h2>结构化答案</h2>
           <pre id="answer-output">等待生成答案</pre>
         </article>
         <article>

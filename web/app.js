@@ -1,12 +1,15 @@
 const fileInput = document.querySelector("#score-file");
 const recognizeButton = document.querySelector("#recognize-button");
 const photoscoreButton = document.querySelector("#photoscore-button");
+const downloadScoreButton = document.querySelector("#download-score-button");
 const statusNode = document.querySelector("#status");
 const parseOutput = document.querySelector("#parse-output");
 const answerOutput = document.querySelector("#answer-output");
+const scoreImage = document.querySelector("#score-image");
 
 const imageLikeExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".pdf"]);
 const xmlLikeExtensions = new Set([".xml", ".musicxml", ".mxl"]);
+let lastRenderableAnswer = null;
 
 function setStatus(message) {
   statusNode.textContent = message;
@@ -19,6 +22,7 @@ function render(node, value) {
 function setBusy(isBusy, message) {
   recognizeButton.disabled = isBusy;
   photoscoreButton.disabled = isBusy;
+  downloadScoreButton.disabled = isBusy || !lastRenderableAnswer;
   if (message) setStatus(message);
 }
 
@@ -59,6 +63,19 @@ async function postJson(endpoint, body) {
     throw new Error(typeof payload.detail === "string" ? payload.detail : `请求失败：${response.status}`);
   }
   return payload;
+}
+
+async function postForBlob(endpoint, body) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(typeof payload.detail === "string" ? payload.detail : `请求失败：${response.status}`);
+  }
+  return response.blob();
 }
 
 function buildSolveRequest(parsed) {
@@ -125,6 +142,39 @@ function reviewSummary(result) {
   };
 }
 
+async function renderScorePreview(answerPayload) {
+  lastRenderableAnswer = answerPayload;
+  downloadScoreButton.disabled = false;
+  const blob = await postForBlob("/api/render/answer.svg", answerPayload);
+  const url = URL.createObjectURL(blob);
+  scoreImage.innerHTML = "";
+  const image = document.createElement("img");
+  image.alt = "四部和声谱面答案";
+  image.src = url;
+  image.onload = () => URL.revokeObjectURL(url);
+  scoreImage.appendChild(image);
+}
+
+async function downloadScorePng() {
+  if (!lastRenderableAnswer) return;
+  setBusy(true, "导出谱面中");
+  try {
+    const blob = await postForBlob("/api/render/answer.png", lastRenderableAnswer);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "four-part-answer.png";
+    link.click();
+    URL.revokeObjectURL(url);
+    setStatus("完成");
+  } catch (error) {
+    render(answerOutput, { error: error.message });
+    setStatus("失败");
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function photoscoreSolve() {
   const file = selectedFile();
   const extension = extensionOf(file);
@@ -136,6 +186,7 @@ async function photoscoreSolve() {
     const result = await uploadForm("/api/photoscore/solve", file, { measureLimit: 32, autoSolve: true });
     render(answerOutput, answerSummary(result));
     render(parseOutput, reviewSummary(result));
+    await renderScorePreview(result);
     setStatus("完成");
   } catch (error) {
     render(answerOutput, { error: error.message });
@@ -156,6 +207,7 @@ async function recognizeAndSolve() {
     const answer = await solveParsedScore(parsed);
     render(answerOutput, answerSummary(answer));
     render(parseOutput, parsed);
+    await renderScorePreview(answer);
     setStatus("完成");
   } catch (error) {
     render(answerOutput, { error: error.message });
@@ -178,3 +230,5 @@ recognizeButton.addEventListener("click", () => {
     setStatus("失败");
   });
 });
+
+downloadScoreButton.addEventListener("click", downloadScorePng);

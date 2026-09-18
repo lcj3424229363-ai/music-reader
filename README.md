@@ -11,6 +11,7 @@ scores into solver input, and producing four-part harmony answers.
 - Run structural MusicXML quality checks.
 - Convert recognized scores into the internal editor/solver representation.
 - Generate rule-based Sposobin-style harmony and four-part answer payloads.
+- Render the four-part answer as visible score notation and export PNG.
 - Explain solver output through the LLM/agent endpoints when configured.
 - Provide a lightweight upload frontend for score photos, PDFs, MusicXML, and MIDI.
 
@@ -32,6 +33,7 @@ PhotoScore image/PDF recognition
   -> export MusicXML
   -> POST /api/photoscore/solve
   -> returns the final answer plus text/quality review
+  -> POST /api/render/answer.png for a visible score image
   -> optional POST /api/explain or /agent/explain
 ```
 
@@ -108,6 +110,19 @@ form-data:
   autoSolve=true
 ```
 
+Render a solved answer as notation:
+
+```text
+POST http://127.0.0.1:8765/api/render/answer.svg
+POST http://127.0.0.1:8765/api/render/answer.png
+Content-Type: application/json
+
+<the /api/photoscore/solve or /solve-melody response>
+```
+
+The upload frontend calls these render endpoints automatically after a successful
+solve and exposes a PNG export button.
+
 Generate a four-part answer:
 
 ```text
@@ -141,10 +156,14 @@ POST http://127.0.0.1:8765/agent/explain
 ## Technology Stack
 
 - Python: FastAPI backend, score readers, MusicXML quality checks, OMR pipeline,
-  solver, and AI/agent integration.
+  solver, built-in score renderer, and AI/agent integration.
 - HTML/CSS/JavaScript: lightweight upload frontend only.
 - External recognition tools: PhotoScore exports MusicXML for the backend;
   Audiveris/HOMR-style OMR support is used when configured for image/PDF input.
+
+The built-in renderer is intentionally dependency-light and designed to make the
+answer visible immediately. If MuseScore, LilyPond, or Verovio is installed
+later, the same render endpoints can be upgraded to professional engraving.
 
 The current repository is therefore not Python-only, but Python is the core
 runtime. The browser code is intentionally small and only handles file upload

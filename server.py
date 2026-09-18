@@ -12,7 +12,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,6 +25,7 @@ from omr import SUPPORTED_OMR_EXTENSIONS, OmrError, transcribe_with_audiveris
 from musicxml_quality import audit_musicxml
 from omr_semantic_metrics import score_musicxml_semantics
 from photoscore_ai import build_photoscore_ai_context, extract_musicxml_text_review
+from score_render import RenderError, render_answer_png, render_answer_svg
 from harmony_validator import validate_four_part_solution
 from exercise_extractor import extract_exercise_constraints
 from score_ir import validate_score_ir
@@ -866,6 +867,30 @@ async def photoscore_solve_upload(
             }
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/render/answer.svg")
+async def render_answer_svg_endpoint(payload: dict) -> Response:
+    """Render a four-part answer payload as an SVG score."""
+    try:
+        svg = render_answer_svg(payload)
+    except RenderError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+@app.post("/api/render/answer.png")
+async def render_answer_png_endpoint(payload: dict) -> Response:
+    """Render a four-part answer payload as a PNG score image."""
+    try:
+        png = render_answer_png(payload)
+    except RenderError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": 'attachment; filename="four-part-answer.png"'},
+    )
 
 
 @app.post("/api/omr/enhanced-parse")

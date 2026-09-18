@@ -115,6 +115,11 @@ button:nth-child(2) {
   color: #24382f;
 }
 
+button:nth-child(3) {
+  background: #e9efe9;
+  color: #24382f;
+}
+
 button:disabled {
   cursor: progress;
   opacity: 0.65;
@@ -124,6 +129,24 @@ button:disabled {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
+}
+
+.score-preview {
+  padding: 4px 0 24px;
+}
+
+.score-image {
+  min-height: 260px;
+  overflow: auto;
+  border: 1px solid #d5dbd2;
+  background: #ffffff;
+}
+
+.score-image img {
+  display: block;
+  width: 100%;
+  min-width: 760px;
+  height: auto;
 }
 
 article {
