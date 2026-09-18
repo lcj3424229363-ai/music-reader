@@ -24,7 +24,7 @@ from reader import SUPPORTED_EXTENSIONS, read_score
 from omr import SUPPORTED_OMR_EXTENSIONS, OmrError, transcribe_with_audiveris
 from musicxml_quality import audit_musicxml
 from omr_semantic_metrics import score_musicxml_semantics
-from photoscore_ai import build_photoscore_ai_context
+from photoscore_ai import build_photoscore_ai_context, extract_musicxml_text_review
 from harmony_validator import validate_four_part_solution
 from exercise_extractor import extract_exercise_constraints
 from score_ir import validate_score_ir
@@ -793,6 +793,77 @@ async def photoscore_ai_context_upload(
         target.write_bytes(payload)
         try:
             return build_photoscore_ai_context(target, measure_limit=measure_limit)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/photoscore/solve")
+async def photoscore_solve_upload(
+    file: UploadFile = File(...),
+    measureLimit: int = Form(32),
+    autoSolve: bool = Form(True),
+) -> dict:
+    """Run the PhotoScore MusicXML experiment chain through the solver."""
+    from reader_to_editor import reader_payload_to_editor
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".xml", ".musicxml", ".mxl"}:
+        raise HTTPException(status_code=400, detail="PhotoScore solve expects exported MusicXML.")
+    payload = await file.read(MAX_FINAL_MUSICXML_BYTES + 1)
+    await file.close()
+    if len(payload) > MAX_FINAL_MUSICXML_BYTES:
+        raise HTTPException(status_code=413, detail="MusicXML exceeds 10 MB.")
+
+    with tempfile.TemporaryDirectory(prefix="music-reader-photoscore-solve-") as temp_dir:
+        target = Path(temp_dir) / _safe_upload_name(file.filename, suffix)
+        target.write_bytes(payload)
+        try:
+            raw_payload = _remove_source_path(read_score(target))
+            editor_payload = reader_payload_to_editor(raw_payload)
+            editor_payload["rawSummary"] = raw_payload.get("summary", {})
+            editor_payload["sourceMusicXml"] = target.read_text(encoding="utf-8-sig")
+            editor_payload["importRoute"] = "photoscore-reader-projection"
+            _annotate_editor_analysis(editor_payload)
+            ai_context = build_photoscore_ai_context(target, measure_limit=measureLimit)
+            text_review = extract_musicxml_text_review(target)
+            answer = (
+                _solve_imported_exercise(editor_payload)
+                if autoSolve else {
+                    "status": "ready",
+                    "stage": "exercise",
+                    "questionType": (editor_payload.get("exerciseExtraction") or {}).get("recommendedQuestionType"),
+                    "issues": [],
+                }
+            )
+            return {
+                "workflow": "photoscore-musicxml-to-answer-v1",
+                "source": {
+                    "fileName": Path(file.filename or target.name).name,
+                    "recognitionEngine": "PhotoScore",
+                    "format": suffix.lstrip("."),
+                },
+                "inputPolicy": {
+                    "primaryRecognition": "PhotoScore exported MusicXML",
+                    "solverUses": [
+                        "notes",
+                        "rests",
+                        "durations",
+                        "voices",
+                        "clefs",
+                        "key signatures",
+                        "time signatures",
+                    ],
+                    "textIgnoredForSolving": True,
+                    "textReviewRequiredForConstraints": bool(text_review.get("possibleConstraints")),
+                    "vlmRole": "review suspected notation regions or user-selected crops; do not replace PhotoScore XML automatically.",
+                },
+                "textReview": text_review,
+                "quality": ai_context.get("quality"),
+                "exerciseExtraction": editor_payload.get("exerciseExtraction"),
+                "solverEligibility": editor_payload.get("solverEligibility"),
+                "answer": answer,
+                "aiContext": ai_context,
+            }
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

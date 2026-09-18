@@ -1,5 +1,6 @@
 const fileInput = document.querySelector("#score-file");
 const recognizeButton = document.querySelector("#recognize-button");
+const photoscoreButton = document.querySelector("#photoscore-button");
 const contextButton = document.querySelector("#context-button");
 const statusNode = document.querySelector("#status");
 const parseOutput = document.querySelector("#parse-output");
@@ -85,6 +86,7 @@ async function recognizeAndSolve() {
   const extension = extensionOf(file);
   setStatus("处理中");
   recognizeButton.disabled = true;
+  photoscoreButton.disabled = true;
   contextButton.disabled = true;
   try {
     const parsed = imageLikeExtensions.has(extension)
@@ -99,6 +101,37 @@ async function recognizeAndSolve() {
     setStatus("失败");
   } finally {
     recognizeButton.disabled = false;
+    photoscoreButton.disabled = false;
+    contextButton.disabled = false;
+  }
+}
+
+async function photoscoreSolve() {
+  const file = selectedFile();
+  setStatus("PhotoScore 求解");
+  recognizeButton.disabled = true;
+  photoscoreButton.disabled = true;
+  contextButton.disabled = true;
+  try {
+    const result = await uploadForm("/api/photoscore/solve", file, { measureLimit: 32, autoSolve: true });
+    render(parseOutput, {
+      workflow: result.workflow,
+      source: result.source,
+      inputPolicy: result.inputPolicy,
+      textReview: result.textReview,
+      quality: result.quality,
+      exerciseExtraction: result.exerciseExtraction,
+      solverEligibility: result.solverEligibility,
+      aiContext: result.aiContext,
+    });
+    render(answerOutput, result.answer);
+    setStatus("完成");
+  } catch (error) {
+    render(answerOutput, { error: error.message });
+    setStatus("失败");
+  } finally {
+    recognizeButton.disabled = false;
+    photoscoreButton.disabled = false;
     contextButton.disabled = false;
   }
 }
@@ -107,6 +140,7 @@ async function buildAiContext() {
   const file = selectedFile();
   setStatus("生成上下文");
   recognizeButton.disabled = true;
+  photoscoreButton.disabled = true;
   contextButton.disabled = true;
   try {
     const context = await uploadForm("/api/photoscore/ai-context", file, { measureLimit: 32 });
@@ -118,9 +152,11 @@ async function buildAiContext() {
     setStatus("失败");
   } finally {
     recognizeButton.disabled = false;
+    photoscoreButton.disabled = false;
     contextButton.disabled = false;
   }
 }
 
 recognizeButton.addEventListener("click", recognizeAndSolve);
+photoscoreButton.addEventListener("click", photoscoreSolve);
 contextButton.addEventListener("click", buildAiContext);

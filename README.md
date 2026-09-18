@@ -31,10 +31,18 @@ Typical PhotoScore workflow:
 ```text
 PhotoScore image/PDF recognition
   -> export MusicXML
-  -> POST /api/photoscore/ai-context or /parse-score
-  -> POST /solve-melody or /four-part-answer
+  -> POST /api/photoscore/solve
+  -> returns text review, quality review, solver readiness, and final answer
   -> optional POST /api/explain or /agent/explain
 ```
+
+The PhotoScore path treats MusicXML notes, rests, rhythm, voices, clefs, key
+signatures, and time signatures as the musical source of truth. Titles,
+composer text, lyrics, page text, and OCR-like text are collected under
+`textReview` only; they do not drive the solver unless a user confirms them as
+exercise constraints. VLM review is reserved for suspected notation regions or
+user-selected crops and should produce correction suggestions rather than
+silently replacing the PhotoScore XML.
 
 Typical direct OMR workflow:
 
@@ -86,6 +94,16 @@ POST http://127.0.0.1:8765/api/photoscore/ai-context
 form-data:
   file=<PhotoScore-exported MusicXML>
   measureLimit=32
+```
+
+Run the PhotoScore XML experiment chain and return the answer:
+
+```text
+POST http://127.0.0.1:8765/api/photoscore/solve
+form-data:
+  file=<PhotoScore-exported MusicXML>
+  measureLimit=32
+  autoSolve=true
 ```
 
 Generate a four-part answer:

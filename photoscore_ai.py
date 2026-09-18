@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,29 @@ from reader import read_score
 DEFAULT_MEASURE_LIMIT = 32
 DEFAULT_EVENTS_PER_MEASURE = 12
 DEFAULT_HARMONIES_PER_MEASURE = 6
+TEXT_TAGS = {
+    "credit-words",
+    "creator",
+    "rights",
+    "movement-title",
+    "movement-number",
+    "work-title",
+    "work-number",
+    "lyric",
+    "words",
+    "rehearsal",
+    "direction-type",
+}
+CONSTRAINT_PATTERNS = [
+    (re.compile(r"\b(soprano|melody|given melody)\b", re.I), "melody-given"),
+    (re.compile(r"\b(bass|figured bass|given bass)\b", re.I), "bass-given"),
+    (re.compile(r"\b(alto)\b", re.I), "alto-given"),
+    (re.compile(r"\b(tenor)\b", re.I), "tenor-given"),
+    (re.compile(r"(高音|旋律|题目旋律)"), "melody-given"),
+    (re.compile(r"(低音|数字低音|低音题)"), "bass-given"),
+    (re.compile(r"(中音)"), "alto-given"),
+    (re.compile(r"(次中音)"), "tenor-given"),
+]
 
 
 def build_photoscore_ai_context(
@@ -72,15 +97,109 @@ def build_photoscore_ai_context(
         "parts": compact_parts,
         "harmonyTimeline": compact_harmony,
         "readerWarnings": warnings[:24],
+        "textReview": extract_musicxml_text_review(source),
         "aiInstructions": [
             "Treat this as an OMR-derived score, not ground truth.",
             "Base analysis on the compact parts and harmony timeline.",
             "Call out reviewTargets before making strong claims about those measures.",
-            "Ignore garbled title/composer text unless verified by the user.",
+            "Ignore title, composer, lyrics, OCR text, and page text unless textReview marks it as a likely exercise constraint.",
         ],
     }
     context["markdown"] = render_ai_context_markdown(context)
     return context
+
+
+def extract_musicxml_text_review(path: str | Path) -> dict[str, Any]:
+    """Collect non-note MusicXML text without letting it drive the answer."""
+    source = Path(path)
+    try:
+        root = ET.fromstring(source.read_text(encoding="utf-8-sig"))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "unreadable",
+            "ignoredForSolving": True,
+            "error": str(exc),
+            "items": [],
+            "possibleConstraints": [],
+        }
+
+    items: list[dict[str, str]] = []
+    for element in root.iter():
+        tag = _local_name(element.tag)
+        if tag not in TEXT_TAGS:
+            continue
+        values = _element_text_values(element)
+        if not values:
+            continue
+        text = " ".join(values).strip()
+        if not text:
+            continue
+        items.append({"tag": tag, "text": _compact_text(text)})
+
+    deduped = _dedupe_text_items(items)
+    constraints = _possible_constraints(deduped)
+    return {
+        "status": "ok",
+        "ignoredForSolving": True,
+        "policy": (
+            "Text from titles, credits, lyrics, rehearsal marks, and OCR page text "
+            "is reported for review only. Solver input is built from musical events."
+        ),
+        "items": deduped[:32],
+        "truncated": len(deduped) > 32,
+        "possibleConstraints": constraints,
+    }
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _element_text_values(element: ET.Element) -> list[str]:
+    if _local_name(element.tag) == "lyric":
+        return [
+            (child.text or "").strip()
+            for child in element
+            if _local_name(child.tag) == "text" and (child.text or "").strip()
+        ]
+    return [(element.text or "").strip()] if (element.text or "").strip() else []
+
+
+def _compact_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()[:240]
+
+
+def _dedupe_text_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen = set()
+    result = []
+    for item in items:
+        key = (item["tag"], item["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _possible_constraints(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    constraints = []
+    seen = set()
+    for item in items:
+        text = item["text"]
+        for pattern, kind in CONSTRAINT_PATTERNS:
+            if not pattern.search(text):
+                continue
+            key = (kind, text)
+            if key in seen:
+                continue
+            seen.add(key)
+            constraints.append({
+                "kind": kind,
+                "sourceTag": item["tag"],
+                "text": text,
+                "requiresConfirmation": True,
+            })
+    return constraints[:12]
 
 
 def _recognition_engine(reader_payload: dict[str, Any]) -> str:
