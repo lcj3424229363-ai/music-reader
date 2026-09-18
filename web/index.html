@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Music Reader Upload</title>
+    <title>Music Reader</title>
     <link rel="stylesheet" href="/web/styles.css">
   </head>
   <body>
@@ -11,8 +11,11 @@
       <section class="hero">
         <div>
           <p class="eyebrow">Music Reader</p>
-          <h1>上传谱面照片、PDF 或 MusicXML</h1>
-          <p class="summary">前端只保留识别入口；手工制谱编辑器和样本数据已经移出项目。</p>
+          <h1>上传谱面，直接出答案</h1>
+          <p class="summary">
+            主流程是 PhotoScore 导出 MusicXML 后上传求解。照片/PDF 入口保留给 OMR 实验，
+            浏览器手工制谱编辑器和样本数据已经移出项目。
+          </p>
         </div>
         <div class="status" id="status">等待上传</div>
       </section>
@@ -20,25 +23,26 @@
       <section class="panel">
         <label class="drop-zone" for="score-file">
           <span class="drop-title">选择谱面文件</span>
-          <span class="drop-hint">支持图片、PDF、MusicXML、MIDI。照片/PDF 会走 OMR，XML 会直接解析。</span>
+          <span class="drop-hint">
+            推荐上传 PhotoScore 导出的 .xml/.musicxml/.mxl。也支持图片、PDF、MIDI 做实验。
+          </span>
           <input id="score-file" type="file" accept=".png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp,.pdf,.xml,.musicxml,.mxl,.mid,.midi">
         </label>
 
         <div class="controls">
-          <button id="recognize-button" type="button">识别并尝试出答案</button>
           <button id="photoscore-button" type="button">PhotoScore XML 出答案</button>
-          <button id="context-button" type="button">生成 PhotoScore AI 上下文</button>
+          <button id="recognize-button" type="button">照片/PDF 识别出答案</button>
         </div>
       </section>
 
       <section class="results">
         <article>
-          <h2>识别/解析结果</h2>
-          <pre id="parse-output">{}</pre>
+          <h2>答案</h2>
+          <pre id="answer-output">等待生成答案</pre>
         </article>
         <article>
-          <h2>求解答案</h2>
-          <pre id="answer-output">{}</pre>
+          <h2>检查信息</h2>
+          <pre id="parse-output">上传后显示识别质量、文字过滤和求解准备情况</pre>
         </article>
       </section>
     </main>

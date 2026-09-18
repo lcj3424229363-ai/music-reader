@@ -1,14 +1,13 @@
 # Music Reader
 
 Backend service for reading MusicXML/MIDI/OMR output, converting recognized
-scores into solver input, and producing four-part harmony answers plus
-AI-readable analysis.
+scores into solver input, and producing four-part harmony answers.
 
 ## Current Scope
 
 - Read `.musicxml`, `.xml`, `.mxl`, `.mid`, and `.midi` files.
 - Accept image/PDF OMR input through the configured OMR path.
-- Accept PhotoScore-exported MusicXML and convert it into compact AI context.
+- Accept PhotoScore-exported MusicXML as the preferred recognition result.
 - Run structural MusicXML quality checks.
 - Convert recognized scores into the internal editor/solver representation.
 - Generate rule-based Sposobin-style harmony and four-part answer payloads.
@@ -32,7 +31,7 @@ Typical PhotoScore workflow:
 PhotoScore image/PDF recognition
   -> export MusicXML
   -> POST /api/photoscore/solve
-  -> returns text review, quality review, solver readiness, and final answer
+  -> returns the final answer plus text/quality review
   -> optional POST /api/explain or /agent/explain
 ```
 
@@ -87,7 +86,7 @@ POST http://127.0.0.1:8765/parse-score
 form-data: file=<MusicXML file>
 ```
 
-Build AI context from PhotoScore MusicXML:
+Internal/debug: inspect the compact PhotoScore analysis payload:
 
 ```text
 POST http://127.0.0.1:8765/api/photoscore/ai-context
@@ -95,6 +94,9 @@ form-data:
   file=<PhotoScore-exported MusicXML>
   measureLimit=32
 ```
+
+This endpoint is not the main product flow. It exists so developers can inspect
+what musical facts the backend extracted before solving.
 
 Run the PhotoScore XML experiment chain and return the answer:
 

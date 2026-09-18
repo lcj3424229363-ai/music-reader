@@ -1,7 +1,6 @@
 const fileInput = document.querySelector("#score-file");
 const recognizeButton = document.querySelector("#recognize-button");
 const photoscoreButton = document.querySelector("#photoscore-button");
-const contextButton = document.querySelector("#context-button");
 const statusNode = document.querySelector("#status");
 const parseOutput = document.querySelector("#parse-output");
 const answerOutput = document.querySelector("#answer-output");
@@ -14,7 +13,13 @@ function setStatus(message) {
 }
 
 function render(node, value) {
-  node.textContent = JSON.stringify(value, null, 2);
+  node.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+function setBusy(isBusy, message) {
+  recognizeButton.disabled = isBusy;
+  photoscoreButton.disabled = isBusy;
+  if (message) setStatus(message);
 }
 
 function selectedFile() {
@@ -38,7 +43,7 @@ async function uploadForm(endpoint, file, extraFields = {}) {
   const response = await fetch(endpoint, { method: "POST", body: form });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.detail || `请求失败：${response.status}`);
+    throw new Error(typeof payload.detail === "string" ? payload.detail : `请求失败：${response.status}`);
   }
   return payload;
 }
@@ -51,18 +56,17 @@ async function postJson(endpoint, body) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.detail || `请求失败：${response.status}`);
+    throw new Error(typeof payload.detail === "string" ? payload.detail : `请求失败：${response.status}`);
   }
   return payload;
 }
 
 function buildSolveRequest(parsed) {
   const extraction = parsed.exerciseExtraction || {};
-  const recommended = extraction.recommendedQuestionType || "melody-given";
   return {
     key: parsed.key || parsed.rawSummary?.key || extraction.key || "C",
     timeSignature: parsed.timeSignature || parsed.rawSummary?.timeSignature || extraction.timeSignature || "4/4",
-    questionType: recommended,
+    questionType: extraction.recommendedQuestionType || "melody",
     melodyMeasures: parsed.melodyMeasures || [],
     bassMeasures: parsed.bassMeasures || [],
     altoMeasures: parsed.altoMeasures || [],
@@ -71,92 +75,106 @@ function buildSolveRequest(parsed) {
 }
 
 async function solveParsedScore(parsed) {
-  if (parsed.endToEnd) {
-    return parsed.endToEnd;
-  }
+  if (parsed.endToEnd) return parsed.endToEnd;
   const request = buildSolveRequest(parsed);
-  if (!request.melodyMeasures.length && !request.bassMeasures.length && !request.altoMeasures.length && !request.tenorMeasures.length) {
+  const hasVoice = request.melodyMeasures.length || request.bassMeasures.length ||
+    request.altoMeasures.length || request.tenorMeasures.length;
+  if (!hasVoice) {
     return { status: "skipped", message: "解析结果里没有可提交给求解器的声部数据。" };
   }
   return postJson("/solve-melody", request);
 }
 
-async function recognizeAndSolve() {
-  const file = selectedFile();
-  const extension = extensionOf(file);
-  setStatus("处理中");
-  recognizeButton.disabled = true;
-  photoscoreButton.disabled = true;
-  contextButton.disabled = true;
-  try {
-    const parsed = imageLikeExtensions.has(extension)
-      ? await uploadForm("/api/omr/enhanced-parse", file, { useVision: true, maxRegions: 3, autoSolve: true })
-      : await uploadForm(xmlLikeExtensions.has(extension) ? "/parse-score" : "/read-score", file);
-    render(parseOutput, parsed);
-    const answer = await solveParsedScore(parsed);
-    render(answerOutput, answer);
-    setStatus("完成");
-  } catch (error) {
-    render(answerOutput, { error: error.message });
-    setStatus("失败");
-  } finally {
-    recognizeButton.disabled = false;
-    photoscoreButton.disabled = false;
-    contextButton.disabled = false;
+function answerSummary(result) {
+  const answer = result.answer || result;
+  const lines = [];
+  lines.push(`状态：${answer.status || answer.summary?.status || "unknown"}`);
+  if (answer.questionType) lines.push(`题型：${answer.questionType}`);
+  if (answer.exerciseKind) lines.push(`识别类型：${answer.exerciseKind}`);
+  const fourPart = answer.solution?.fourPart || answer.fourPart;
+  const voices = fourPart?.voices || [];
+  if (voices.length) {
+    lines.push("");
+    lines.push("四部答案：");
+    for (const voice of voices) {
+      lines.push(`${voice.name || voice.voice || "voice"}：${JSON.stringify(voice.entries || voice.measures || voice)}`);
+    }
   }
+  const harmonies = fourPart?.harmonies || answer.solution?.harmonies || [];
+  if (harmonies.length) {
+    lines.push("");
+    lines.push("和声：");
+    lines.push(JSON.stringify(harmonies, null, 2));
+  }
+  if (answer.issues?.length) {
+    lines.push("");
+    lines.push("需要复核：");
+    lines.push(JSON.stringify(answer.issues, null, 2));
+  }
+  return lines.join("\n");
+}
+
+function reviewSummary(result) {
+  return {
+    source: result.source,
+    inputPolicy: result.inputPolicy,
+    textReview: result.textReview,
+    quality: result.quality,
+    exerciseExtraction: result.exerciseExtraction,
+    solverEligibility: result.solverEligibility,
+  };
 }
 
 async function photoscoreSolve() {
   const file = selectedFile();
-  setStatus("PhotoScore 求解");
-  recognizeButton.disabled = true;
-  photoscoreButton.disabled = true;
-  contextButton.disabled = true;
+  const extension = extensionOf(file);
+  if (!xmlLikeExtensions.has(extension)) {
+    throw new Error("PhotoScore 主流程需要上传导出的 .xml/.musicxml/.mxl 文件。");
+  }
+  setBusy(true, "PhotoScore XML 求解中");
   try {
     const result = await uploadForm("/api/photoscore/solve", file, { measureLimit: 32, autoSolve: true });
-    render(parseOutput, {
-      workflow: result.workflow,
-      source: result.source,
-      inputPolicy: result.inputPolicy,
-      textReview: result.textReview,
-      quality: result.quality,
-      exerciseExtraction: result.exerciseExtraction,
-      solverEligibility: result.solverEligibility,
-      aiContext: result.aiContext,
-    });
-    render(answerOutput, result.answer);
+    render(answerOutput, answerSummary(result));
+    render(parseOutput, reviewSummary(result));
     setStatus("完成");
   } catch (error) {
     render(answerOutput, { error: error.message });
     setStatus("失败");
   } finally {
-    recognizeButton.disabled = false;
-    photoscoreButton.disabled = false;
-    contextButton.disabled = false;
+    setBusy(false);
   }
 }
 
-async function buildAiContext() {
+async function recognizeAndSolve() {
   const file = selectedFile();
-  setStatus("生成上下文");
-  recognizeButton.disabled = true;
-  photoscoreButton.disabled = true;
-  contextButton.disabled = true;
+  const extension = extensionOf(file);
+  setBusy(true, "识别求解中");
   try {
-    const context = await uploadForm("/api/photoscore/ai-context", file, { measureLimit: 32 });
-    render(parseOutput, context);
-    render(answerOutput, { next: "把 parse-score 的结果提交到 /solve-melody 可以生成四部和声答案。" });
+    const parsed = imageLikeExtensions.has(extension)
+      ? await uploadForm("/api/omr/enhanced-parse", file, { useVision: true, maxRegions: 3, autoSolve: true })
+      : await uploadForm(xmlLikeExtensions.has(extension) ? "/parse-score" : "/read-score", file);
+    const answer = await solveParsedScore(parsed);
+    render(answerOutput, answerSummary(answer));
+    render(parseOutput, parsed);
     setStatus("完成");
   } catch (error) {
     render(answerOutput, { error: error.message });
     setStatus("失败");
   } finally {
-    recognizeButton.disabled = false;
-    photoscoreButton.disabled = false;
-    contextButton.disabled = false;
+    setBusy(false);
   }
 }
 
-recognizeButton.addEventListener("click", recognizeAndSolve);
-photoscoreButton.addEventListener("click", photoscoreSolve);
-contextButton.addEventListener("click", buildAiContext);
+photoscoreButton.addEventListener("click", () => {
+  photoscoreSolve().catch((error) => {
+    render(answerOutput, { error: error.message });
+    setStatus("失败");
+  });
+});
+
+recognizeButton.addEventListener("click", () => {
+  recognizeAndSolve().catch((error) => {
+    render(answerOutput, { error: error.message });
+    setStatus("失败");
+  });
+});
